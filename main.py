@@ -1,7 +1,7 @@
 import time
 import queue
 import sys
-from luma.core.interface.serial import i2c
+from luma.core.interface.serial import spi
 from luma.oled.device import sh1106
 from gpiozero import Button
 
@@ -9,13 +9,13 @@ from core.system_monitor import SystemMonitor
 from ui.engine import UIManager
 
 def main():
-    # Inicializar I2C y display SH1106 (Asume port=1, address=0x3C)
+    # Inicializar SPI y display SH1106
     try:
-        serial = i2c(port=1, address=0x3C)
-        device = sh1106(serial)
+        serial = spi(device=0, port=0, bus_speed_hz=8000000, gpio_DC=24, gpio_RST=25)
+        device = sh1106(serial, rotate=0)
     except Exception as e:
         print(f"Error inicializando display: {e}")
-        print("Asegurate de ejecutar esto en la Raspberry Pi con I2C habilitado.")
+        print("Asegurate de ejecutar esto en la Raspberry Pi con SPI habilitado.")
         sys.exit(1)
 
     # Cola (Queue) para el patron Productor-Consumidor
