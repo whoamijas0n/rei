@@ -1,5 +1,0 @@
-luma.oled
-luma.core
-Pillow
-gpiozero
-psutil
