@@ -1,0 +1,25 @@
+"""
+OmniDiag Hub - UI Module
+Package initialization for UI rendering, views, and input handlers.
+"""
+
+from .input_handler import InputEvent, GPIOInputHandler
+from .display import (
+    ScreenManager,
+    BaseView,
+    HeroCardDeckView,
+    DetailCardView,
+    HeroCard,
+    IconRenderer,
+)
+
+__all__ = [
+    "InputEvent",
+    "GPIOInputHandler",
+    "ScreenManager",
+    "BaseView",
+    "HeroCardDeckView",
+    "DetailCardView",
+    "HeroCard",
+    "IconRenderer",
+]
