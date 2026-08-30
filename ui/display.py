@@ -3,6 +3,7 @@ OmniDiag Hub - Display Engine and View Hierarchy
 Minimalist Hero Card System for 1.3" SH1106 OLED (128x64 px).
 Implements procedural pixel-art rendering, micro-dot pagination, continuous perimeter framing,
 and non-blocking navigation stack.
+Hardware: Waveshare 1.3" OLED HAT (SPI: DC=GPIO24, RST=GPIO25, rotate=2).
 """
 
 from abc import ABC, abstractmethod
@@ -40,197 +41,157 @@ class ViewAction:
 class IconRenderer:
     """
     Procedural Pixel-Art Icon Engine.
-    Draws 20x20 pixel-art icons centered at exact coordinates (center_x, center_y).
-    Bounding box: (center_x - 10, center_y - 10) to (center_x + 9, center_y + 9).
+    Draws 20x20 pixel-art icons centered at exact coordinates (cx, cy) = (64, 24).
     """
 
     @classmethod
-    def draw_icon(cls, draw: ImageDraw.ImageDraw, icon_name: str, center_x: int = 64, center_y: int = 24) -> None:
+    def draw_icon(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        icon_name: str,
+        cx: int = 64,
+        cy: int = 24,
+        center_x: Optional[int] = None,
+        center_y: Optional[int] = None,
+    ) -> None:
         """Dispatches icon rendering by registered name."""
+        if center_x is not None:
+            cx = center_x
+        if center_y is not None:
+            cy = center_y
         name = icon_name.upper().strip()
         draw_fn = getattr(cls, f"_draw_{name}", cls._draw_DEFAULT)
-        x0 = center_x - 10
-        y0 = center_y - 10
-        draw_fn(draw, x0, y0)
+        draw_fn(draw, cx, cy)
 
     @staticmethod
-    def _draw_DEFAULT(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Generic fallback icon (geometric diamond)."""
-        draw.polygon([(x + 10, y + 2), (x + 18, y + 10), (x + 10, y + 18), (x + 2, y + 10)], outline=1)
-        draw.point((x + 10, y + 10), fill=1)
+    def _draw_DEFAULT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Generic fallback diamond."""
+        draw.polygon([(cx, cy - 8), (cx + 8, cy), (cx, cy + 8), (cx - 8, cy)], outline="white")
+        draw.point((cx, cy), fill="white")
 
     @staticmethod
-    def _draw_INFO(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Info badge icon (circle badge with 'i' glyph)."""
-        # Outer circle outline
-        draw.ellipse([x + 1, y + 1, x + 18, y + 18], outline=1)
-        # Dot of the 'i'
-        draw.rectangle([x + 9, y + 4, x + 10, y + 5], fill=1)
-        # Stem of the 'i'
-        draw.rectangle([x + 9, y + 8, x + 10, y + 14], fill=1)
-        # Base of the 'i'
-        draw.line([x + 7, y + 14, x + 12, y + 14], fill=1)
+    def _draw_INFO(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Circle badge with 'i' letter."""
+        draw.ellipse((cx - 9, cy - 9, cx + 9, cy + 9), outline="white", fill="black")
+        draw.point((cx, cy - 5), fill="white")
+        draw.line((cx, cy - 2, cx, cy + 5), fill="white")
+        draw.line((cx - 2, cy - 2, cx, cy - 2), fill="white")
+        draw.line((cx - 2, cy + 5, cx + 2, cy + 5), fill="white")
 
     @staticmethod
-    def _draw_NETWORK(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Ethernet Network Switch icon with RJ45 ports and activity LEDs."""
-        # Main switch chassis
-        draw.rectangle([x + 1, y + 3, x + 18, y + 16], outline=1)
-        # 4 Port cutouts
-        for px in [x + 3, x + 7, x + 11, x + 15]:
-            draw.rectangle([px, y + 9, px + 2, y + 13], outline=1)
-            # Port latch notch
-            draw.point((px + 1, y + 9), fill=0)
-            # Port activity LED
-            draw.point((px + 1, y + 5), fill=1)
+    def _draw_NETWORK(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Wi-Fi / Signal waves icon."""
+        draw.arc((cx - 10, cy - 8, cx + 10, cy + 12), 200, 340, fill="white")
+        draw.arc((cx - 6, cy - 4, cx + 6, cy + 8), 200, 340, fill="white")
+        draw.ellipse((cx - 2, cy + 3, cx + 2, cy + 7), fill="white")
 
     @staticmethod
-    def _draw_ENDPOINT(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """PC Workstation / Monitor icon."""
-        # Monitor outer frame
-        draw.rectangle([x + 2, y + 2, x + 17, y + 13], outline=1)
-        # Power LED
-        draw.point((x + 15, y + 12), fill=1)
-        # Stand neck
-        draw.line([x + 9, y + 14, x + 10, y + 14], fill=1)
-        draw.line([x + 9, y + 15, x + 10, y + 15], fill=1)
-        # Stand base
-        draw.line([x + 5, y + 16, x + 14, y + 16], fill=1)
+    def _draw_WIFI(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Wi-Fi waves icon alias."""
+        IconRenderer._draw_NETWORK(draw, cx, cy)
 
     @staticmethod
-    def _draw_VAULT(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Security Vault / Safe Door icon."""
-        # Safe box body
-        draw.rectangle([x + 2, y + 2, x + 17, y + 17], outline=1)
-        # Rivets / Corner bolts
-        draw.point((x + 4, y + 4), fill=1)
-        draw.point((x + 15, y + 4), fill=1)
-        draw.point((x + 4, y + 15), fill=1)
-        draw.point((x + 15, y + 15), fill=1)
-        # Dial ring
-        draw.ellipse([x + 7, y + 7, x + 12, y + 12], outline=1)
-        # Dial handle notch
-        draw.line([x + 13, y + 9, x + 15, y + 9], fill=1)
+    def _draw_BATTERY(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Battery silhouette with charge level indicator."""
+        draw.rectangle((cx - 9, cy - 5, cx + 7, cy + 5), outline="white", fill="black")
+        draw.rectangle((cx + 8, cy - 2, cx + 9, cy + 2), fill="white")
+        draw.rectangle((cx - 7, cy - 3, cx + 2, cy + 3), fill="white")
 
     @staticmethod
-    def _draw_IP(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """IP / Network Node Globe icon."""
-        # Globe circle
-        draw.ellipse([x + 2, y + 2, x + 17, y + 17], outline=1)
-        # Equator
-        draw.line([x + 2, y + 9, x + 17, y + 9], fill=1)
-        # Meridian curve
-        draw.ellipse([x + 6, y + 2, x + 13, y + 17], outline=1)
+    def _draw_SYSTEM(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Microprocessor chip with pins."""
+        draw.rectangle((cx - 6, cy - 6, cx + 6, cy + 6), outline="white", fill="black")
+        draw.rectangle((cx - 3, cy - 3, cx + 3, cy + 3), fill="white")
+        for i in (-4, 0, 4):
+            draw.line((cx + i, cy - 9, cx + i, cy - 7), fill="white")
+            draw.line((cx + i, cy + 7, cx + i, cy + 9), fill="white")
+            draw.line((cx - 9, cy + i, cx - 7, cy + i), fill="white")
+            draw.line((cx + 7, cy + i, cx + 9, cy + i), fill="white")
 
     @staticmethod
-    def _draw_WIFI(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Wi-Fi Signal Radiating Waves icon."""
-        # Center signal dot
-        draw.rectangle([x + 9, y + 15, x + 10, y + 16], fill=1)
-        # Inner wave
-        draw.arc([x + 6, y + 11, x + 13, y + 18], start=210, end=330, fill=1)
-        # Middle wave
-        draw.arc([x + 3, y + 7, x + 16, y + 20], start=210, end=330, fill=1)
-        # Outer wave
-        draw.arc([x + 0, y + 3, x + 19, y + 22], start=210, end=330, fill=1)
+    def _draw_CPU(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """CPU alias for SYSTEM icon."""
+        IconRenderer._draw_SYSTEM(draw, cx, cy)
 
     @staticmethod
-    def _draw_BATTERY(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Battery Gauge icon."""
-        # Main shell
-        draw.rectangle([x + 2, y + 5, x + 16, y + 14], outline=1)
-        # Positive terminal nib
-        draw.rectangle([x + 17, y + 7, x + 18, y + 12], fill=1)
-        # Charge bars (80% full)
-        draw.rectangle([x + 4, y + 7, x + 6, y + 12], fill=1)
-        draw.rectangle([x + 8, y + 7, x + 10, y + 12], fill=1)
-        draw.rectangle([x + 12, y + 7, x + 14, y + 12], fill=1)
+    def _draw_SWITCH(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Network Switch with RJ45 ports."""
+        draw.rectangle((cx - 10, cy - 5, cx + 10, cy + 5), outline="white", fill="black")
+        for i in (-6, -1, 4):
+            draw.rectangle((cx + i, cy - 2, cx + i + 2, cy + 2), fill="white")
 
     @staticmethod
-    def _draw_CPU(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """CPU / System Chip icon."""
-        # Main chip body
-        draw.rectangle([x + 4, y + 4, x + 15, y + 15], outline=1)
-        # Core die
-        draw.rectangle([x + 7, y + 7, x + 12, y + 12], fill=1)
-        # Top & bottom pins
-        for px in [x + 6, x + 9, x + 13]:
-            draw.line([px, y + 1, px, y + 3], fill=1)
-            draw.line([px, y + 16, px, y + 18], fill=1)
-        # Left & right pins
-        for py in [y + 6, y + 9, y + 13]:
-            draw.line([x + 1, py, x + 3, py], fill=1)
-            draw.line([x + 16, py, x + 18, py], fill=1)
+    def _draw_SWITCHES(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for switch icon."""
+        IconRenderer._draw_SWITCH(draw, cx, cy)
 
     @staticmethod
-    def _draw_SERIAL(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """RS232 / Cisco Serial DB9 connector icon."""
-        # D-Sub shell
-        draw.polygon([
-            (x + 2, y + 5),
-            (x + 17, y + 5),
-            (x + 15, y + 15),
-            (x + 4, y + 15)
-        ], outline=1)
-        # Screw lugs
-        draw.point((x + 1, y + 9), fill=1)
-        draw.point((x + 18, y + 9), fill=1)
-        # Pin dots (top row 5, bottom row 4)
-        for px in range(x + 5, x + 15, 2):
-            draw.point((px, y + 8), fill=1)
-        for px in range(x + 6, x + 14, 2):
-            draw.point((px, y + 12), fill=1)
+    def _draw_ENDPOINT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Desktop PC / Monitor."""
+        draw.rectangle((cx - 9, cy - 7, cx + 9, cy + 3), outline="white", fill="black")
+        draw.line((cx, cy + 4, cx, cy + 7), fill="white")
+        draw.line((cx - 4, cy + 7, cx + 4, cy + 7), fill="white")
 
     @staticmethod
-    def _draw_SSH(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """SSH Terminal / CLI Prompt icon."""
-        # Window frame
-        draw.rectangle([x + 1, y + 2, x + 18, y + 17], outline=1)
-        # Title bar divider
-        draw.line([x + 1, y + 5, x + 18, y + 5], fill=1)
-        # Window buttons
-        draw.point((x + 3, y + 3), fill=1)
-        draw.point((x + 5, y + 3), fill=1)
-        # Prompt '>_'
-        draw.line([x + 3, y + 8, x + 6, y + 11], fill=1)
-        draw.line([x + 6, y + 11, x + 3, y + 14], fill=1)
-        draw.line([x + 8, y + 14, x + 12, y + 14], fill=1)
+    def _draw_PC(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for desktop PC icon."""
+        IconRenderer._draw_ENDPOINT(draw, cx, cy)
 
     @staticmethod
-    def _draw_SNMP(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """SNMP Radar / Scanner icon."""
-        # Outer circle
-        draw.ellipse([x + 1, y + 1, x + 18, y + 18], outline=1)
-        # Crosshair lines
-        draw.line([x + 1, y + 9, x + 18, y + 9], fill=1)
-        draw.line([x + 9, y + 1, x + 9, y + 18], fill=1)
-        # Radar sweep target blip
-        draw.rectangle([x + 12, y + 4, x + 14, y + 6], fill=1)
+    def _draw_VAULT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Security Lock / Vault Shield."""
+        draw.arc((cx - 5, cy - 8, cx + 5, cy + 2), 180, 360, fill="white")
+        draw.rectangle((cx - 7, cy - 1, cx + 7, cy + 8), outline="white", fill="black")
+        draw.point((cx, cy + 3), fill="white")
 
     @staticmethod
-    def _draw_WINDOWS(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Windows / RNDIS USB Endpoint icon."""
-        # 4 Quadrants logo
-        draw.polygon([(x + 2, y + 5), (x + 8, y + 4), (x + 8, y + 9), (x + 2, y + 9)], fill=1)
-        draw.polygon([(x + 10, y + 4), (x + 17, y + 2), (x + 17, y + 9), (x + 10, y + 9)], fill=1)
-        draw.polygon([(x + 2, y + 11), (x + 8, y + 11), (x + 8, y + 16), (x + 2, y + 15)], fill=1)
-        draw.polygon([(x + 10, y + 11), (x + 17, y + 11), (x + 17, y + 18), (x + 10, y + 16)], fill=1)
+    def _draw_SHIELD(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for vault / shield icon."""
+        IconRenderer._draw_VAULT(draw, cx, cy)
 
     @staticmethod
-    def _draw_LINUX(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Linux Tux Console icon."""
-        # Penguin body outline
-        draw.ellipse([x + 5, y + 2, x + 14, y + 15], outline=1)
-        # Eyes
-        draw.point((x + 8, y + 5), fill=1)
-        draw.point((x + 11, y + 5), fill=1)
-        # Beak
-        draw.line([x + 8, y + 7, x + 11, y + 7], fill=1)
-        # Belly
-        draw.ellipse([x + 7, y + 9, x + 12, y + 14], fill=1)
-        # Feet
-        draw.line([x + 4, y + 16, x + 8, y + 16], fill=1)
-        draw.line([x + 11, y + 16, x + 15, y + 16], fill=1)
+    def _draw_IP(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Network IP Node / Globe."""
+        draw.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), outline="white", fill="black")
+        draw.line((cx - 8, cy, cx + 8, cy), fill="white")
+        draw.ellipse((cx - 4, cy - 8, cx + 4, cy + 8), outline="white")
+
+    @staticmethod
+    def _draw_SERIAL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Serial DB9 Connector."""
+        draw.polygon([(cx - 8, cy - 5), (cx + 8, cy - 5), (cx + 6, cy + 6), (cx - 6, cy + 6)], outline="white", fill="black")
+        for px in (-4, 0, 4):
+            draw.point((cx + px, cy - 2), fill="white")
+            draw.point((cx + px, cy + 2), fill="white")
+
+    @staticmethod
+    def _draw_SSH(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """SSH Terminal Prompt."""
+        draw.rectangle((cx - 9, cy - 7, cx + 9, cy + 7), outline="white", fill="black")
+        draw.line((cx - 6, cy - 3, cx - 3, cy), fill="white")
+        draw.line((cx - 3, cy, cx - 6, cy + 3), fill="white")
+        draw.line((cx - 1, cy + 3, cx + 4, cy + 3), fill="white")
+
+    @staticmethod
+    def _draw_SNMP(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """SNMP Radar Scanner."""
+        draw.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), outline="white", fill="black")
+        draw.line((cx - 8, cy, cx + 8, cy), fill="white")
+        draw.line((cx, cy - 8, cx, cy + 8), fill="white")
+        draw.point((cx + 4, cy - 4), fill="white")
+
+    @staticmethod
+    def _draw_WINDOWS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Windows USB / OS logo."""
+        draw.rectangle((cx - 7, cy - 6, cx - 1, cy - 1), fill="white")
+        draw.rectangle((cx + 1, cy - 6, cx + 7, cy - 1), fill="white")
+        draw.rectangle((cx - 7, cy + 1, cx - 1, cy + 6), fill="white")
+        draw.rectangle((cx + 1, cy + 1, cx + 7, cy + 6), fill="white")
+
+    @staticmethod
+    def _draw_LINUX(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Linux Terminal / Tux icon."""
+        IconRenderer._draw_SSH(draw, cx, cy)
 
 
 class BaseView(ABC):
@@ -252,7 +213,7 @@ class BaseView(ABC):
         Renders the continuous 1px perimeter border.
         Standard coordinates: (1, 1) to (126, 62).
         """
-        draw.rectangle([1, 1, 126, 62], outline=1)
+        draw.rectangle((1, 1, 126, 62), outline="white", fill="black")
 
     @abstractmethod
     def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
@@ -282,7 +243,7 @@ class HeroCard:
 
 class HeroCardDeckView(BaseView):
     """
-    Hero Card Deck View (Carousel).
+    Carrusel de tarjetas minimalistas (Borde + Puntos + Icono + Título).
     Renders 20x20 procedural pixel-art hero icon centered at (64, 24),
     continuous perimeter frame (1,1)-(126,62), micro-dot carousel pagination,
     and dynamically centered uppercase title at Y=44.
@@ -299,62 +260,54 @@ class HeroCardDeckView(BaseView):
         return self
 
     def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
-        # 1. Continuous Perimeter Border (1, 1) to (126, 62)
+        # 1. Borde perimetral fijo (1, 1) a (126, 62)
         self.draw_perimeter_border(draw)
 
         if not self.cards:
-            draw.text((30, 28), "NO ITEMS", fill=1, font=self.font)
+            draw.text((30, 28), "NO ITEMS", fill="white", font=self.font)
             return
 
-        total_cards = len(self.cards)
-        self.active_index = max(0, min(self.active_index, total_cards - 1))
+        total = len(self.cards)
+        self.active_index = max(0, min(self.active_index, total - 1))
         active_card = self.cards[self.active_index]
 
-        # 2. Micro-Dot Pagination (Top-Right Corner)
-        if total_cards > 1:
-            dot_spacing = 4
-            total_pagination_width = (total_cards - 1) * dot_spacing
-            start_x = 122 - total_pagination_width
-            dot_y = 5
+        # 2. Puntos de carrusel en la esquina superior derecha
+        start_x = 122 - (total * 5)
+        for i in range(total):
+            x = start_x + (i * 5)
+            if i == self.active_index:
+                draw.rectangle((x, 4, x + 2, 6), fill="white")
+            else:
+                draw.point((x + 1, 5), fill="white")
 
-            for idx in range(total_cards):
-                px = start_x + (idx * dot_spacing)
-                if idx == self.active_index:
-                    # Active dot: 2x2 filled micro-dot
-                    draw.rectangle([px, dot_y, px + 1, dot_y + 1], fill=1)
-                else:
-                    # Inactive dot: 1x1 micro-dot
-                    draw.point((px, dot_y), fill=1)
+        # 3. Dibujar Icono Centrado (cx=64, cy=24)
+        IconRenderer.draw_icon(draw, active_card.icon_name, cx=64, cy=24)
 
-        # 3. Hero Icon (20x20 px centered at 64, 24)
-        IconRenderer.draw_icon(draw, active_card.icon_name, center_x=64, center_y=24)
-
-        # 4. Dynamically Centered Uppercase Title at Y=44
+        # 4. Dibujar Título Centrado en Y=44
         title_text = active_card.title.upper()
-        bbox = draw.textbbox((0, 0), title_text, font=self.font)
-        text_width = bbox[2] - bbox[0]
-        title_x = max(4, (width - text_width) // 2)
-        draw.text((title_x, 44), title_text, fill=1, font=self.font)
+        text_w = len(title_text) * 6
+        text_x = max(4, (width - text_w) // 2)
+        draw.text((text_x, 44), title_text, font=self.font, fill="white")
 
     def handle_input(self, event: InputEvent) -> ViewAction:
         if not self.cards:
-            if event in (InputEvent.KEY1, InputEvent.BACK):
+            if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.BACK):
                 return ViewAction(ViewActionType.POP_VIEW)
             return ViewAction(ViewActionType.NONE)
 
         total_cards = len(self.cards)
 
         # Navigation: Left/Right Carousel
-        if event == InputEvent.LEFT:
-            self.active_index = (self.active_index - 1) % total_cards
-            return ViewAction(ViewActionType.NONE)
-
-        elif event == InputEvent.RIGHT:
+        if event == InputEvent.RIGHT:
             self.active_index = (self.active_index + 1) % total_cards
             return ViewAction(ViewActionType.NONE)
 
-        # Selection: Joystick Press or Physical Key 3
-        elif event in (InputEvent.PRESS, InputEvent.KEY3):
+        elif event == InputEvent.LEFT:
+            self.active_index = (self.active_index - 1 + total_cards) % total_cards
+            return ViewAction(ViewActionType.NONE)
+
+        # Selection: Joystick Press or Physical Key 1
+        elif event in (InputEvent.PRESS, InputEvent.KEY1):
             current_card = self.cards[self.active_index]
             if current_card.on_select:
                 current_card.on_select()
@@ -368,8 +321,8 @@ class HeroCardDeckView(BaseView):
                 )
             return ViewAction(ViewActionType.NONE)
 
-        # Back Navigation: Physical Key 1 / BACK
-        elif event in (InputEvent.KEY1, InputEvent.BACK):
+        # Back Navigation: Physical Key 3 / BACK
+        elif event in (InputEvent.KEY3, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -377,9 +330,7 @@ class HeroCardDeckView(BaseView):
 
 class DetailCardView(BaseView):
     """
-    Detail Card View.
-    Displays diagnostic metrics, live status outputs, and telemetry data
-    while retaining the continuous perimeter frame.
+    Vista de detalle / métrica final (Mantiene el borde).
     """
 
     def __init__(
@@ -413,44 +364,27 @@ class DetailCardView(BaseView):
             self._spinner_tick = (self._spinner_tick + 1) % 12
 
     def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
-        # 1. Continuous Perimeter Border
+        # 1. Borde perimetral
         self.draw_perimeter_border(draw)
 
-        # 2. Header Title (Uppercase, Y=4)
+        # 2. Cabecera centrada
         header_text = self.title.upper()
-        draw.text((5, 4), header_text[:14], fill=1, font=self.font)
+        text_w = len(header_text) * 6
+        draw.text(((width - text_w) // 2, 6), header_text, font=self.font, fill="white")
+        draw.line((4, 18, 123, 18), fill="white")
 
-        # Status / Activity Badge (Top Right)
-        if self.is_loading:
-            spinner_frames = ["-", "\\", "|", "/"]
-            spin_char = spinner_frames[(self._spinner_tick // 3) % 4]
-            draw.text((114, 4), spin_char, fill=1, font=self.font)
+        # 3. Contenido limpio (Y=24, espaciado 12px)
+        y = 24
+        visible_lines = self.lines[self.scroll_offset : self.scroll_offset + 3]
+        if not visible_lines:
+            draw.text((8, y), "Sin datos / Presione OK", font=self.font, fill="white")
         else:
-            draw.text((96, 4), self.status_text[:5].upper(), fill=1, font=self.font)
-
-        # Header Separator
-        draw.line([4, 15, 123, 15], fill=1)
-
-        # 3. Content Lines (Y=18 to Y=58, max 4 visible lines)
-        visible_lines = 4
-        line_height = 10
-        y_start = 18
-
-        if not self.lines:
-            draw.text((8, 28), "Sin datos / Presione OK", fill=1, font=self.font)
-        else:
-            for idx in range(visible_lines):
-                line_idx = self.scroll_offset + idx
-                if line_idx < len(self.lines):
-                    draw.text(
-                        (5, y_start + (idx * line_height)),
-                        self.lines[line_idx][:22],
-                        fill=1,
-                        font=self.font
-                    )
+            for line in visible_lines:
+                draw.text((8, y), line[:20], font=self.font, fill="white")
+                y += 12
 
     def handle_input(self, event: InputEvent) -> ViewAction:
-        max_scroll = max(0, len(self.lines) - 4)
+        max_scroll = max(0, len(self.lines) - 3)
 
         if event == InputEvent.UP:
             self.scroll_offset = max(0, self.scroll_offset - 1)
@@ -460,13 +394,14 @@ class DetailCardView(BaseView):
             self.scroll_offset = min(max_scroll, self.scroll_offset + 1)
             return ViewAction(ViewActionType.NONE)
 
-        elif event in (InputEvent.PRESS, InputEvent.KEY2, InputEvent.KEY3):
+        elif event == InputEvent.KEY2:
             if self.on_refresh:
                 self.is_loading = True
                 self.on_refresh()
             return ViewAction(ViewActionType.NONE)
 
-        elif event in (InputEvent.KEY1, InputEvent.BACK):
+        # Return on Key3, Key1, Press or Back
+        elif event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -474,38 +409,88 @@ class DetailCardView(BaseView):
 
 class ScreenManager:
     """
-    Manages view stack transitions and OLED frame rendering.
-    Supports hardware SH1106 OLED (SPI/I2C) with seamless fallback
-    to virtual buffer simulation.
+    Gestor de pantallas y renderizado OLED SH1106.
+    Soporta comunicación SPI directa con el HAT OLED Waveshare 1.3"
+    (DC=GPIO24, RST=GPIO25, rotate=2) con fallback a I2C o simulación.
     """
 
-    def __init__(self, width: int = 128, height: int = 64, i2c_port: int = 1, i2c_address: int = 0x3C):
+    def __init__(
+        self,
+        width: int = 128,
+        height: int = 64,
+        gpio_dc: int = 24,
+        gpio_rst: int = 25,
+        bus_speed_hz: int = 8000000,
+        rotate: int = 2,
+        i2c_port: int = 1,
+        i2c_address: int = 0x3C,
+    ):
         self.width = width
         self.height = height
+        self.rotate = rotate
         self._view_stack: List[BaseView] = []
         self._oled_device: Optional[Any] = None
-        self._buffer: Image.Image = Image.new("1", (self.width, self.height), 0)
+        self._buffer: Image.Image = Image.new("1", (self.width, self.height), "black")
         self._draw: ImageDraw.ImageDraw = ImageDraw.Draw(self._buffer)
 
-        self._initialize_display_hardware(i2c_port, i2c_address)
+        self._initialize_display_hardware(
+            gpio_dc=gpio_dc,
+            gpio_rst=gpio_rst,
+            bus_speed_hz=bus_speed_hz,
+            rotate=rotate,
+            i2c_port=i2c_port,
+            i2c_address=i2c_address,
+        )
 
-    def _initialize_display_hardware(self, i2c_port: int, i2c_address: int) -> None:
-        """Attempts to initialize luma.oled SH1106 hardware driver."""
+    def _initialize_display_hardware(
+        self,
+        gpio_dc: int,
+        gpio_rst: int,
+        bus_speed_hz: int,
+        rotate: int,
+        i2c_port: int,
+        i2c_address: int,
+    ) -> None:
+        """Inicializa el controlador luma.oled SH1106 por SPI."""
         try:
             from luma.core.interface.serial import i2c, spi
             from luma.oled.device import sh1106
 
-            # Try SPI first (Waveshare 1.3inch OLED default), then I2C fallback
+            # 1. SPI Interface (Waveshare 1.3" OLED HAT: DC=GPIO24, RST=GPIO25, rotate=2)
             try:
-                # SPI configuration (CS=GPIO8, DC=GPIO25, RST=GPIO27)
-                serial_interface = spi(device=0, port=0, bus_speed_hz=8000000, gpio_DC=25, gpio_RST=27)
-                self._oled_device = sh1106(serial_interface, width=self.width, height=self.height, rotate=0)
-                logger.info("Initialized SH1106 OLED via SPI interface.")
+                serial_interface = spi(
+                    device=0,
+                    port=0,
+                    bus_speed_hz=bus_speed_hz,
+                    gpio_DC=gpio_dc,
+                    gpio_RST=gpio_rst,
+                )
+                self._oled_device = sh1106(
+                    serial_interface,
+                    width=self.width,
+                    height=self.height,
+                    rotate=rotate,
+                )
+                logger.info(
+                    f"Initialized SH1106 OLED via SPI (DC={gpio_dc}, RST={gpio_rst}, rotate={rotate})."
+                )
+                return
             except Exception as spi_ex:
-                logger.debug(f"SPI initialization failed ({spi_ex}), trying I2C...")
+                logger.warning(f"SPI initialization failed ({spi_ex}), trying I2C fallback...")
+
+            # 2. I2C Interface Fallback
+            try:
                 serial_interface = i2c(port=i2c_port, address=i2c_address)
-                self._oled_device = sh1106(serial_interface, width=self.width, height=self.height, rotate=0)
-                logger.info("Initialized SH1106 OLED via I2C interface.")
+                self._oled_device = sh1106(
+                    serial_interface,
+                    width=self.width,
+                    height=self.height,
+                    rotate=rotate,
+                )
+                logger.info(f"Initialized SH1106 OLED via I2C (port={i2c_port}, addr={hex(i2c_address)}).")
+                return
+            except Exception as i2c_ex:
+                logger.warning(f"I2C initialization failed ({i2c_ex}).")
 
         except (ImportError, Exception) as ex:
             self._oled_device = None
@@ -541,8 +526,8 @@ class ScreenManager:
         Renders the active view into the 128x64 1-bit buffer
         and pushes pixels to the SH1106 OLED device.
         """
-        # Clear frame (0 = Black)
-        self._draw.rectangle([0, 0, self.width - 1, self.height - 1], fill=0)
+        # Clear frame to black
+        self._draw.rectangle([0, 0, self.width - 1, self.height - 1], fill="black")
 
         view = self.current_view
         if view:
@@ -562,3 +547,11 @@ class ScreenManager:
     def buffer(self) -> Image.Image:
         """Access the current raw PIL 1-bit image buffer."""
         return self._buffer
+
+    def clear(self) -> None:
+        """Clears physical display on shutdown."""
+        if self._oled_device is not None:
+            try:
+                self._oled_device.clear()
+            except Exception:
+                pass

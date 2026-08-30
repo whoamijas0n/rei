@@ -78,15 +78,14 @@ class TestHeroCardStandard(unittest.TestCase):
 
         # Check continuous perimeter border at (1, 1) to (126, 62)
         # Top line
-        self.assertEqual(img.getpixel((1, 1)), 1)
-        self.assertEqual(img.getpixel((126, 1)), 1)
+        self.assertNotEqual(img.getpixel((1, 1)), 0)
+        self.assertNotEqual(img.getpixel((126, 1)), 0)
         # Bottom line
-        self.assertEqual(img.getpixel((1, 62)), 1)
-        self.assertEqual(img.getpixel((126, 62)), 1)
+        self.assertNotEqual(img.getpixel((1, 62)), 0)
+        self.assertNotEqual(img.getpixel((126, 62)), 0)
 
         # Check micro-dot pagination exists in top right
-        # Total width: 2 cards -> dots at 122 - 4 = 118, and 122
-        self.assertEqual(img.getpixel((118, 5)), 1)
+        self.assertNotEqual(img.getpixel((118, 5)), 0)
 
     def test_navigation_cycling(self):
         deck = HeroCardDeckView("TEST DECK")
@@ -142,7 +141,7 @@ class TestMenuHierarchyAndApp(unittest.TestCase):
         self.assertEqual(lvl2_titles, ["VER DIRECCION IP", "ESCANEAR WI-FI"])
 
         # Test Back navigation
-        pop_action = lvl2_view.handle_input(InputEvent.KEY1)
+        pop_action = lvl2_view.handle_input(InputEvent.KEY3)
         self.assertEqual(pop_action.action_type, ViewActionType.POP_VIEW)
         app.screen_manager.pop_view()
         self.assertEqual(app.screen_manager.current_view, lvl1_view)
