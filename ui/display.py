@@ -260,6 +260,77 @@ class IconRenderer:
         """Alias for REBOOT icon."""
         IconRenderer._draw_REBOOT(draw, cx, cy)
 
+    @staticmethod
+    def _draw_UPDATE(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """System / software update circular arrows (20x20)."""
+        draw.arc((cx - 8, cy - 8, cx + 8, cy + 8), 30, 200, fill="white")
+        draw.arc((cx - 8, cy - 8, cx + 8, cy + 8), 210, 20, fill="white")
+        draw.polygon([(cx + 6, cy - 7), (cx + 9, cy - 1), (cx + 3, cy - 2)], fill="white")
+        draw.polygon([(cx - 6, cy + 7), (cx - 9, cy + 1), (cx - 3, cy + 2)], fill="white")
+
+    @staticmethod
+    def _draw_ACTUALIZACION(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for UPDATE icon."""
+        IconRenderer._draw_UPDATE(draw, cx, cy)
+
+    @staticmethod
+    def _draw_ACTUALIZACIONES(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for UPDATE icon."""
+        IconRenderer._draw_UPDATE(draw, cx, cy)
+
+    @staticmethod
+    def _draw_UPGRADE(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for UPDATE icon."""
+        IconRenderer._draw_UPDATE(draw, cx, cy)
+
+    @staticmethod
+    def _draw_SYNC(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for UPDATE icon."""
+        IconRenderer._draw_UPDATE(draw, cx, cy)
+
+    @staticmethod
+    def _draw_APT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Debian / APT Package Box (20x20)."""
+        draw.rectangle((cx - 8, cy - 7, cx + 8, cy + 7), outline="white", fill="black")
+        draw.line((cx - 8, cy - 2, cx + 8, cy - 2), fill="white")
+        draw.line((cx, cy - 2, cx, cy + 7), fill="white")
+        draw.line((cx - 3, cy - 5, cx + 3, cy - 5), fill="white")
+
+    @staticmethod
+    def _draw_SISTEMA_APT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for APT icon."""
+        IconRenderer._draw_APT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_PKG(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for APT icon."""
+        IconRenderer._draw_APT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_GIT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Git Branch / Commit Node Icon (20x20)."""
+        draw.line((cx - 4, cy - 7, cx - 4, cy + 7), fill="white")
+        draw.arc((cx - 4, cy - 4, cx + 4, cy + 4), 270, 360, fill="white")
+        draw.line((cx + 4, cy, cx + 4, cy - 7), fill="white")
+        draw.ellipse((cx - 6, cy - 8, cx - 2, cy - 4), fill="white")
+        draw.ellipse((cx - 6, cy + 4, cx - 2, cy + 8), fill="white")
+        draw.ellipse((cx + 2, cy - 8, cx + 6, cy - 4), fill="white")
+
+    @staticmethod
+    def _draw_GITHUB(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for GIT icon."""
+        IconRenderer._draw_GIT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_REPO(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for GIT icon."""
+        IconRenderer._draw_GIT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_PROGRAMA(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for GIT icon."""
+        IconRenderer._draw_GIT(draw, cx, cy)
+
 
 class BaseView(ABC):
     """Abstract Base Class for all OLED views."""
@@ -469,6 +540,115 @@ class DetailCardView(BaseView):
 
         # Return on Key3, Key1, Press or Back
         elif event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
+            return ViewAction(ViewActionType.POP_VIEW)
+
+        return ViewAction(ViewActionType.NONE)
+
+
+class UpdateProgressView(BaseView):
+    """
+    Pantalla de progreso bloqueante para actualizaciones de Sistema (APT) o Programa (Git).
+    Muestra barra de progreso y fases en tiempo real a 30 FPS en pantalla OLED 128x64.
+    BLOQUEO ESTRICTO: Mientras is_running=True, ignora todas las entradas del usuario.
+    Al finalizar (is_finished=True), muestra reporte de éxito o error y habilita KEY3/PRESS para salir.
+    """
+
+    def __init__(self, title: str, on_start: Optional[Callable[[], None]] = None):
+        super().__init__(title=title)
+        self.on_start = on_start
+        self.stage_message: str = "Iniciando..."
+        self.progress: float = 0.0
+        self.is_running: bool = True
+        self.is_finished: bool = False
+        self.is_success: bool = False
+        self.result_summary: str = ""
+        self.result_details: List[str] = []
+        self._anim_tick: int = 0
+        self._start_time: float = time.monotonic()
+        self._started: bool = False
+
+    def start(self) -> None:
+        """Starts background task if callback provided."""
+        if not self._started and self.on_start:
+            self._started = True
+            self.on_start()
+
+    def set_progress(self, message: str, progress: float) -> None:
+        """Thread-safe update of current progress stage."""
+        self.stage_message = message
+        self.progress = max(0.0, min(1.0, progress))
+
+    def set_completed(self, success: bool, summary: str, details: Optional[List[str]] = None) -> None:
+        """Transitions view from running state to finished state."""
+        self.is_running = False
+        self.is_finished = True
+        self.is_success = success
+        self.result_summary = summary
+        self.result_details = details or []
+        self.progress = 1.0
+
+    def update(self) -> None:
+        """Frame ticker hook called at 30 FPS."""
+        if not self._started and self.on_start:
+            self.start()
+        if self.is_running:
+            self._anim_tick = (self._anim_tick + 1) % 60
+
+    def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
+        # 1. Borde perimetral continuo
+        self.draw_perimeter_border(draw)
+
+        # 2. Cabecera centrada
+        header_text = self.title.upper()
+        text_w = len(header_text) * 6
+        draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
+        draw.line((4, 16, 123, 16), fill="white")
+
+        if self.is_running:
+            # 3A. Barra de progreso exterior (X: 12..115, Y: 22..30)
+            draw.rectangle((12, 22, 115, 30), outline="white", fill="black")
+            fill_w = int(101 * self.progress)
+            if fill_w > 0:
+                draw.rectangle((13, 23, 13 + fill_w, 29), fill="white")
+            else:
+                # Glider animado de actividad inicial
+                glider_x = 14 + ((self._anim_tick * 3) % 85)
+                draw.rectangle((glider_x, 24, min(113, glider_x + 12), 28), fill="white")
+
+            # 4A. Etiqueta de fase actual
+            stage_txt = self.stage_message[:18]
+            draw.text((10, 34), stage_txt, font=self.font, fill="white")
+
+            # 5A. Porcentaje y tiempo transcurrido
+            elapsed = time.monotonic() - self._start_time
+            info_txt = f"{int(self.progress * 100)}% ({elapsed:.1f}s)"
+            draw.text((10, 47), info_txt, font=self.font, fill="white")
+
+        else:
+            # 3B. Estado finalizado (Éxito o Fallo)
+            if self.is_success:
+                draw.text((8, 20), "[✓] COMPLETADO", font=self.font, fill="white")
+            else:
+                draw.text((8, 20), "[✗] FALLO / ERROR", font=self.font, fill="white")
+
+            # 4B. Línea de resumen
+            first_line = (self.result_details[0] if self.result_details else self.result_summary)[:19]
+            draw.text((8, 33), first_line, font=self.font, fill="white")
+
+            # 5B. Línea de detalle o indicación de salida
+            if len(self.result_details) > 1:
+                second_line = self.result_details[1][:19]
+                draw.text((8, 45), second_line, font=self.font, fill="white")
+            else:
+                draw.text((8, 45), "OK / KEY3: Salir", font=self.font, fill="white")
+
+    def handle_input(self, event: InputEvent) -> ViewAction:
+        if self.is_running:
+            # BLOQUEO ESTRICTO: No se permite salir ni interrumpir mientras corre
+            return ViewAction(ViewActionType.NONE)
+
+        # Cuando concluye, permitir salir con KEY3, KEY1, PRESS, BACK
+        if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
