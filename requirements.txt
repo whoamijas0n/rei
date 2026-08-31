@@ -12,3 +12,4 @@ uvicorn>=0.28.0
 qrcode>=7.4.2
 pydantic>=2.6.4
 smbus2>=0.4.3
+evdev>=1.7.0

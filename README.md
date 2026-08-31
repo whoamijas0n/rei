@@ -1,4 +1,4 @@
-# REI
+# REI (Portable Multi-Interface Diagnostic Hub)
 
 REI es un dispositivo de campo de bolsillo autónomo para diagnóstico rápido de infraestructura TI y endpoints, diseñado para Raspberry Pi Zero 2 W con pantalla OLED SH1106 de 1.3" (128x64 px).
 

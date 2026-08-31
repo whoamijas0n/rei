@@ -16,6 +16,7 @@ from core.manager import DiagnosticManager
 from core.plugins import (
     IPAddressPlugin,
     WiFiScanPlugin,
+    WiFiConnectPlugin,
     BatteryStatusPlugin,
     SystemStatusPlugin,
     CiscoSerialPlugin,
@@ -34,6 +35,7 @@ from ui.display import (
     HeroCardDeckView,
     DetailCardView,
     UpdateProgressView,
+    KeyboardInputView,
     HeroCard,
     ViewAction,
     ViewActionType,
@@ -85,6 +87,7 @@ class REIApp:
         plugins = [
             IPAddressPlugin(),
             WiFiScanPlugin(),
+            WiFiConnectPlugin(),
             BatteryStatusPlugin(),
             SystemStatusPlugin(),
             CiscoSerialPlugin(),
@@ -161,6 +164,109 @@ class REIApp:
         """Callback invoked by worker thread when diagnostic completes."""
         logger.info(f"Task completed: {result.plugin_name} ({result.status.name})")
 
+    def _start_wifi_scan(self) -> None:
+        """Initiates Wi-Fi scan and displays progress."""
+        progress_view = UpdateProgressView(title="ESCANER WI-FI")
+        progress_view.stage_message = "Buscando redes..."
+        progress_view.progress = 0.5
+        self.screen_manager.push_view(progress_view)
+
+        def on_scan_done(result: DiagnosticResult):
+            self.screen_manager.pop_view()
+            self._display_scanned_wifi_networks(result)
+
+        self.diag_manager.execute_async(
+            plugin_id="diag_wifi_scan",
+            on_complete=on_scan_done
+        )
+
+    def _display_scanned_wifi_networks(self, result: DiagnosticResult) -> None:
+        """Constructs a Hero Card Deck of discovered Wi-Fi networks."""
+        networks = result.metrics.get("networks", [])
+        deck_wifi_nets = HeroCardDeckView("REDES WI-FI")
+
+        if not networks:
+            no_net_card = HeroCard(
+                title="SIN REDES",
+                icon_name="WIFI_FAIL",
+                submenu=DetailCardView("SIN REDES", ["No se encontraron", "redes Wi-Fi."])
+            )
+            deck_wifi_nets.add_card(no_net_card)
+        else:
+            for net in networks:
+                ssid = net.get("ssid", "Red Wi-Fi")
+                is_secured = net.get("is_secured", True)
+                signal_pct = net.get("signal_pct", 50)
+                icon = "LOCK" if is_secured else "WIFI"
+
+                def make_select_handler(target_ssid: str, secured: bool):
+                    def handler():
+                        if secured:
+                            kb_view = KeyboardInputView(
+                                ssid=target_ssid,
+                                on_submit=self._connect_to_wifi
+                            )
+                            self.screen_manager.push_view(kb_view)
+                        else:
+                            self._connect_to_wifi(ssid=target_ssid, password=None)
+                    return handler
+
+                deck_wifi_nets.add_card(
+                    HeroCard(
+                        title=f"{ssid.upper()[:14]}",
+                        icon_name=icon,
+                        on_select=make_select_handler(ssid, is_secured)
+                    )
+                )
+
+        self.screen_manager.push_view(deck_wifi_nets)
+
+    def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
+        """Launches Wi-Fi connection worker and shows progress."""
+        conn_view = UpdateProgressView(title="CONECTANDO...")
+        conn_view.stage_message = f"Enlazando {ssid[:10]}..."
+        conn_view.progress = 0.5
+        self.screen_manager.push_view(conn_view)
+
+        def on_connect_done(result: DiagnosticResult):
+            self.screen_manager.pop_view()
+            self._display_wifi_result_hero_card(result, ssid)
+
+        self.diag_manager.execute_async(
+            plugin_id="sys_wifi_connect",
+            ssid=ssid,
+            password=password,
+            on_complete=on_connect_done
+        )
+
+    def _display_wifi_result_hero_card(self, result: DiagnosticResult, ssid: str) -> None:
+        """Displays Wi-Fi connection outcome strictly formatted as Hero Cards."""
+        is_success = (result.status == DiagnosticStatus.SUCCESS)
+
+        if is_success:
+            hero_title = f"CONECTADO: {ssid.upper()[:8]}"
+            icon_name = "WIFI_OK"
+            detail_title = "CONEXION OK"
+        else:
+            hero_title = "ERROR CONEXION"
+            icon_name = "WIFI_FAIL"
+            detail_title = "ERROR CONEXION"
+
+        detail_view = DetailCardView(
+            title=detail_title,
+            initial_lines=result.details if result.details else [result.summary]
+        )
+
+        deck_result = HeroCardDeckView("ESTADO WI-FI")
+        deck_result.add_card(
+            HeroCard(
+                title=hero_title,
+                icon_name=icon_name,
+                submenu=detail_view
+            )
+        )
+        self.screen_manager.push_view(deck_result)
+
     def _build_menu_hierarchy(self) -> None:
         """
         Builds the exact navigation hierarchy:
@@ -175,7 +281,6 @@ class REIApp:
         # LEVEL 2: Sub-menus for CONEXION DE RED
         # ----------------------------------------------------
         view_ip_detail = self._create_detail_view("diag_ip_address", "DIRECCION IP")
-        view_wifi_detail = self._create_detail_view("diag_wifi_scan", "ESCANER WI-FI")
 
         deck_net_conn = HeroCardDeckView("CONEXION DE RED")
         deck_net_conn.add_card(
@@ -190,8 +295,7 @@ class REIApp:
             HeroCard(
                 title="ESCANEAR WI-FI",
                 icon_name="WIFI",
-                submenu=view_wifi_detail,
-                on_select=lambda: self._trigger_task("diag_wifi_scan")
+                on_select=self._start_wifi_scan
             )
         )
 
@@ -402,7 +506,7 @@ class REIApp:
     def run(self) -> None:
         """
         Executes the fixed 30 FPS UI Event Loop.
-        Consumes GPIO events, processes asynchronous diagnostic outputs,
+        Consumes GPIO and USB keyboard events, processes asynchronous diagnostic outputs,
         and renders double-buffered OLED frames with high temporal precision.
         """
         self.running = True
@@ -414,12 +518,16 @@ class REIApp:
             while self.running:
                 frame_start = time.monotonic()
 
-                # 1. Non-blocking Input Consumption
+                # 1. Non-blocking Input Consumption (GPIO + USB Keyboard)
                 event = self.input_handler.get_event()
                 while event is not None:
                     curr_view = self.screen_manager.current_view
                     if curr_view:
-                        action = curr_view.handle_input(event)
+                        if isinstance(curr_view, KeyboardInputView):
+                            action = curr_view.handle_input(event, char=self.input_handler.get_last_char())
+                        else:
+                            action = curr_view.handle_input(event)
+
                         if action.action_type == ViewActionType.PUSH_VIEW and action.target_view:
                             self.screen_manager.push_view(action.target_view)
                         elif action.action_type == ViewActionType.POP_VIEW:
@@ -449,6 +557,15 @@ class REIApp:
             logger.info("KeyboardInterrupt received.")
         finally:
             self.shutdown()
+
+    def shutdown(self) -> None:
+        """Releases hardware and thread pool resources."""
+        logger.info("Shutting down REI...")
+        self.running = False
+        self.input_handler.close()
+        self.diag_manager.shutdown(wait=False)
+        self.screen_manager.clear()
+        logger.info("Shutdown complete.")
 
     def shutdown(self) -> None:
         """Releases hardware and thread pool resources."""

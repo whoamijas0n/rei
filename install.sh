@@ -185,6 +185,7 @@ do_install() {
             python3-spidev
             git
             curl
+            python3-evdev
             dnsmasq
             smartmontools
             wireless-tools
