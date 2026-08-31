@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - GPIO Input Handler
+REI - GPIO Input Handler
 Non-blocking GPIO event capture for Waveshare 1.3" OLED HAT (SH1106).
 Maps 5-way joystick and 3 physical buttons to a thread-safe event queue using gpiozero.
 """
@@ -9,7 +9,7 @@ import logging
 import queue
 from typing import Optional, Dict, Any
 
-logger = logging.getLogger("OmniDiag.UI.Input")
+logger = logging.getLogger("REI.UI.Input")
 
 
 class InputEvent(Enum):

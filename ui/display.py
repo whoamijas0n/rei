@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - Display Engine and View Hierarchy
+REI - Display Engine and View Hierarchy
 Minimalist Hero Card System for 1.3" SH1106 OLED (128x64 px).
 Implements procedural pixel-art rendering, micro-dot pagination, continuous perimeter framing,
 and non-blocking navigation stack.
@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .input_handler import InputEvent
 
-logger = logging.getLogger("OmniDiag.UI.Display")
+logger = logging.getLogger("REI.UI.Display")
 
 
 class ViewActionType(Enum):
@@ -192,6 +192,73 @@ class IconRenderer:
     def _draw_LINUX(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
         """Linux Terminal / Tux icon."""
         IconRenderer._draw_SSH(draw, cx, cy)
+
+    @staticmethod
+    def _draw_TOOLS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Utility Gear icon (20x20)."""
+        draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), outline="white", fill="black")
+        draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill="white")
+        for dx, dy in [(-8, 0), (8, 0), (0, -8), (0, 8), (-6, -6), (6, 6), (-6, 6), (6, -6)]:
+            draw.rectangle((cx + dx - 1, cy + dy - 1, cx + dx + 1, cy + dy + 1), fill="white")
+
+    @staticmethod
+    def _draw_UTILIDADES(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for TOOLS / Gear icon."""
+        IconRenderer._draw_TOOLS(draw, cx, cy)
+
+    @staticmethod
+    def _draw_UTIL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for TOOLS / Gear icon."""
+        IconRenderer._draw_TOOLS(draw, cx, cy)
+
+    @staticmethod
+    def _draw_POWER(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Power / Lightning bolt icon (20x20)."""
+        draw.polygon([
+            (cx, cy - 8),
+            (cx - 5, cy),
+            (cx - 1, cy),
+            (cx - 3, cy + 8),
+            (cx + 5, cy - 1),
+            (cx + 1, cy - 1)
+        ], fill="white")
+
+    @staticmethod
+    def _draw_ALIMENTACION(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for POWER icon."""
+        IconRenderer._draw_POWER(draw, cx, cy)
+
+    @staticmethod
+    def _draw_POWEROFF(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Standard Power Off button icon."""
+        draw.arc((cx - 7, cy - 7, cx + 7, cy + 7), 300, 240, fill="white")
+        draw.line((cx, cy - 8, cx, cy - 1), fill="white")
+
+    @staticmethod
+    def _draw_APAGAR(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for POWEROFF icon."""
+        IconRenderer._draw_POWEROFF(draw, cx, cy)
+
+    @staticmethod
+    def _draw_SHUTDOWN(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for POWEROFF icon."""
+        IconRenderer._draw_POWEROFF(draw, cx, cy)
+
+    @staticmethod
+    def _draw_REBOOT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Circular restart / reboot arrows."""
+        draw.arc((cx - 8, cy - 8, cx + 8, cy + 8), 40, 310, fill="white")
+        draw.polygon([(cx + 2, cy - 9), (cx + 8, cy - 5), (cx + 3, cy - 3)], fill="white")
+
+    @staticmethod
+    def _draw_REINICIAR(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for REBOOT icon."""
+        IconRenderer._draw_REBOOT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_RESTART(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for REBOOT icon."""
+        IconRenderer._draw_REBOOT(draw, cx, cy)
 
 
 class BaseView(ABC):

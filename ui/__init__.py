@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - UI Module
+REI - UI Module
 Package initialization for UI rendering, views, and input handlers.
 """
 
