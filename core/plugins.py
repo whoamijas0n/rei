@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
 from .pisugar import PiSugar3Client, PiSugarTelemetry
+from .wifi import WiFiManager, WiFiNetwork
 
 
 class IPAddressPlugin(IDiagnosticPlugin):
@@ -59,6 +60,9 @@ class IPAddressPlugin(IDiagnosticPlugin):
 class WiFiScanPlugin(IDiagnosticPlugin):
     """Scans for local 2.4GHz / 5GHz Wi-Fi networks."""
 
+    def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
+        self._mgr = wifi_mgr or WiFiManager()
+
     @property
     def id(self) -> str:
         return "diag_wifi_scan"
@@ -72,21 +76,91 @@ class WiFiScanPlugin(IDiagnosticPlugin):
         return "NETWORK"
 
     def run(self, **kwargs) -> DiagnosticResult:
-        # Simulate scan delay realistically without blocking UI
-        time.sleep(0.6)
-        details = [
-            "Corp_Net_5G  [-42dBm]",
-            "REI_Lab_AP   [-55dBm]",
-            "Guest_WiFi   [-70dBm]",
-            "Switch_Mgmt  [-78dBm]"
-        ]
+        networks = self._mgr.scan_networks()
+        details = []
+        for net in networks[:8]:
+            sec_badge = "[L]" if net.is_secured else "[O]"
+            details.append(f"{sec_badge} {net.ssid[:12]:<12} {net.signal_pct}%")
+
+        if not details:
+            details = ["No se encontraron", "redes Wi-Fi."]
+
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
-            summary="4 Redes Encontradas",
+            summary=f"{len(networks)} Redes Detectadas",
             details=details,
-            metrics={"count": 4}
+            metrics={
+                "count": len(networks),
+                "networks": [
+                    {
+                        "ssid": n.ssid,
+                        "signal_pct": n.signal_pct,
+                        "security": n.security,
+                        "is_secured": n.is_secured,
+                        "frequency": n.frequency,
+                        "in_use": n.in_use
+                    }
+                    for n in networks
+                ]
+            }
         )
+
+
+class WiFiConnectPlugin(IDiagnosticPlugin):
+    """Connects to a specified Wi-Fi network with password authentication."""
+
+    def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
+        self._mgr = wifi_mgr or WiFiManager()
+
+    @property
+    def id(self) -> str:
+        return "sys_wifi_connect"
+
+    @property
+    def name(self) -> str:
+        return "CONECTAR WI-FI"
+
+    @property
+    def category(self) -> str:
+        return "NETWORK"
+
+    def run(self, ssid: str = "", password: Optional[str] = None, **kwargs) -> DiagnosticResult:
+        if not ssid:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="SSID no especificado",
+                details=["Error de red:", "SSID vacío"],
+                metrics={"success": False, "ssid": ""}
+            )
+
+        success, message, details_dict = self._mgr.connect_network(ssid=ssid, password=password)
+        if success:
+            ip_addr = details_dict.get("ip_address", "Asignada")
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.SUCCESS,
+                summary=f"Conectado a {ssid}",
+                details=[
+                    f"Red: {ssid[:15]}",
+                    f"IP:  {ip_addr[:15]}",
+                    "Conexión activa OK"
+                ],
+                metrics={"success": True, "ssid": ssid, **details_dict}
+            )
+        else:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="Fallo de conexión",
+                details=[
+                    f"Red: {ssid[:15]}",
+                    f"Error: {message[:14]}",
+                    "Verifique clave/señal"
+                ],
+                metrics={"success": False, "ssid": ssid, "error": message, **details_dict}
+            )
 
 
 class BatteryStatusPlugin(IDiagnosticPlugin):
