@@ -138,27 +138,40 @@ class WiFiConnectPlugin(IDiagnosticPlugin):
         success, message, details_dict = self._mgr.connect_network(ssid=ssid, password=password)
         if success:
             ip_addr = details_dict.get("ip_address", "Asignada")
+            details = [
+                f"SSID: {ssid[:14]}",
+                f"IP:   {ip_addr[:14]}",
+            ]
+            if "gateway" in details_dict and details_dict["gateway"]:
+                details.append(f"GW:   {str(details_dict['gateway'])[:14]}")
+            elif "signal" in details_dict and details_dict["signal"]:
+                details.append(f"Senal:{str(details_dict['signal'])[:14]}")
+            else:
+                details.append("Conexión activa OK")
+
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.SUCCESS,
                 summary=f"Conectado a {ssid}",
-                details=[
-                    f"Red: {ssid[:15]}",
-                    f"IP:  {ip_addr[:15]}",
-                    "Conexión activa OK"
-                ],
+                details=details,
                 metrics={"success": True, "ssid": ssid, **details_dict}
             )
         else:
+            reason = details_dict.get("reason", message)
+            details = [
+                f"Red:   {ssid[:14]}",
+                f"Error: {message[:14]}",
+            ]
+            if reason and reason != message:
+                details.append(f"Causa: {reason[:14]}")
+            else:
+                details.append("Verifique clave/señal")
+
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
                 summary="Fallo de conexión",
-                details=[
-                    f"Red: {ssid[:15]}",
-                    f"Error: {message[:14]}",
-                    "Verifique clave/señal"
-                ],
+                details=details,
                 metrics={"success": False, "ssid": ssid, "error": message, **details_dict}
             )
 
@@ -609,7 +622,7 @@ class RebootPlugin(IDiagnosticPlugin):
 class SystemUpdatePlugin(IDiagnosticPlugin):
     """
     Executes Debian/Raspberry Pi OS APT package updates.
-    Provides stage-by-stage progress callbacks and comprehensive error reporting.
+    Provides auto-recovery for interrupted dpkg states and stage-by-stage progress callbacks.
     """
 
     @property
@@ -634,13 +647,15 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
 
         # Safe simulation / Dry-run support
         if os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_UPDATES") == "1":
-            update_progress("Comprobando red...", 0.15)
-            time.sleep(0.4)
+            update_progress("Comprobando red...", 0.10)
+            time.sleep(0.3)
+            update_progress("Saneando dpkg...", 0.25)
+            time.sleep(0.3)
             update_progress("Actualizando indices APT...", 0.45)
-            time.sleep(0.5)
-            update_progress("Descargando paquetes...", 0.75)
-            time.sleep(0.5)
-            update_progress("Instalando mejoras...", 0.95)
+            time.sleep(0.4)
+            update_progress("Instalando paquetes...", 0.75)
+            time.sleep(0.4)
+            update_progress("Limpieza del sistema...", 0.90)
             time.sleep(0.3)
             update_progress("Sistema actualizado", 1.0)
             return DiagnosticResult(
@@ -650,7 +665,7 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
                 details=[
                     "Indices APT al día",
                     "0 paquetes pendientes",
-                    "Sistema optimizado",
+                    "Sistema saneado OK",
                     "Simulación segura OK"
                 ],
                 metrics={"packages_updated": 0, "mock": True}
@@ -675,20 +690,60 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
                 ]
             )
 
-        # 2. Check dpkg/apt lock
-        for lock_file in ["/var/lib/dpkg/lock-frontend", "/var/lib/apt/lists/lock"]:
-            if os.path.exists(lock_file):
-                # Try to check if held
-                pass
-
+        # Environment configuration for strict non-interactive execution
         env = dict(os.environ)
         env["DEBIAN_FRONTEND"] = "noninteractive"
+        env["APT_LISTCHANGES_FRONTEND"] = "none"
+        env["NEEDRESTART_MODE"] = "a"
 
-        # 3. apt-get update
-        update_progress("Actualizando indices APT...", 0.30)
+        use_sudo = (os.geteuid() != 0)
+
+        # 2. Step: Auto-recovery for interrupted dpkg
+        update_progress("Saneando dpkg...", 0.20)
+        try:
+            cmd_dpkg = [
+                "dpkg", "--configure", "-a",
+                "--force-confdef", "--force-confold"
+            ]
+            if use_sudo:
+                cmd_dpkg.insert(0, "sudo")
+
+            subprocess.run(
+                cmd_dpkg,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env
+            )
+        except Exception as dpkg_ex:
+            logger.debug(f"dpkg recovery notice: {dpkg_ex}")
+
+        # 3. Step: Fix broken dependencies
+        update_progress("Reparando paquetes...", 0.30)
+        try:
+            cmd_fix = [
+                "apt-get", "--fix-broken", "install", "-y", "-qq",
+                "-o", "Dpkg::Options::=--force-confdef",
+                "-o", "Dpkg::Options::=--force-confold"
+            ]
+            if use_sudo:
+                cmd_fix.insert(0, "sudo")
+
+            subprocess.run(
+                cmd_fix,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env
+            )
+        except Exception as fix_ex:
+            logger.debug(f"apt fix-broken notice: {fix_ex}")
+
+        # 4. Step: apt-get update
+        update_progress("Actualizando indices...", 0.45)
         try:
             cmd_update = ["apt-get", "update", "-qq"]
-            if os.geteuid() != 0:
+            if use_sudo:
                 cmd_update.insert(0, "sudo")
 
             res_update = subprocess.run(
@@ -721,26 +776,30 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
                 details=[str(ex)[:20]]
             )
 
-        # 4. apt-get upgrade
-        update_progress("Aplicando actualizaciones...", 0.65)
+        # 5. Step: apt-get dist-upgrade
+        update_progress("Instalando mejoras...", 0.70)
         try:
-            cmd_upgrade = ["apt-get", "upgrade", "-y", "-qq", "--no-install-recommends"]
-            if os.geteuid() != 0:
+            cmd_upgrade = [
+                "apt-get", "dist-upgrade", "-y", "-qq", "--no-install-recommends",
+                "-o", "Dpkg::Options::=--force-confdef",
+                "-o", "Dpkg::Options::=--force-confold"
+            ]
+            if use_sudo:
                 cmd_upgrade.insert(0, "sudo")
 
             res_upgrade = subprocess.run(
                 cmd_upgrade,
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=300,
                 env=env
             )
             if res_upgrade.returncode != 0:
-                err = (res_upgrade.stderr or res_upgrade.stdout or "Error en apt-get upgrade").strip()
+                err = (res_upgrade.stderr or res_upgrade.stdout or "Error en dist-upgrade").strip()
                 return DiagnosticResult(
                     plugin_name=self.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Fallo en apt upgrade",
+                    summary="Fallo en actualizacion",
                     details=["Error al instalar:", err[:20], "Consulte journalctl"]
                 )
         except subprocess.TimeoutExpired:
@@ -758,16 +817,17 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
                 details=[str(ex)[:20]]
             )
 
-        update_progress("Limpieza y cierre...", 0.90)
+        # 6. Step: Cleanup
+        update_progress("Limpieza del sistema...", 0.90)
         try:
             cmd_clean = ["apt-get", "autoremove", "-y", "-qq"]
-            if os.geteuid() != 0:
+            if use_sudo:
                 cmd_clean.insert(0, "sudo")
             subprocess.run(cmd_clean, capture_output=True, timeout=30, env=env)
         except Exception:
             pass
 
-        update_progress("Actualizacion completada", 1.0)
+        update_progress("Sistema actualizado", 1.0)
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
@@ -786,6 +846,7 @@ class AppUpdatePlugin(IDiagnosticPlugin):
     Updates the REI software from the GitHub remote repository.
     Verifies git status, fetches remote commits, performs fast-forward pull,
     and updates python dependencies if required.
+    Ensures safe.directory compliance under systemd (root/pi user permissions).
     """
 
     def __init__(self, repo_path: Optional[str] = None):
@@ -802,6 +863,22 @@ class AppUpdatePlugin(IDiagnosticPlugin):
     @property
     def category(self) -> str:
         return "SYSTEM"
+
+    def _exec_git(self, git_bin: str, args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+        """Executes a Git command with explicit safe.directory overrides."""
+        cmd = [
+            git_bin,
+            "-c", f"safe.directory={self.repo_path}",
+            "-c", "safe.directory=*",
+            *args
+        ]
+        return subprocess.run(
+            cmd,
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
 
     def run(self, progress_callback: Optional[Callable[[str, float], None]] = None, **kwargs) -> DiagnosticResult:
         def update_progress(msg: str, pct: float) -> None:
@@ -851,6 +928,21 @@ class AppUpdatePlugin(IDiagnosticPlugin):
                 details=["Ruta no valida:", self.repo_path[:20]]
             )
 
+        # Ensure git safe.directory is configured globally as well
+        try:
+            subprocess.run(
+                [git_bin, "config", "--global", "--add", "safe.directory", self.repo_path],
+                capture_output=True,
+                timeout=5
+            )
+            subprocess.run(
+                [git_bin, "config", "--global", "--add", "safe.directory", "*"],
+                capture_output=True,
+                timeout=5
+            )
+        except Exception:
+            pass
+
         # 2. Connectivity check
         update_progress("Comprobando conexion...", 0.15)
         try:
@@ -868,13 +960,7 @@ class AppUpdatePlugin(IDiagnosticPlugin):
         # 3. Git Fetch
         update_progress("Consultando GitHub...", 0.35)
         try:
-            res_fetch = subprocess.run(
-                [git_bin, "fetch", "--all", "--prune"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            res_fetch = self._exec_git(git_bin, ["fetch", "--all", "--prune"], timeout=30)
             if res_fetch.returncode != 0:
                 err = (res_fetch.stderr or res_fetch.stdout or "Error en git fetch").strip()
                 return DiagnosticResult(
@@ -901,30 +987,11 @@ class AppUpdatePlugin(IDiagnosticPlugin):
         # 4. Check status (current branch vs upstream)
         update_progress("Verificando diferencias...", 0.60)
         try:
-            branch_res = subprocess.run(
-                [git_bin, "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+            branch_res = self._exec_git(git_bin, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=5)
             branch = branch_res.stdout.strip() or "main"
 
-            local_rev = subprocess.run(
-                [git_bin, "rev-parse", "HEAD"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=5
-            ).stdout.strip()
-
-            remote_rev = subprocess.run(
-                [git_bin, "rev-parse", f"origin/{branch}"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=5
-            ).stdout.strip()
+            local_rev = self._exec_git(git_bin, ["rev-parse", "HEAD"], timeout=5).stdout.strip()
+            remote_rev = self._exec_git(git_bin, ["rev-parse", f"origin/{branch}"], timeout=5).stdout.strip()
 
             if local_rev == remote_rev:
                 update_progress("REI ya actualizado", 1.0)
@@ -943,13 +1010,7 @@ class AppUpdatePlugin(IDiagnosticPlugin):
 
             # Pull changes
             update_progress("Descargando commits...", 0.80)
-            res_pull = subprocess.run(
-                [git_bin, "pull", "--ff-only", "origin", branch],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            res_pull = self._exec_git(git_bin, ["pull", "--ff-only", "origin", branch], timeout=30)
             if res_pull.returncode != 0:
                 err = (res_pull.stderr or res_pull.stdout or "Error en git pull").strip()
                 return DiagnosticResult(
@@ -960,13 +1021,7 @@ class AppUpdatePlugin(IDiagnosticPlugin):
                 )
 
             # Get new commit hash
-            new_rev = subprocess.run(
-                [git_bin, "rev-parse", "HEAD"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=5
-            ).stdout.strip()
+            new_rev = self._exec_git(git_bin, ["rev-parse", "HEAD"], timeout=5).stdout.strip()
 
             update_progress("Actualizacion completada", 1.0)
             return DiagnosticResult(

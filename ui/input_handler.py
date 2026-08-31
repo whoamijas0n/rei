@@ -12,6 +12,7 @@ import queue
 import select
 import sys
 import threading
+import time
 from typing import Optional, Dict, Any, Tuple
 
 logger = logging.getLogger("REI.UI.Input")
@@ -50,7 +51,7 @@ DEFAULT_PINS = {
 class USBKeyboardListener(threading.Thread):
     """
     Background worker that listens for USB keyboard events via Linux evdev
-    and terminal stdin without blocking the main 30 FPS UI loop.
+    and interactive terminal stdin without blocking the main 30 FPS UI loop.
     Supports physical USB keyboards, 2.4GHz wireless dongles, and console terminal input.
     """
 
@@ -59,9 +60,11 @@ class USBKeyboardListener(threading.Thread):
         self.handler = handler
         self.running = True
         self._shift_pressed = False
+        self._caps_lock = False
         self._devices: Dict[str, Any] = {}
         self._last_scan_time: float = 0.0
         self._old_termios = None
+        self._has_interactive_stdin = False
 
         # Build scancode lookup table using evdev ecodes
         self._scancode_char_map: Dict[int, Tuple[str, str]] = {}
@@ -122,6 +125,8 @@ class USBKeyboardListener(threading.Thread):
             (ecodes.KEY_APOSTROPHE, "'", "\""), (ecodes.KEY_GRAVE, "`", "~"),
             (ecodes.KEY_LEFTBRACE, "[", "{"), (ecodes.KEY_RIGHTBRACE, "]", "}"),
         ]
+        if hasattr(ecodes, "KEY_102ND"):
+            symbols.append((ecodes.KEY_102ND, "<", ">"))
         for code, norm, shift in symbols:
             self._scancode_char_map[code] = (norm, shift)
 
@@ -141,15 +146,19 @@ class USBKeyboardListener(threading.Thread):
         self._scancode_event_map[ecodes.KEY_F3] = InputEvent.KEY3
 
     def _init_terminal_mode(self) -> None:
-        """Sets non-canonical cbreak mode on stdin for immediate key capture."""
+        """Sets non-canonical cbreak mode on stdin for immediate key capture if interactive."""
         if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
             try:
                 import termios, tty
                 self._old_termios = termios.tcgetattr(sys.stdin)
                 tty.setcbreak(sys.stdin.fileno())
-                logger.info("Stdin terminal cbreak mode enabled.")
+                self._has_interactive_stdin = True
+                logger.info("Stdin terminal cbreak mode enabled for interactive session.")
             except Exception as ex:
+                self._has_interactive_stdin = False
                 logger.debug(f"Terminal cbreak mode not applicable: {ex}")
+        else:
+            self._has_interactive_stdin = False
 
     def _scan_evdev_devices(self) -> None:
         """Discovers new keyboard devices and keeps them open."""
@@ -159,8 +168,11 @@ class USBKeyboardListener(threading.Thread):
         except ImportError:
             return
 
-        now = os.times().elapsed if hasattr(os, "times") else 0
-        current_paths = set(evdev.list_devices())
+        try:
+            current_paths = set(evdev.list_devices())
+        except Exception as scan_err:
+            logger.debug(f"Error listing evdev devices: {scan_err}")
+            return
 
         # Close removed devices
         for path in list(self._devices.keys()):
@@ -180,7 +192,14 @@ class USBKeyboardListener(threading.Thread):
                     caps = dev.capabilities()
                     if ecodes.EV_KEY in caps:
                         key_caps = caps[ecodes.EV_KEY]
-                        if ecodes.KEY_A in key_caps or ecodes.KEY_ENTER in key_caps or ecodes.KEY_SPACE in key_caps:
+                        # Check for keyboard capabilities (A key, Enter, Space, numbers, etc.)
+                        has_key = any(
+                            k in key_caps for k in (
+                                ecodes.KEY_A, ecodes.KEY_ENTER, ecodes.KEY_SPACE,
+                                ecodes.KEY_1, ecodes.KEY_ESC, ecodes.KEY_BACKSPACE
+                            )
+                        )
+                        if has_key:
                             self._devices[path] = dev
                             logger.info(f"Attached keyboard device: {dev.name} ({path})")
                 except Exception as open_ex:
@@ -201,13 +220,23 @@ class USBKeyboardListener(threading.Thread):
             self._shift_pressed = (val > 0)
             return
 
+        # CapsLock toggle on keydown
+        if code == ecodes.KEY_CAPSLOCK:
+            if val == 1:
+                self._caps_lock = not self._caps_lock
+            return
+
         # Handle keydown and keyhold
         if val in (1, 2):
             if code in self._scancode_event_map:
                 self.handler.inject_event(self._scancode_event_map[code])
             elif code in self._scancode_char_map:
                 norm_char, shift_char = self._scancode_char_map[code]
-                char = shift_char if self._shift_pressed else norm_char
+                if norm_char.isalpha():
+                    is_upper = self._shift_pressed ^ self._caps_lock
+                    char = shift_char if is_upper else norm_char
+                else:
+                    char = shift_char if self._shift_pressed else norm_char
                 self.handler.inject_char(char)
 
     def _process_stdin_bytes(self, data: bytes) -> None:
@@ -216,7 +245,7 @@ class USBKeyboardListener(threading.Thread):
             return
 
         # Special escape sequences
-        if data == b'\r' or data == b'\n':
+        if data in (b'\r', b'\n'):
             self.handler.inject_event(InputEvent.ENTER)
         elif data in (b'\x7f', b'\x08'):
             self.handler.inject_event(InputEvent.BACKSPACE)
@@ -248,7 +277,7 @@ class USBKeyboardListener(threading.Thread):
         last_scan = 0.0
 
         while self.running:
-            now = os.times().elapsed if hasattr(os, "times") else 0
+            now = time.monotonic()
             if (now - last_scan) > 2.0 or len(self._devices) == 0:
                 self._scan_evdev_devices()
                 last_scan = now
@@ -265,34 +294,37 @@ class USBKeyboardListener(threading.Thread):
                 except Exception:
                     pass
 
-            # Add stdin to select list
+            # Add stdin to select list ONLY if it is an active interactive TTY
             has_stdin = False
-            if sys.stdin and not sys.stdin.closed:
+            if self._has_interactive_stdin and sys.stdin and not sys.stdin.closed:
                 try:
                     s_fd = sys.stdin.fileno()
                     r_fds.append(s_fd)
                     has_stdin = True
                 except Exception:
-                    pass
+                    self._has_interactive_stdin = False
 
             if not r_fds:
-                select.select([], [], [], 0.05)
+                time.sleep(0.05)
                 continue
 
             try:
                 r_ready, _, _ = select.select(r_fds, [], [], 0.05)
             except (ValueError, OSError):
-                select.select([], [], [], 0.05)
+                time.sleep(0.05)
                 continue
 
             for fd in r_ready:
-                if has_stdin and fd == sys.stdin.fileno():
+                if has_stdin and sys.stdin and fd == sys.stdin.fileno():
                     try:
                         data = os.read(fd, 64)
                         if data:
                             self._process_stdin_bytes(data)
+                        else:
+                            # EOF on stdin, disable polling it
+                            self._has_interactive_stdin = False
                     except Exception:
-                        pass
+                        self._has_interactive_stdin = False
                 elif fd in device_map:
                     dev = device_map[fd]
                     try:

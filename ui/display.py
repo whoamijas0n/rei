@@ -25,6 +25,7 @@ class ViewActionType(Enum):
     NONE = auto()
     PUSH_VIEW = auto()
     POP_VIEW = auto()
+    POP_TO_ROOT = auto()
     REPLACE_VIEW = auto()
     EXECUTE_TASK = auto()
 
@@ -560,11 +561,13 @@ class DetailCardView(BaseView):
         self,
         title: str,
         initial_lines: Optional[List[str]] = None,
-        on_refresh: Optional[Callable[[], None]] = None
+        on_refresh: Optional[Callable[[], None]] = None,
+        pop_to_root_on_key1: bool = False
     ):
         super().__init__(title=title)
         self.lines: List[str] = initial_lines or []
         self.on_refresh = on_refresh
+        self.pop_to_root_on_key1 = pop_to_root_on_key1
         self.status_text: str = "LISTO"
         self.is_loading: bool = False
         self.scroll_offset: int = 0
@@ -606,7 +609,7 @@ class DetailCardView(BaseView):
                 draw.text((8, y), line[:20], font=self.font, fill="white")
                 y += 12
 
-    def handle_input(self, event: InputEvent) -> ViewAction:
+    def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
         max_scroll = max(0, len(self.lines) - 3)
 
         if event == InputEvent.UP:
@@ -623,8 +626,14 @@ class DetailCardView(BaseView):
                 self.on_refresh()
             return ViewAction(ViewActionType.NONE)
 
-        # Return on Key3, Key1, Press or Back
-        elif event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
+        # KEY1 / Joystick PRESS -> Pop to root if configured, else pop view
+        elif event in (InputEvent.KEY1, InputEvent.PRESS):
+            if self.pop_to_root_on_key1:
+                return ViewAction(ViewActionType.POP_TO_ROOT)
+            return ViewAction(ViewActionType.POP_VIEW)
+
+        # Return on Key3, Back -> Pop view
+        elif event in (InputEvent.KEY3, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -948,6 +957,12 @@ class ScreenManager:
             logger.debug(f"Popped view: {popped.title} (Stack depth: {len(self._view_stack)})")
             return popped
         return None
+
+    def pop_to_root(self) -> None:
+        """Pops all views down to the root view."""
+        if len(self._view_stack) > 1:
+            self._view_stack = [self._view_stack[0]]
+            logger.debug("Popped to root view (Stack depth: 1)")
 
     def set_root_view(self, view: BaseView) -> None:
         """Clears stack and sets the root view."""

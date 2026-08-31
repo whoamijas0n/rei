@@ -247,9 +247,9 @@ class REIApp:
         is_success = (result.status == DiagnosticStatus.SUCCESS)
 
         if is_success:
-            hero_title = f"CONECTADO: {ssid.upper()[:8]}"
+            hero_title = "CONECTADO"
             icon_name = "WIFI_OK"
-            detail_title = "CONEXION OK"
+            detail_title = "RESUMEN RED"
         else:
             hero_title = "ERROR CONEXION"
             icon_name = "WIFI_FAIL"
@@ -257,7 +257,8 @@ class REIApp:
 
         detail_view = DetailCardView(
             title=detail_title,
-            initial_lines=result.details if result.details else [result.summary]
+            initial_lines=result.details if result.details else [result.summary],
+            pop_to_root_on_key1=True
         )
 
         deck_result = HeroCardDeckView("ESTADO WI-FI")
@@ -535,6 +536,8 @@ class REIApp:
                             self.screen_manager.push_view(action.target_view)
                         elif action.action_type == ViewActionType.POP_VIEW:
                             self.screen_manager.pop_view()
+                        elif action.action_type == ViewActionType.POP_TO_ROOT:
+                            self.screen_manager.pop_to_root()
                         elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
                             self._trigger_task(action.task_id)
 
