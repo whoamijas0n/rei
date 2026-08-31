@@ -51,100 +51,280 @@ class USBKeyboardListener(threading.Thread):
     """
     Background worker that listens for USB keyboard events via Linux evdev
     and terminal stdin without blocking the main 30 FPS UI loop.
+    Supports physical USB keyboards, 2.4GHz wireless dongles, and console terminal input.
     """
-
-    # Basic evdev scancode to ASCII map
-    SCANCODE_MAP: Dict[str, Tuple[str, str]] = {
-        "KEY_A": ("a", "A"), "KEY_B": ("b", "B"), "KEY_C": ("c", "C"),
-        "KEY_D": ("d", "D"), "KEY_E": ("e", "E"), "KEY_F": ("f", "F"),
-        "KEY_G": ("g", "G"), "KEY_H": ("h", "H"), "KEY_I": ("i", "I"),
-        "KEY_J": ("j", "J"), "KEY_K": ("k", "K"), "KEY_L": ("l", "L"),
-        "KEY_M": ("m", "M"), "KEY_N": ("n", "N"), "KEY_O": ("o", "O"),
-        "KEY_P": ("p", "P"), "KEY_Q": ("q", "Q"), "KEY_R": ("r", "R"),
-        "KEY_S": ("s", "S"), "KEY_T": ("t", "T"), "KEY_U": ("u", "U"),
-        "KEY_V": ("v", "V"), "KEY_W": ("w", "W"), "KEY_X": ("x", "X"),
-        "KEY_Y": ("y", "Y"), "KEY_Z": ("z", "Z"),
-        "KEY_1": ("1", "!"), "KEY_2": ("2", "@"), "KEY_3": ("3", "#"),
-        "KEY_4": ("4", "$"), "KEY_5": ("5", "%"), "KEY_6": ("6", "^"),
-        "KEY_7": ("7", "&"), "KEY_8": ("8", "*"), "KEY_9": ("9", "("),
-        "KEY_0": ("0", ")"),
-        "KEY_MINUS": ("-", "_"), "KEY_EQUAL": ("=", "+"),
-        "KEY_SPACE": (" ", " "), "KEY_DOT": (".", ">"),
-        "KEY_COMMA": (",", "<"), "KEY_SLASH": ("/", "?"),
-        "KEY_BACKSLASH": ("\\", "|"), "KEY_SEMICOLON": (";", ":"),
-        "KEY_APOSTROPHE": ("'", "\""), "KEY_GRAVE": ("`", "~"),
-        "KEY_LEFTBRACE": ("[", "{"), "KEY_RIGHTBRACE": ("]", "}"),
-    }
 
     def __init__(self, handler: 'GPIOInputHandler'):
         super().__init__(name="REIKeyboardListener", daemon=True)
         self.handler = handler
         self.running = True
         self._shift_pressed = False
+        self._devices: Dict[str, Any] = {}
+        self._last_scan_time: float = 0.0
+        self._old_termios = None
+
+        # Build scancode lookup table using evdev ecodes
+        self._scancode_char_map: Dict[int, Tuple[str, str]] = {}
+        self._scancode_event_map: Dict[int, InputEvent] = {}
+        self._init_scancode_maps()
+        self._init_terminal_mode()
+
+    def _init_scancode_maps(self) -> None:
+        """Populates integer scancode maps for fast evdev lookups."""
+        try:
+            from evdev import ecodes
+        except ImportError:
+            return
+
+        # Letters A-Z
+        letters = [
+            (ecodes.KEY_A, "a", "A"), (ecodes.KEY_B, "b", "B"), (ecodes.KEY_C, "c", "C"),
+            (ecodes.KEY_D, "d", "D"), (ecodes.KEY_E, "e", "E"), (ecodes.KEY_F, "f", "F"),
+            (ecodes.KEY_G, "g", "G"), (ecodes.KEY_H, "h", "H"), (ecodes.KEY_I, "i", "I"),
+            (ecodes.KEY_J, "j", "J"), (ecodes.KEY_K, "k", "K"), (ecodes.KEY_L, "l", "L"),
+            (ecodes.KEY_M, "m", "M"), (ecodes.KEY_N, "n", "N"), (ecodes.KEY_O, "o", "O"),
+            (ecodes.KEY_P, "p", "P"), (ecodes.KEY_Q, "q", "Q"), (ecodes.KEY_R, "r", "R"),
+            (ecodes.KEY_S, "s", "S"), (ecodes.KEY_T, "t", "T"), (ecodes.KEY_U, "u", "U"),
+            (ecodes.KEY_V, "v", "V"), (ecodes.KEY_W, "w", "W"), (ecodes.KEY_X, "x", "X"),
+            (ecodes.KEY_Y, "y", "Y"), (ecodes.KEY_Z, "z", "Z"),
+        ]
+        for code, norm, shift in letters:
+            self._scancode_char_map[code] = (norm, shift)
+
+        # Numbers 0-9
+        numbers = [
+            (ecodes.KEY_1, "1", "!"), (ecodes.KEY_2, "2", "@"), (ecodes.KEY_3, "3", "#"),
+            (ecodes.KEY_4, "4", "$"), (ecodes.KEY_5, "5", "%"), (ecodes.KEY_6, "6", "^"),
+            (ecodes.KEY_7, "7", "&"), (ecodes.KEY_8, "8", "*"), (ecodes.KEY_9, "9", "("),
+            (ecodes.KEY_0, "0", ")"),
+        ]
+        for code, norm, shift in numbers:
+            self._scancode_char_map[code] = (norm, shift)
+
+        # Keypad digits & symbols
+        keypad = [
+            (ecodes.KEY_KP0, "0", "0"), (ecodes.KEY_KP1, "1", "1"), (ecodes.KEY_KP2, "2", "2"),
+            (ecodes.KEY_KP3, "3", "3"), (ecodes.KEY_KP4, "4", "4"), (ecodes.KEY_KP5, "5", "5"),
+            (ecodes.KEY_KP6, "6", "6"), (ecodes.KEY_KP7, "7", "7"), (ecodes.KEY_KP8, "8", "8"),
+            (ecodes.KEY_KP9, "9", "9"), (ecodes.KEY_KPDOT, ".", "."),
+            (ecodes.KEY_KPPLUS, "+", "+"), (ecodes.KEY_KPMINUS, "-", "-"),
+            (ecodes.KEY_KPASTERISK, "*", "*"), (ecodes.KEY_KPSLASH, "/", "/"),
+        ]
+        for code, norm, shift in keypad:
+            self._scancode_char_map[code] = (norm, shift)
+
+        # Punctuation and Symbols
+        symbols = [
+            (ecodes.KEY_MINUS, "-", "_"), (ecodes.KEY_EQUAL, "=", "+"),
+            (ecodes.KEY_SPACE, " ", " "), (ecodes.KEY_DOT, ".", ">"),
+            (ecodes.KEY_COMMA, ",", "<"), (ecodes.KEY_SLASH, "/", "?"),
+            (ecodes.KEY_BACKSLASH, "\\", "|"), (ecodes.KEY_SEMICOLON, ";", ":"),
+            (ecodes.KEY_APOSTROPHE, "'", "\""), (ecodes.KEY_GRAVE, "`", "~"),
+            (ecodes.KEY_LEFTBRACE, "[", "{"), (ecodes.KEY_RIGHTBRACE, "]", "}"),
+        ]
+        for code, norm, shift in symbols:
+            self._scancode_char_map[code] = (norm, shift)
+
+        # Control and Action Keys
+        self._scancode_event_map[ecodes.KEY_ENTER] = InputEvent.ENTER
+        self._scancode_event_map[ecodes.KEY_KPENTER] = InputEvent.ENTER
+        self._scancode_event_map[ecodes.KEY_BACKSPACE] = InputEvent.BACKSPACE
+        self._scancode_event_map[ecodes.KEY_DELETE] = InputEvent.BACKSPACE
+        self._scancode_event_map[ecodes.KEY_ESC] = InputEvent.ESCAPE
+        self._scancode_event_map[ecodes.KEY_UP] = InputEvent.UP
+        self._scancode_event_map[ecodes.KEY_DOWN] = InputEvent.DOWN
+        self._scancode_event_map[ecodes.KEY_LEFT] = InputEvent.LEFT
+        self._scancode_event_map[ecodes.KEY_RIGHT] = InputEvent.RIGHT
+        self._scancode_event_map[ecodes.KEY_TAB] = InputEvent.KEY2
+        self._scancode_event_map[ecodes.KEY_F1] = InputEvent.KEY1
+        self._scancode_event_map[ecodes.KEY_F2] = InputEvent.KEY2
+        self._scancode_event_map[ecodes.KEY_F3] = InputEvent.KEY3
+
+    def _init_terminal_mode(self) -> None:
+        """Sets non-canonical cbreak mode on stdin for immediate key capture."""
+        if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+            try:
+                import termios, tty
+                self._old_termios = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                logger.info("Stdin terminal cbreak mode enabled.")
+            except Exception as ex:
+                logger.debug(f"Terminal cbreak mode not applicable: {ex}")
+
+    def _scan_evdev_devices(self) -> None:
+        """Discovers new keyboard devices and keeps them open."""
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            return
+
+        now = os.times().elapsed if hasattr(os, "times") else 0
+        current_paths = set(evdev.list_devices())
+
+        # Close removed devices
+        for path in list(self._devices.keys()):
+            if path not in current_paths:
+                try:
+                    self._devices[path].close()
+                except Exception:
+                    pass
+                del self._devices[path]
+                logger.info(f"Keyboard disconnected: {path}")
+
+        # Scan new devices
+        for path in current_paths:
+            if path not in self._devices:
+                try:
+                    dev = evdev.InputDevice(path)
+                    caps = dev.capabilities()
+                    if ecodes.EV_KEY in caps:
+                        key_caps = caps[ecodes.EV_KEY]
+                        if ecodes.KEY_A in key_caps or ecodes.KEY_ENTER in key_caps or ecodes.KEY_SPACE in key_caps:
+                            self._devices[path] = dev
+                            logger.info(f"Attached keyboard device: {dev.name} ({path})")
+                except Exception as open_ex:
+                    logger.debug(f"Could not open device {path}: {open_ex}")
+
+    def _process_evdev_event(self, event) -> None:
+        """Processes an evdev key event."""
+        try:
+            from evdev import ecodes
+        except ImportError:
+            return
+
+        code = event.code
+        val = event.value  # 0=up, 1=down, 2=hold
+
+        # Shift tracking
+        if code in (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT):
+            self._shift_pressed = (val > 0)
+            return
+
+        # Handle keydown and keyhold
+        if val in (1, 2):
+            if code in self._scancode_event_map:
+                self.handler.inject_event(self._scancode_event_map[code])
+            elif code in self._scancode_char_map:
+                norm_char, shift_char = self._scancode_char_map[code]
+                char = shift_char if self._shift_pressed else norm_char
+                self.handler.inject_char(char)
+
+    def _process_stdin_bytes(self, data: bytes) -> None:
+        """Parses raw bytes from stdin."""
+        if not data:
+            return
+
+        # Special escape sequences
+        if data == b'\r' or data == b'\n':
+            self.handler.inject_event(InputEvent.ENTER)
+        elif data in (b'\x7f', b'\x08'):
+            self.handler.inject_event(InputEvent.BACKSPACE)
+        elif data == b'\x1b':
+            self.handler.inject_event(InputEvent.ESCAPE)
+        elif data == b'\x1b[A':
+            self.handler.inject_event(InputEvent.UP)
+        elif data == b'\x1b[B':
+            self.handler.inject_event(InputEvent.DOWN)
+        elif data == b'\x1b[C':
+            self.handler.inject_event(InputEvent.RIGHT)
+        elif data == b'\x1b[D':
+            self.handler.inject_event(InputEvent.LEFT)
+        elif data == b'\t':
+            self.handler.inject_event(InputEvent.KEY2)
+        else:
+            try:
+                decoded = data.decode("utf-8", errors="ignore")
+                for ch in decoded:
+                    if ch in ('\r', '\n'):
+                        self.handler.inject_event(InputEvent.ENTER)
+                    elif ch.isprintable() and ord(ch) >= 32:
+                        self.handler.inject_char(ch)
+            except Exception:
+                pass
 
     def run(self) -> None:
         """Continuously monitors evdev devices and stdin for key inputs."""
-        try:
-            import evdev
-            has_evdev = True
-        except ImportError:
-            has_evdev = False
+        last_scan = 0.0
 
         while self.running:
-            handled = False
+            now = os.times().elapsed if hasattr(os, "times") else 0
+            if (now - last_scan) > 2.0 or len(self._devices) == 0:
+                self._scan_evdev_devices()
+                last_scan = now
 
-            # 1. Try Linux evdev devices
-            if has_evdev:
+            r_fds = []
+            device_map = {}
+
+            # Add evdev devices to select list
+            for path, dev in list(self._devices.items()):
                 try:
-                    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-                    # Filter keyboard devices
-                    kb_devices = [d for d in devices if "keyboard" in d.name.lower() or "kbd" in d.name.lower() or d.name]
-                    if kb_devices:
-                        r, _, _ = select.select(kb_devices, [], [], 0.1)
-                        for dev in r:
-                            for event in dev.read():
-                                if event.type == evdev.ecodes.EV_KEY:
-                                    key_event = evdev.categorize(event)
-                                    keycode = key_event.keycode
-                                    if isinstance(keycode, list):
-                                        keycode = keycode[0]
-
-                                    if key_event.keystate in (key_event.key_down, key_event.key_hold):
-                                        if keycode in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
-                                            self._shift_pressed = True
-                                        elif keycode in ("KEY_ENTER", "KEY_KPENTER"):
-                                            self.handler.inject_event(InputEvent.ENTER)
-                                        elif keycode == "KEY_BACKSPACE":
-                                            self.handler.inject_event(InputEvent.BACKSPACE)
-                                        elif keycode == "KEY_ESC":
-                                            self.handler.inject_event(InputEvent.ESCAPE)
-                                        elif keycode in self.SCANCODE_MAP:
-                                            norm_char, shift_char = self.SCANCODE_MAP[keycode]
-                                            char = shift_char if self._shift_pressed else norm_char
-                                            self.handler.inject_char(char)
-                                    elif key_event.keystate == key_event.key_up:
-                                        if keycode in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
-                                            self._shift_pressed = False
-                        handled = True
-                except Exception as ev_ex:
-                    logger.debug(f"evdev keyboard read error: {ev_ex}")
-
-            # 2. Fallback: Check stdin (if in terminal / console)
-            if not handled and sys.stdin and not sys.stdin.closed:
-                try:
-                    r, _, _ = select.select([sys.stdin], [], [], 0.08)
-                    if r:
-                        line = sys.stdin.readline()
-                        if line:
-                            for ch in line.strip("\r\n"):
-                                self.handler.inject_char(ch)
-                            if line.endswith("\n"):
-                                self.handler.inject_event(InputEvent.ENTER)
+                    fd = dev.fd
+                    r_fds.append(fd)
+                    device_map[fd] = dev
                 except Exception:
                     pass
 
-            if not handled:
-                select.select([], [], [], 0.1)
+            # Add stdin to select list
+            has_stdin = False
+            if sys.stdin and not sys.stdin.closed:
+                try:
+                    s_fd = sys.stdin.fileno()
+                    r_fds.append(s_fd)
+                    has_stdin = True
+                except Exception:
+                    pass
+
+            if not r_fds:
+                select.select([], [], [], 0.05)
+                continue
+
+            try:
+                r_ready, _, _ = select.select(r_fds, [], [], 0.05)
+            except (ValueError, OSError):
+                select.select([], [], [], 0.05)
+                continue
+
+            for fd in r_ready:
+                if has_stdin and fd == sys.stdin.fileno():
+                    try:
+                        data = os.read(fd, 64)
+                        if data:
+                            self._process_stdin_bytes(data)
+                    except Exception:
+                        pass
+                elif fd in device_map:
+                    dev = device_map[fd]
+                    try:
+                        for ev in dev.read():
+                            if ev.type == 1:  # EV_KEY
+                                self._process_evdev_event(ev)
+                    except BlockingIOError:
+                        pass
+                    except (OSError, Exception) as dev_ex:
+                        logger.debug(f"Device read error on {dev.path}: {dev_ex}")
+                        try:
+                            dev.close()
+                        except Exception:
+                            pass
+                        self._devices.pop(dev.path, None)
+
+    def close(self) -> None:
+        """Cleans up devices and restores terminal settings."""
+        self.running = False
+        for dev in list(self._devices.values()):
+            try:
+                dev.close()
+            except Exception:
+                pass
+        self._devices.clear()
+
+        if self._old_termios and sys.stdin and not sys.stdin.closed:
+            try:
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_termios)
+            except Exception:
+                pass
 
 
 class GPIOInputHandler:

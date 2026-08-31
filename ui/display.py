@@ -743,8 +743,8 @@ class KeyboardInputView(BaseView):
     """
     Vista interactiva para ingreso de contraseñas Wi-Fi mediante teclado físico USB.
     Muestra los caracteres ingresados en tiempo real sobre la pantalla OLED 128x64
-    con cursor activo, soporte para borrado (Backspace), confirmación (Enter)
-    y cancelación (KEY3/Escape).
+    con cursor activo, soporte para borrado (Backspace), confirmación (Enter/KEY1/PRESS),
+    alternar visibilidad (KEY2/Tab) y cancelación (KEY3/Escape).
     """
 
     def __init__(
@@ -775,11 +775,12 @@ class KeyboardInputView(BaseView):
         self.cursor_visible = (self._cursor_tick < 15)
 
     def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
-        # 1. Borde perimetral
+        # 1. Borde perimetral continuo
         self.draw_perimeter_border(draw)
 
-        # 2. Encabezado centrado
-        header_text = f"CLAVE: {self.ssid.upper()[:10]}"
+        # 2. Encabezado centrado con indicador de modo de máscara [TXT] / [***]
+        mask_badge = "[***]" if self.is_masked else "[TXT]"
+        header_text = f"{self.ssid.upper()[:7]} {mask_badge}"
         text_w = len(header_text) * 6
         draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
         draw.line((4, 16, 123, 16), fill="white")
@@ -787,7 +788,7 @@ class KeyboardInputView(BaseView):
         # 3. Caja de texto para el input
         draw.rectangle((8, 20, 119, 34), outline="white", fill="black")
 
-        # 4. Texto ingresado con desplazamiento horizontal
+        # 4. Texto ingresado con desplazamiento horizontal y cursor
         display_str = ("*" * len(self.input_text)) if self.is_masked else self.input_text
         if len(display_str) > 16:
             visible_str = display_str[-16:]
@@ -798,11 +799,11 @@ class KeyboardInputView(BaseView):
         draw.text((12, 22), visible_str + cursor_char, font=self.font, fill="white")
 
         # 5. Indicaciones de control
-        draw.text((12, 38), "[ENTER] Conectar", font=self.font, fill="white")
-        draw.text((12, 50), "KEY3:Salir KEY2:Ver", font=self.font, fill="white")
+        draw.text((8, 38), "[ENTER/KEY1] Conectar", font=self.font, fill="white")
+        draw.text((8, 50), "KEY2:Ver  KEY3:Salir", font=self.font, fill="white")
 
     def handle_input(self, event: InputEvent, char: Optional[str] = None) -> ViewAction:
-        # 1. Character typing from physical USB keyboard
+        # 1. Character typing from physical USB keyboard or terminal
         if event == InputEvent.CHAR:
             if char:
                 if len(self.input_text) < self.max_length:
@@ -815,34 +816,25 @@ class KeyboardInputView(BaseView):
                 self.input_text = self.input_text[:-1]
             return ViewAction(ViewActionType.NONE)
 
-        # 3. Enter -> Submit Password
-        elif event == InputEvent.ENTER:
-            if self.on_submit:
-                self.on_submit(self.ssid, self.input_text)
-            return ViewAction(
-                ViewActionType.EXECUTE_TASK,
-                task_id="sys_wifi_connect",
-                payload={"ssid": self.ssid, "password": self.input_text}
-            )
-
-        # 4. KEY2 -> Toggle Masking
+        # 3. Toggle Masking (KEY2 or Tab)
         elif event == InputEvent.KEY2:
             self.is_masked = not self.is_masked
             return ViewAction(ViewActionType.NONE)
 
-        # 5. KEY3 / ESCAPE / BACK -> Cancel & Pop
-        elif event in (InputEvent.KEY3, InputEvent.ESCAPE, InputEvent.BACK):
-            return ViewAction(ViewActionType.POP_VIEW)
-
-        # Press on joystick can also act as Enter if keyboard Enter not available
-        elif event == InputEvent.PRESS and len(self.input_text) > 0:
+        # 4. Enter / KEY1 / Joystick PRESS -> Submit Password and connect
+        elif event in (InputEvent.ENTER, InputEvent.KEY1, InputEvent.PRESS):
             if self.on_submit:
                 self.on_submit(self.ssid, self.input_text)
+                return ViewAction(ViewActionType.NONE)
             return ViewAction(
                 ViewActionType.EXECUTE_TASK,
                 task_id="sys_wifi_connect",
                 payload={"ssid": self.ssid, "password": self.input_text}
             )
+
+        # 5. KEY3 / ESCAPE / BACK -> Cancel & Pop
+        elif event in (InputEvent.KEY3, InputEvent.ESCAPE, InputEvent.BACK):
+            return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
 
