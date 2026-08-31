@@ -42,11 +42,12 @@ class DiagnosticManager:
         self,
         plugin_id: str,
         on_complete: Optional[Callable[[DiagnosticResult], None]] = None,
+        on_progress: Optional[Callable[[str, float], None]] = None,
         **kwargs
     ) -> bool:
         """
         Submits a plugin execution task to the background thread pool.
-        Non-blocking to the caller.
+        Non-blocking to the caller. Supports real-time progress callbacks.
         """
         plugin = self.get_plugin(plugin_id)
         if not plugin:
@@ -61,6 +62,9 @@ class DiagnosticManager:
         def _worker_wrapper():
             start_time = time.monotonic()
             try:
+                # Pass on_progress to plugin if supported
+                if on_progress:
+                    kwargs["progress_callback"] = on_progress
                 result = plugin.run(**kwargs)
             except Exception as ex:
                 logger.exception(f"Unhandled error executing plugin '{plugin_id}': {ex}")
