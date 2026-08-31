@@ -223,6 +223,9 @@ class REIApp:
 
     def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
         """Launches Wi-Fi connection worker and shows progress."""
+        if isinstance(self.screen_manager.current_view, KeyboardInputView):
+            self.screen_manager.pop_view()
+
         conn_view = UpdateProgressView(title="CONECTANDO...")
         conn_view.stage_message = f"Enlazando {ssid[:10]}..."
         conn_view.progress = 0.5
@@ -557,15 +560,6 @@ class REIApp:
             logger.info("KeyboardInterrupt received.")
         finally:
             self.shutdown()
-
-    def shutdown(self) -> None:
-        """Releases hardware and thread pool resources."""
-        logger.info("Shutting down REI...")
-        self.running = False
-        self.input_handler.close()
-        self.diag_manager.shutdown(wait=False)
-        self.screen_manager.clear()
-        logger.info("Shutdown complete.")
 
     def shutdown(self) -> None:
         """Releases hardware and thread pool resources."""
