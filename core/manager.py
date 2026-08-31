@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - Diagnostic Manager
+REI - Diagnostic Manager
 Handles asynchronous execution of diagnostic plugins using a worker thread pool.
 """
 
@@ -11,7 +11,7 @@ from typing import Callable, Dict, Optional
 
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
 
-logger = logging.getLogger("OmniDiag.Core.Manager")
+logger = logging.getLogger("REI.Core.Manager")
 
 
 class DiagnosticManager:
@@ -23,7 +23,7 @@ class DiagnosticManager:
     def __init__(self, max_workers: int = 2):
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
-            thread_name_prefix="OmniDiagWorker"
+            thread_name_prefix="REIWorker"
         )
         self._plugins: Dict[str, IDiagnosticPlugin] = {}
         self._active_tasks: Dict[str, Future] = {}

@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - Metric and Output Parser
+REI - Metric and Output Parser
 Utilities for parsing network, hardware, and system telemetry data.
 """
 

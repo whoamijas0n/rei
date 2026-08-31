@@ -1,14 +1,17 @@
 """
-OmniDiag Hub - Diagnostic Plugins
-Decoupled diagnostic implementations for system, network, switch, and endpoint analysis.
+REI - Diagnostic & System Plugins
+Decoupled diagnostic implementations for system, network, switch, endpoint analysis,
+and system power management.
 All plugins implement IDiagnosticPlugin and run asynchronously in worker threads.
 """
 
 import os
 import platform
+import shutil
 import socket
+import subprocess
 import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
 
@@ -72,7 +75,7 @@ class WiFiScanPlugin(IDiagnosticPlugin):
         time.sleep(0.6)
         details = [
             "Corp_Net_5G  [-42dBm]",
-            "Omni_Lab_AP  [-55dBm]",
+            "REI_Lab_AP   [-55dBm]",
             "Guest_WiFi   [-70dBm]",
             "Switch_Mgmt  [-78dBm]"
         ]
@@ -350,3 +353,177 @@ class VaultPlugin(IDiagnosticPlugin):
             summary="Bóveda Bloqueada",
             details=details
         )
+
+
+def execute_system_poweroff() -> Tuple[bool, str]:
+    """
+    Safely synchronizes filesystems and invokes system poweroff.
+    Guards against accidental shutdown during development or testing via REI_DRY_RUN / REI_MOCK_POWER.
+    Attempts multiple system binaries (systemctl, poweroff, shutdown) with and without sudo.
+    """
+    if os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_POWER") == "1":
+        return True, "Simulación segura (Dry-Run / Mock)"
+
+    try:
+        if hasattr(os, "sync"):
+            os.sync()
+    except Exception:
+        pass
+
+    commands = [
+        ["systemctl", "poweroff"],
+        ["poweroff"],
+        ["shutdown", "-h", "now"],
+        ["sudo", "systemctl", "poweroff"],
+        ["sudo", "poweroff"],
+        ["sudo", "shutdown", "-h", "now"],
+    ]
+
+    last_error = ""
+    for cmd in commands:
+        bin_path = shutil.which(cmd[0])
+        if bin_path:
+            try:
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if res.returncode == 0:
+                    return True, "Comando enviado"
+                else:
+                    err = (res.stderr or res.stdout or f"Exit code {res.returncode}").strip()
+                    last_error = f"{cmd[0]}: {err}"
+            except Exception as ex:
+                last_error = f"{cmd[0]}: {str(ex)}"
+
+    return False, last_error if last_error else "Comando no encontrado"
+
+
+def execute_system_reboot() -> Tuple[bool, str]:
+    """
+    Safely synchronizes filesystems and invokes system reboot.
+    Guards against accidental reboot during development or testing via REI_DRY_RUN / REI_MOCK_POWER.
+    Attempts multiple system binaries (systemctl, reboot, shutdown) with and without sudo.
+    """
+    if os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_POWER") == "1":
+        return True, "Simulación segura (Dry-Run / Mock)"
+
+    try:
+        if hasattr(os, "sync"):
+            os.sync()
+    except Exception:
+        pass
+
+    commands = [
+        ["systemctl", "reboot"],
+        ["reboot"],
+        ["shutdown", "-r", "now"],
+        ["sudo", "systemctl", "reboot"],
+        ["sudo", "reboot"],
+        ["sudo", "shutdown", "-r", "now"],
+    ]
+
+    last_error = ""
+    for cmd in commands:
+        bin_path = shutil.which(cmd[0])
+        if bin_path:
+            try:
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if res.returncode == 0:
+                    return True, "Comando enviado"
+                else:
+                    err = (res.stderr or res.stdout or f"Exit code {res.returncode}").strip()
+                    last_error = f"{cmd[0]}: {err}"
+            except Exception as ex:
+                last_error = f"{cmd[0]}: {str(ex)}"
+
+    return False, last_error if last_error else "Comando no encontrado"
+
+
+class PoweroffPlugin(IDiagnosticPlugin):
+    """Executes safe system shutdown on the host device."""
+
+    @property
+    def id(self) -> str:
+        return "sys_poweroff"
+
+    @property
+    def name(self) -> str:
+        return "APAGAR SISTEMA"
+
+    @property
+    def category(self) -> str:
+        return "SYSTEM"
+
+    def run(self, **kwargs) -> DiagnosticResult:
+        success, msg = execute_system_poweroff()
+        if success:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.SUCCESS,
+                summary="Apagando equipo...",
+                details=[
+                    "Sincronizando disco...",
+                    "Apagando sistema...",
+                    "Apagado seguro OK"
+                ]
+            )
+        else:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="Fallo al apagar",
+                details=[
+                    "Error al apagar:",
+                    msg[:20],
+                    "Verifique permisos"
+                ]
+            )
+
+
+class RebootPlugin(IDiagnosticPlugin):
+    """Executes safe system reboot on the host device."""
+
+    @property
+    def id(self) -> str:
+        return "sys_reboot"
+
+    @property
+    def name(self) -> str:
+        return "REINICIAR SISTEMA"
+
+    @property
+    def category(self) -> str:
+        return "SYSTEM"
+
+    def run(self, **kwargs) -> DiagnosticResult:
+        success, msg = execute_system_reboot()
+        if success:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.SUCCESS,
+                summary="Reiniciando equipo...",
+                details=[
+                    "Sincronizando disco...",
+                    "Reiniciando sistema...",
+                    "Reinicio seguro OK"
+                ]
+            )
+        else:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="Fallo al reiniciar",
+                details=[
+                    "Error al reiniciar:",
+                    msg[:20],
+                    "Verifique permisos"
+                ]
+            )

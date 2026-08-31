@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - Core Interfaces
+REI - Core Interfaces
 Defines abstract plugin contracts and diagnostic data structures.
 """
 
