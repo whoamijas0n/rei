@@ -183,6 +183,8 @@ do_install() {
             python3-gpiozero
             python3-rpi.gpio
             python3-spidev
+            git
+            curl
             dnsmasq
             smartmontools
             wireless-tools

@@ -26,11 +26,14 @@ from core.plugins import (
     VaultPlugin,
     PoweroffPlugin,
     RebootPlugin,
+    SystemUpdatePlugin,
+    AppUpdatePlugin,
 )
 from ui.display import (
     ScreenManager,
     HeroCardDeckView,
     DetailCardView,
+    UpdateProgressView,
     HeroCard,
     ViewAction,
     ViewActionType,
@@ -66,8 +69,9 @@ class REIApp:
         # 2. Register Diagnostic Plugins
         self._register_plugins()
 
-        # 3. Cache of Detail Views for background updates
+        # 3. Cache of Views for background updates
         self._detail_views: Dict[str, DetailCardView] = {}
+        self._progress_views: Dict[str, UpdateProgressView] = {}
 
         # 4. Build Hierarchical Menu Tree (Strict Prototype Fidelity)
         self._build_menu_hierarchy()
@@ -91,6 +95,8 @@ class REIApp:
             VaultPlugin(),
             PoweroffPlugin(),
             RebootPlugin(),
+            SystemUpdatePlugin(),
+            AppUpdatePlugin(),
         ]
         for plugin in plugins:
             self.diag_manager.register_plugin(plugin)
@@ -108,6 +114,18 @@ class REIApp:
         self._detail_views[task_id] = view
         return view
 
+    def _create_update_view(self, task_id: str, title: str) -> UpdateProgressView:
+        """Factory for blocking update progress views wired to asynchronous updates."""
+        def on_start():
+            self._trigger_update_task(task_id)
+
+        view = UpdateProgressView(
+            title=title,
+            on_start=on_start
+        )
+        self._progress_views[task_id] = view
+        return view
+
     def _trigger_task(self, task_id: str) -> None:
         """Submits a diagnostic task to the background worker pool."""
         detail_view = self._detail_views.get(task_id)
@@ -119,6 +137,26 @@ class REIApp:
             on_complete=self._on_task_completed
         )
 
+    def _trigger_update_task(self, task_id: str) -> None:
+        """Submits a critical update task with streaming progress to worker pool."""
+        progress_view = self._progress_views.get(task_id)
+        if not progress_view:
+            return
+
+        progress_view.stage_message = "Iniciando proceso..."
+        progress_view.progress = 0.0
+        progress_view.is_running = True
+        progress_view.is_finished = False
+
+        def on_progress(msg: str, pct: float):
+            progress_view.set_progress(msg, pct)
+
+        self.diag_manager.execute_async(
+            plugin_id=task_id,
+            on_complete=self._on_task_completed,
+            on_progress=on_progress
+        )
+
     def _on_task_completed(self, result: DiagnosticResult) -> None:
         """Callback invoked by worker thread when diagnostic completes."""
         logger.info(f"Task completed: {result.plugin_name} ({result.status.name})")
@@ -127,9 +165,10 @@ class REIApp:
         """
         Builds the exact navigation hierarchy:
         - Level 0 (Main): UTILIDADES, SWITCHES / RED, ENDPOINTS PC, BOVEDA / VAULT
-        - Level 1 (Utilidades): CONEXION DE RED (-> Level 2: IP, WIFI), ESTADO BATERIA, ESTADO SISTEMA, ALIMENTACION (-> Level 2: APAGAR, REINICIAR)
-        - Level 1 (Switches): CISCO SERIAL, CISCO SSH, ESCANER SNMP
-        - Level 1 (Endpoints): WINDOWS USB-RNDIS, LINUX SSH
+        - Level 1 (Utilidades): CONEXION DE RED, ESTADO BATERIA, ESTADO SISTEMA, ACTUALIZACIONES, ALIMENTACION
+        - Level 2 (Conexion): VER DIRECCION IP, ESCANEAR WI-FI
+        - Level 2 (Actualizaciones): ACTUALIZAR SISTEMA, ACTUALIZAR REI
+        - Level 2 (Alimentacion): APAGAR, REINICIAR
         """
 
         # ----------------------------------------------------
@@ -153,6 +192,30 @@ class REIApp:
                 icon_name="WIFI",
                 submenu=view_wifi_detail,
                 on_select=lambda: self._trigger_task("diag_wifi_scan")
+            )
+        )
+
+        # ----------------------------------------------------
+        # LEVEL 2: Sub-menus for ACTUALIZACIONES
+        # ----------------------------------------------------
+        view_apt_update = self._create_update_view("sys_apt_update", "ACTUALIZAR SISTEMA")
+        view_git_update = self._create_update_view("sys_git_update", "ACTUALIZAR REI")
+
+        deck_actualizaciones = HeroCardDeckView("ACTUALIZACIONES")
+        deck_actualizaciones.add_card(
+            HeroCard(
+                title="ACTUALIZAR SISTEMA",
+                icon_name="APT",
+                submenu=view_apt_update,
+                on_select=lambda: view_apt_update.start()
+            )
+        )
+        deck_actualizaciones.add_card(
+            HeroCard(
+                title="ACTUALIZAR REI",
+                icon_name="GIT",
+                submenu=view_git_update,
+                on_select=lambda: view_git_update.start()
             )
         )
 
@@ -208,6 +271,13 @@ class REIApp:
                 icon_name="CPU",
                 submenu=view_system_detail,
                 on_select=lambda: self._trigger_task("diag_system")
+            )
+        )
+        deck_utilidades.add_card(
+            HeroCard(
+                title="ACTUALIZACIONES",
+                icon_name="UPDATE",
+                submenu=deck_actualizaciones
             )
         )
         deck_utilidades.add_card(
@@ -312,6 +382,17 @@ class REIApp:
                     status_badge = "OK" if result.status == DiagnosticStatus.SUCCESS else "FAIL"
                     lines = result.details if result.details else [result.summary]
                     detail_view.set_content(lines=lines, status=status_badge, is_loading=False)
+
+            # Find matching update progress view
+            for task_id, progress_view in self._progress_views.items():
+                plugin = self.diag_manager.get_plugin(task_id)
+                if plugin and plugin.name == result.plugin_name:
+                    is_ok = (result.status == DiagnosticStatus.SUCCESS)
+                    progress_view.set_completed(
+                        success=is_ok,
+                        summary=result.summary,
+                        details=result.details
+                    )
 
     def _handle_signal(self, signum, frame):
         """Signal handler for graceful shutdown."""
