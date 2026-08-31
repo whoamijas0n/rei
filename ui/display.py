@@ -331,6 +331,91 @@ class IconRenderer:
         """Alias for GIT icon."""
         IconRenderer._draw_GIT(draw, cx, cy)
 
+    @staticmethod
+    def _draw_KEYBOARD(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Physical USB keyboard icon (20x20)."""
+        draw.rectangle((cx - 9, cy - 6, cx + 9, cy + 6), outline="white", fill="black")
+        for x_off in (-6, -2, 2, 6):
+            draw.point((cx + x_off, cy - 3), fill="white")
+            draw.point((cx + x_off, cy), fill="white")
+        draw.line((cx - 4, cy + 3, cx + 4, cy + 3), fill="white")
+
+    @staticmethod
+    def _draw_KEY(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for KEYBOARD icon."""
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_TECLADO(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for KEYBOARD icon."""
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_WIFI_OK(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Wi-Fi with checkmark (20x20)."""
+        draw.arc((cx - 10, cy - 8, cx + 10, cy + 12), 200, 340, fill="white")
+        draw.arc((cx - 6, cy - 4, cx + 6, cy + 8), 200, 340, fill="white")
+        draw.ellipse((cx - 2, cy + 3, cx + 2, cy + 7), fill="white")
+        draw.line((cx + 3, cy - 1, cx + 5, cy + 2), fill="white")
+        draw.line((cx + 5, cy + 2, cx + 9, cy - 4), fill="white")
+
+    @staticmethod
+    def _draw_WIFI_SUCCESS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_OK icon."""
+        IconRenderer._draw_WIFI_OK(draw, cx, cy)
+
+    @staticmethod
+    def _draw_WIFI_CONNECTED(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_OK icon."""
+        IconRenderer._draw_WIFI_OK(draw, cx, cy)
+
+    @staticmethod
+    def _draw_WIFI_FAIL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Wi-Fi with error cross (20x20)."""
+        draw.arc((cx - 10, cy - 8, cx + 10, cy + 12), 200, 340, fill="white")
+        draw.arc((cx - 6, cy - 4, cx + 6, cy + 8), 200, 340, fill="white")
+        draw.ellipse((cx - 2, cy + 3, cx + 2, cy + 7), fill="white")
+        draw.line((cx + 4, cy - 4, cx + 8, cy), fill="white")
+        draw.line((cx + 8, cy - 4, cx + 4, cy), fill="white")
+
+    @staticmethod
+    def _draw_WIFI_ERROR(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_FAIL icon."""
+        IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
+
+    @staticmethod
+    def _draw_LOCK(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Padlock icon for secured networks (20x20)."""
+        draw.arc((cx - 4, cy - 8, cx + 4, cy), 180, 360, fill="white")
+        draw.rectangle((cx - 6, cy - 1, cx + 6, cy + 7), outline="white", fill="black")
+        draw.point((cx, cy + 2), fill="white")
+        draw.line((cx, cy + 3, cx, cy + 5), fill="white")
+
+    @staticmethod
+    def _draw_OPEN(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Open network alias."""
+        IconRenderer._draw_NETWORK(draw, cx, cy)
+
+    @staticmethod
+    def _draw_SUCCESS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_OK."""
+        IconRenderer._draw_WIFI_OK(draw, cx, cy)
+
+    @staticmethod
+    def _draw_ERROR(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_FAIL."""
+        IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
+
+    @staticmethod
+    def _draw_FAIL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_FAIL."""
+        IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
+
+    @staticmethod
+    def _draw_WARN(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_FAIL."""
+        IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
+
 
 class BaseView(ABC):
     """Abstract Base Class for all OLED views."""
@@ -642,7 +727,7 @@ class UpdateProgressView(BaseView):
             else:
                 draw.text((8, 45), "OK / KEY3: Salir", font=self.font, fill="white")
 
-    def handle_input(self, event: InputEvent) -> ViewAction:
+    def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
         if self.is_running:
             # BLOQUEO ESTRICTO: No se permite salir ni interrumpir mientras corre
             return ViewAction(ViewActionType.NONE)
@@ -650,6 +735,114 @@ class UpdateProgressView(BaseView):
         # Cuando concluye, permitir salir con KEY3, KEY1, PRESS, BACK
         if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
+
+        return ViewAction(ViewActionType.NONE)
+
+
+class KeyboardInputView(BaseView):
+    """
+    Vista interactiva para ingreso de contraseñas Wi-Fi mediante teclado físico USB.
+    Muestra los caracteres ingresados en tiempo real sobre la pantalla OLED 128x64
+    con cursor activo, soporte para borrado (Backspace), confirmación (Enter)
+    y cancelación (KEY3/Escape).
+    """
+
+    def __init__(
+        self,
+        ssid: str,
+        title: Optional[str] = None,
+        on_submit: Optional[Callable[[str, str], None]] = None,
+        masked: bool = False,
+        max_length: int = 63
+    ):
+        header_title = title or f"CLAVE: {ssid}"
+        super().__init__(title=header_title)
+        self.ssid = ssid
+        self.on_submit = on_submit
+        self.is_masked = masked
+        self.max_length = max_length
+        self.input_text: str = ""
+        self.cursor_visible: bool = True
+        self._cursor_tick: int = 0
+
+    def set_text(self, text: str) -> None:
+        """Direct assignment of text (useful for testing)."""
+        self.input_text = text[:self.max_length]
+
+    def update(self) -> None:
+        """Ticks cursor blinking animation at 30 FPS."""
+        self._cursor_tick = (self._cursor_tick + 1) % 30
+        self.cursor_visible = (self._cursor_tick < 15)
+
+    def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
+        # 1. Borde perimetral
+        self.draw_perimeter_border(draw)
+
+        # 2. Encabezado centrado
+        header_text = f"CLAVE: {self.ssid.upper()[:10]}"
+        text_w = len(header_text) * 6
+        draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
+        draw.line((4, 16, 123, 16), fill="white")
+
+        # 3. Caja de texto para el input
+        draw.rectangle((8, 20, 119, 34), outline="white", fill="black")
+
+        # 4. Texto ingresado con desplazamiento horizontal
+        display_str = ("*" * len(self.input_text)) if self.is_masked else self.input_text
+        if len(display_str) > 16:
+            visible_str = display_str[-16:]
+        else:
+            visible_str = display_str
+
+        cursor_char = "_" if self.cursor_visible else " "
+        draw.text((12, 22), visible_str + cursor_char, font=self.font, fill="white")
+
+        # 5. Indicaciones de control
+        draw.text((12, 38), "[ENTER] Conectar", font=self.font, fill="white")
+        draw.text((12, 50), "KEY3:Salir KEY2:Ver", font=self.font, fill="white")
+
+    def handle_input(self, event: InputEvent, char: Optional[str] = None) -> ViewAction:
+        # 1. Character typing from physical USB keyboard
+        if event == InputEvent.CHAR:
+            if char:
+                if len(self.input_text) < self.max_length:
+                    self.input_text += char
+            return ViewAction(ViewActionType.NONE)
+
+        # 2. Backspace
+        elif event == InputEvent.BACKSPACE:
+            if len(self.input_text) > 0:
+                self.input_text = self.input_text[:-1]
+            return ViewAction(ViewActionType.NONE)
+
+        # 3. Enter -> Submit Password
+        elif event == InputEvent.ENTER:
+            if self.on_submit:
+                self.on_submit(self.ssid, self.input_text)
+            return ViewAction(
+                ViewActionType.EXECUTE_TASK,
+                task_id="sys_wifi_connect",
+                payload={"ssid": self.ssid, "password": self.input_text}
+            )
+
+        # 4. KEY2 -> Toggle Masking
+        elif event == InputEvent.KEY2:
+            self.is_masked = not self.is_masked
+            return ViewAction(ViewActionType.NONE)
+
+        # 5. KEY3 / ESCAPE / BACK -> Cancel & Pop
+        elif event in (InputEvent.KEY3, InputEvent.ESCAPE, InputEvent.BACK):
+            return ViewAction(ViewActionType.POP_VIEW)
+
+        # Press on joystick can also act as Enter if keyboard Enter not available
+        elif event == InputEvent.PRESS and len(self.input_text) > 0:
+            if self.on_submit:
+                self.on_submit(self.ssid, self.input_text)
+            return ViewAction(
+                ViewActionType.EXECUTE_TASK,
+                task_id="sys_wifi_connect",
+                payload={"ssid": self.ssid, "password": self.input_text}
+            )
 
         return ViewAction(ViewActionType.NONE)
 
