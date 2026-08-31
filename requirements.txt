@@ -1,0 +1,13 @@
+luma.oled>=3.13.0
+Pillow>=10.2.0
+gpiozero>=2.0.1
+netmiko>=4.3.0
+scrapli>=2024.1.30
+pypsrp>=0.8.1
+pysnmp-lextudio>=6.1.2
+pyserial>=3.5
+cryptography>=42.0.5
+fastapi>=0.110.0
+uvicorn>=0.28.0
+qrcode>=7.4.2
+pydantic>=2.6.4

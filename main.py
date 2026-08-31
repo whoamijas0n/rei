@@ -1,5 +1,5 @@
 """
-OmniDiag Hub - Main Application Entry Point
+REI - Main Application Entry Point
 Pocket autonomous network & endpoint diagnostic tool for Raspberry Pi Zero 2 W.
 Hardware: Waveshare 1.3" OLED HAT (SH1106, 128x64 px) with 5-way joystick & 3 buttons.
 Architecture: 100% OOP, Decoupled Producer/Consumer, Fixed 30 FPS UI Event Loop.
@@ -24,6 +24,8 @@ from core.plugins import (
     WindowsRNDISPlugin,
     LinuxSSHPlugin,
     VaultPlugin,
+    PoweroffPlugin,
+    RebootPlugin,
 )
 from ui.display import (
     ScreenManager,
@@ -41,12 +43,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S"
 )
-logger = logging.getLogger("OmniDiag.Main")
+logger = logging.getLogger("REI.Main")
 
 
-class OmniDiagApp:
+class REIApp:
     """
-    Main Application Controller for OmniDiag Hub.
+    Main Application Controller for REI.
     Orchestrates the ScreenManager, GPIOInputHandler, and DiagnosticManager.
     """
 
@@ -87,6 +89,8 @@ class OmniDiagApp:
             WindowsRNDISPlugin(),
             LinuxSSHPlugin(),
             VaultPlugin(),
+            PoweroffPlugin(),
+            RebootPlugin(),
         ]
         for plugin in plugins:
             self.diag_manager.register_plugin(plugin)
@@ -122,8 +126,8 @@ class OmniDiagApp:
     def _build_menu_hierarchy(self) -> None:
         """
         Builds the exact navigation hierarchy:
-        - Level 0 (Main): INFO SISTEMA, SWITCHES / RED, ENDPOINTS PC, BOVEDA / VAULT
-        - Level 1 (Info Sistema): CONEXION DE RED (-> Level 2: IP, WIFI), BATERIA, SISTEMA
+        - Level 0 (Main): UTILIDADES, SWITCHES / RED, ENDPOINTS PC, BOVEDA / VAULT
+        - Level 1 (Utilidades): CONEXION DE RED (-> Level 2: IP, WIFI), ESTADO BATERIA, ESTADO SISTEMA, ALIMENTACION (-> Level 2: APAGAR, REINICIAR)
         - Level 1 (Switches): CISCO SERIAL, CISCO SSH, ESCANER SNMP
         - Level 1 (Endpoints): WINDOWS USB-RNDIS, LINUX SSH
         """
@@ -153,20 +157,44 @@ class OmniDiagApp:
         )
 
         # ----------------------------------------------------
-        # LEVEL 1: Sub-menus for INFO SISTEMA
+        # LEVEL 2: Sub-menus for ALIMENTACION
+        # ----------------------------------------------------
+        view_poweroff_detail = self._create_detail_view("sys_poweroff", "APAGAR")
+        view_reboot_detail = self._create_detail_view("sys_reboot", "REINICIAR")
+
+        deck_alimentacion = HeroCardDeckView("ALIMENTACION")
+        deck_alimentacion.add_card(
+            HeroCard(
+                title="APAGAR",
+                icon_name="POWEROFF",
+                submenu=view_poweroff_detail,
+                on_select=lambda: self._trigger_task("sys_poweroff")
+            )
+        )
+        deck_alimentacion.add_card(
+            HeroCard(
+                title="REINICIAR",
+                icon_name="REBOOT",
+                submenu=view_reboot_detail,
+                on_select=lambda: self._trigger_task("sys_reboot")
+            )
+        )
+
+        # ----------------------------------------------------
+        # LEVEL 1: Sub-menus for UTILIDADES
         # ----------------------------------------------------
         view_battery_detail = self._create_detail_view("diag_battery", "ESTADO BATERIA")
         view_system_detail = self._create_detail_view("diag_system", "ESTADO SISTEMA")
 
-        deck_info_sistema = HeroCardDeckView("INFO SISTEMA")
-        deck_info_sistema.add_card(
+        deck_utilidades = HeroCardDeckView("UTILIDADES")
+        deck_utilidades.add_card(
             HeroCard(
                 title="CONEXION DE RED",
                 icon_name="NETWORK",
                 submenu=deck_net_conn
             )
         )
-        deck_info_sistema.add_card(
+        deck_utilidades.add_card(
             HeroCard(
                 title="ESTADO BATERIA",
                 icon_name="BATTERY",
@@ -174,12 +202,19 @@ class OmniDiagApp:
                 on_select=lambda: self._trigger_task("diag_battery")
             )
         )
-        deck_info_sistema.add_card(
+        deck_utilidades.add_card(
             HeroCard(
                 title="ESTADO SISTEMA",
                 icon_name="CPU",
                 submenu=view_system_detail,
                 on_select=lambda: self._trigger_task("diag_system")
+            )
+        )
+        deck_utilidades.add_card(
+            HeroCard(
+                title="ALIMENTACION",
+                icon_name="POWER",
+                submenu=deck_alimentacion
             )
         )
 
@@ -249,7 +284,7 @@ class OmniDiagApp:
         # LEVEL 0: MAIN ROOT DECK
         # ----------------------------------------------------
         root_deck = HeroCardDeckView("MAIN")
-        root_deck.add_card(HeroCard(title="INFO SISTEMA", icon_name="INFO", submenu=deck_info_sistema))
+        root_deck.add_card(HeroCard(title="UTILIDADES", icon_name="TOOLS", submenu=deck_utilidades))
         root_deck.add_card(HeroCard(title="SWITCHES / RED", icon_name="NETWORK", submenu=deck_switches))
         root_deck.add_card(HeroCard(title="ENDPOINTS PC", icon_name="ENDPOINT", submenu=deck_endpoints))
         root_deck.add_card(
@@ -290,7 +325,7 @@ class OmniDiagApp:
         and renders double-buffered OLED frames with high temporal precision.
         """
         self.running = True
-        logger.info("OmniDiag Hub UI Event Loop started at 30 FPS.")
+        logger.info("REI UI Event Loop started at 30 FPS.")
 
         next_frame_time = time.monotonic()
 
@@ -336,13 +371,13 @@ class OmniDiagApp:
 
     def shutdown(self) -> None:
         """Releases hardware and thread pool resources."""
-        logger.info("Shutting down OmniDiag Hub...")
+        logger.info("Shutting down REI...")
         self.running = False
         self.input_handler.close()
         self.diag_manager.shutdown(wait=False)
+        self.screen_manager.clear()
         logger.info("Shutdown complete.")
 
-
 if __name__ == "__main__":
-    app = OmniDiagApp()
+    app = REIApp()
     app.run()
