@@ -4,6 +4,7 @@ Generates non-destructive PowerShell payloads and orchestrates Rubber Ducky inje
 for Windows endpoints with automated JSON exfiltration to REI's local FastAPI server.
 """
 
+import base64
 import json
 import logging
 import time
@@ -23,74 +24,81 @@ logger = logging.getLogger("REI.Plugins.Endpoints.Windows")
 
 class WindowsPayloadGenerator:
     """
-    Constructs compact, non-destructive PowerShell one-liners for target Windows endpoints.
+    Constructs compact, non-destructive PowerShell scripts and base64-encoded execution commands
+    for target Windows endpoints.
     """
 
     @classmethod
-    def get_powershell_payload(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
+    def get_powershell_script(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
         """
-        Returns a single-line PowerShell command that gathers telemetry and posts JSON to server_url.
+        Returns the raw PowerShell script that gathers telemetry and posts JSON to server_url.
         """
         cat = category.upper().strip()
         endpoint_uri = f"{server_url.rstrip('/')}/api/v1/endpoint/report"
 
-        # Base PowerShell script structure
-        # Collects hostname, OS info, IP, and specific telemetry
         if "RED" in cat or "CONEXION" in cat or "NETWORK" in cat:
             telemetry_ps = """
-            $t = @{
-                ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet*','Wi-Fi*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress);
-                gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop);
-                dns = (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ServerAddresses);
-                ping_gateway = (Test-Connection -TargetName (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop) -Count 1 -Quiet -ErrorAction SilentlyContinue);
-                adapters = (Get-NetAdapter -ErrorAction SilentlyContinue | Select-Object Name,Status,LinkSpeed | ConvertTo-Json -Compress)
-            }
+            $gw=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -and $_.DefaultIPGateway} | Select-Object -First 1 -ExpandProperty DefaultIPGateway);
+            $ip=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled} | Select-Object -First 1 -ExpandProperty IPAddress);
+            $dns=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled} | Select-Object -First 1 -ExpandProperty DNSServerSearchOrder);
+            $ping=if($gw){(Test-Connection -TargetName $gw -Count 1 -Quiet)}else{$false};
+            $t=@{ip=$ip;gateway=$gw;dns=$dns;ping_gateway=$ping};
             """
         elif "HARDWARE" in cat or "CPU" in cat:
             telemetry_ps = """
-            $t = @{
-                cpu_percent = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average);
-                ram_percent = [math]::Round(((Get-CimInstance Win32_OperatingSystem | ForEach-Object { ($_.TotalVisibleMemorySize - $_.FreePhysicalMemory) / $_.TotalVisibleMemorySize * 100 })), 1);
-                disks = (Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Select-Object DeviceID,FreeSpace,Size | ConvertTo-Json -Compress);
-                cpu_name = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)
-            }
+            $cpu=(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average;
+            $os=Get-CimInstance Win32_OperatingSystem;
+            $ram=[math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/$os.TotalVisibleMemorySize * 100), 1);
+            $disks=(Get-CimInstance Win32_LogicalDisk | Where-Object {$_.DriveType -eq 3} | ForEach-Object {"$($_.DeviceID) Free:$([math]::Round($_.FreeSpace/1GB,1))GB/$([math]::Round($_.Size/1GB,1))GB"}) -join '; ';
+            $t=@{cpu_percent=$cpu;ram_percent=$ram;disks=$disks;cpu_name=(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)};
             """
         elif "MALWARE" in cat or "VIRUS" in cat:
             telemetry_ps = """
-            $t = @{
-                antivirus_enabled = (Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty displayName);
-                top_cpu_procs = (Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 -Property ProcessName,Id,CPU | ConvertTo-Json -Compress);
-                listening_ports = (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object -First 10 -Property LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress);
-                startup_keys = (Get-ItemProperty 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction SilentlyContinue | Out-String)
-            }
+            $av=(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object -First 1 -ExpandProperty displayName);
+            $procs=(Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object {"$($_.ProcessName)($([math]::Round($_.CPU,1))s)"}) -join ', ';
+            $ports=(Get-NetTCPConnection -State Listen | Select-Object -First 6 | ForEach-Object {"$($_.LocalPort)"}) -join ', ';
+            $t=@{antivirus_enabled=$av;top_cpu_procs=$procs;listening_ports=$ports};
             """
         elif "OTROS" in cat or "LOGS" in cat:
             telemetry_ps = """
-            $t = @{
-                critical_events = (Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2} -MaxEvents 5 -ErrorAction SilentlyContinue | Select-Object TimeCreated,Id,Message | ConvertTo-Json -Compress);
-                stopped_auto_services = (Get-Service | Where-Object {$_.StartType -eq 'Automatic' -and $_.Status -eq 'Stopped'} | Select-Object -First 5 -Property Name | ConvertTo-Json -Compress)
-            }
+            $events=(Get-WinEvent -FilterHashtable @{LogName='System';Level=1,2} -MaxEvents 3 | ForEach-Object {"[$($_.TimeCreated.ToString('HH:mm'))] $($_.Message.Substring(0,[math]::Min(60,$_.Message.Length)))"}) -join ' | ';
+            $services=(Get-Service | Where-Object {$_.StartType -eq 'Automatic' -and $_.Status -eq 'Stopped'} | Select-Object -First 5 -ExpandProperty Name) -join ', ';
+            $t=@{critical_events=$events;stopped_auto_services=$services};
             """
         else:
             # ANALISIS COMPLETO (Consolidated Full Suite)
             telemetry_ps = """
-            $t = @{
-                cpu_percent = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average);
-                ram_percent = [math]::Round(((Get-CimInstance Win32_OperatingSystem | ForEach-Object { ($_.TotalVisibleMemorySize - $_.FreePhysicalMemory) / $_.TotalVisibleMemorySize * 100 })), 1);
-                ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet*','Wi-Fi*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress);
-                gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop);
-                antivirus_enabled = (Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty displayName);
-                top_cpu_procs = (Get-Process | Sort-Object CPU -Descending | Select-Object -First 3 -Property ProcessName,Id,CPU | ConvertTo-Json -Compress)
-            }
+            $cpu=(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average;
+            $os=Get-CimInstance Win32_OperatingSystem;
+            $ram=[math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/$os.TotalVisibleMemorySize * 100), 1);
+            $ip=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled} | Select-Object -First 1 -ExpandProperty IPAddress);
+            $gw=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -and $_.DefaultIPGateway} | Select-Object -First 1 -ExpandProperty DefaultIPGateway);
+            $av=(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object -First 1 -ExpandProperty displayName);
+            $t=@{cpu_percent=$cpu;ram_percent=$ram;ip=$ip;gateway=$gw;antivirus_enabled=$av};
             """
 
-        script = f"""$ErrorActionPreference='SilentlyContinue';{telemetry_ps.strip()};$p=@{{os_type='windows';category='{cat}';hostname=$env:COMPUTERNAME;telemetry=$t}};$b=[System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -Compress -Depth 4 $p));Invoke-RestMethod -Uri '{endpoint_uri}' -Method Post -Body $b -ContentType 'application/json'"""
+        script = (
+            f"$ErrorActionPreference='SilentlyContinue';"
+            f"{telemetry_ps.strip()};"
+            f"$p=@{{os_type='windows';category='{cat}';hostname=$env:COMPUTERNAME;telemetry=$t}};"
+            f"$j=ConvertTo-Json -Compress -Depth 4 $p;"
+            f"$b=[System.Text.Encoding]::UTF8.GetBytes($j);"
+            f"try{{Invoke-RestMethod -Uri '{endpoint_uri}' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec 10}}catch{{"
+            f"try{{$wc=New-Object System.Net.WebClient;$wc.Headers.Add('Content-Type','application/json; charset=utf-8');$wc.UploadData('{endpoint_uri}','POST',$b)}}catch{{}}}}"
+        )
+        return " ".join(line.strip() for line in script.splitlines() if line.strip())
 
-        # Minify to single line
-        compact_script = " ".join(line.strip() for line in script.splitlines() if line.strip())
-
-        # Wrap in PowerShell execution command
-        return f'powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "{compact_script}"'
+    @classmethod
+    def get_powershell_payload(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
+        """
+        Returns a single-line PowerShell command encoded in Base64 (UTF-16LE) using -EncodedCommand.
+        This completely eliminates CLI quotation errors, layout special character corruption,
+        and Windows Run dialog (Win+R) parsing issues.
+        """
+        script = cls.get_powershell_script(category=category, server_url=server_url)
+        encoded_bytes = script.encode("utf-16le")
+        b64_cmd = base64.b64encode(encoded_bytes).decode("ascii")
+        return f"powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64_cmd}"
 
 
 class WindowsHIDPlugin(IDiagnosticPlugin):
@@ -117,7 +125,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
 
     @property
     def id(self) -> str:
-        return f"diag_win_hid_{self._category.lower().replace(' ', '_')}_{self._layout}"
+        return "diag_win_hid"
 
     @property
     def name(self) -> str:
@@ -154,11 +162,11 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
         try:
             # Emulate GUI + r to open Windows Run dialog
             self._injector.press_combination("gui", "r")
-            time.sleep(0.5)
+            time.sleep(0.8)
 
             # Write PowerShell execution string and press ENTER
             self._injector.write_text(payload_cmd, layout=self._layout)
-            time.sleep(0.1)
+            time.sleep(0.2)
             self._injector.press_key("enter")
 
         except Exception as inj_ex:
@@ -170,7 +178,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                     status=DiagnosticStatus.FAILED,
                     overall_status=Severity.CRITICAL,
                     summary="Fallo de inyección USB HID",
-                    details=[f"Error: {str(inj_ex)[:25]}"],
+                    details=["USB HID no disponible", "Active Modo HID en Menu"],
                 )
 
         # Step 3: Await Telemetry over HTTP

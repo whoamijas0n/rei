@@ -233,12 +233,111 @@ do_install() {
                 echo "dtparam=spi=on" >> "$boot_cfg"
             fi
             if ! grep -q "^dtoverlay=dwc2" "$boot_cfg"; then
-                echo "dtoverlay=dwc2" >> "$boot_cfg"
+                echo "dtoverlay=dwc2,dr_mode=peripheral" >> "$boot_cfg"
             fi
-            print_status "info" "Interfaces I2C/SPI y USB OTG (dwc2) habilitadas en ${boot_cfg}"
+            print_status "info" "Interfaces I2C/SPI y USB OTG (dwc2,dr_mode=peripheral) habilitadas en ${boot_cfg}"
             break
         fi
     done
+
+    # 3.1 Creación del Script de Gadget Compuesto (/usr/local/bin/usb_gadget.sh)
+    cat > "/usr/local/bin/usb_gadget.sh" << 'EOF'
+#!/bin/bash
+modprobe libcomposite 2>/dev/null || true
+cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
+
+for dir in /sys/kernel/config/usb_gadget/*; do
+    if [ -d "$dir" ]; then
+        echo "" > "$dir/UDC" 2>/dev/null || true
+        sleep 0.1
+        rm -rf "$dir" 2>/dev/null || true
+    fi
+done
+
+if [ -d rei ]; then
+    echo "" > rei/UDC 2>/dev/null || true
+    sleep 0.1
+    rm -rf rei 2>/dev/null || true
+fi
+
+mkdir -p rei
+cd rei || exit 1
+
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+echo 0x0100 > bcdDevice
+echo 0x0200 > bcdUSB
+
+mkdir -p strings/0x409
+echo "fedcba9876543210" > strings/0x409/serialnumber
+echo "REI" > strings/0x409/manufacturer
+echo "REI Diagnostic Hub (HID+Net)" > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+echo "Config 1" > configs/c.1/strings/0x409/configuration
+echo 250 > configs/c.1/MaxPower
+
+# 1. Teclado HID (/dev/hidg0)
+mkdir -p functions/hid.usb0
+echo 1 > functions/hid.usb0/protocol
+echo 1 > functions/hid.usb0/subclass
+echo 8 > functions/hid.usb0/report_length
+echo -ne \x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0 > functions/hid.usb0/report_desc
+ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
+
+# 2. RNDIS (Windows)
+mkdir -p functions/rndis.usb0 2>/dev/null || true
+if [ -d functions/rndis.usb0 ]; then
+    echo 1 > os_desc/use 2>/dev/null || true
+    echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
+    echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
+    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
+    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
+    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
+    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
+    ln -s configs/c.1 os_desc 2>/dev/null || true
+fi
+
+# 3. ECM (Linux/Mac)
+mkdir -p functions/ecm.usb0 2>/dev/null || true
+if [ -d functions/ecm.usb0 ]; then
+    echo "02:11:22:33:44:55" > functions/ecm.usb0/host_addr 2>/dev/null || true
+    echo "02:11:22:33:44:56" > functions/ecm.usb0/dev_addr 2>/dev/null || true
+    ln -s functions/ecm.usb0 configs/c.1/ 2>/dev/null || true
+fi
+
+UDC_DEV=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+if [ -n "$UDC_DEV" ]; then
+    echo "$UDC_DEV" > UDC
+fi
+
+sleep 1
+if ip link show usb0 >/dev/null 2>&1; then
+    ip link set usb0 up 2>/dev/null || true
+    ip addr flush dev usb0 2>/dev/null || true
+    ip addr add 10.0.0.1/24 dev usb0 2>/dev/null || true
+fi
+EOF
+    chmod 755 "/usr/local/bin/usb_gadget.sh"
+
+    # 3.2 Servicio Systemd usb_gadget.service
+    cat > "/etc/systemd/system/usb_gadget.service" << 'EOF'
+[Unit]
+Description=USB HID/Net Gadget Initialization
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/bin/usb_gadget.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+    chmod 644 "/etc/systemd/system/usb_gadget.service"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable usb_gadget.service 2>/dev/null || true
+    print_status "info" "Servicio usb_gadget.service configurado y habilitado."
 
     # Configuración de arranque silencioso en cmdline.txt para evitar parpadeos de consola
     for cmdline_cfg in "/boot/firmware/cmdline.txt" "/boot/cmdline.txt"; do
@@ -424,6 +523,14 @@ do_uninstall() {
         print_status "info" "Splash de arranque deshabilitado."
     fi
 
+    if systemctl is-active --quiet "usb_gadget.service" 2>/dev/null; then
+        systemctl stop "usb_gadget.service" 2>/dev/null || true
+    fi
+    if systemctl is-enabled --quiet "usb_gadget.service" 2>/dev/null; then
+        systemctl disable "usb_gadget.service" 2>/dev/null || true
+        print_status "info" "Servicio usb_gadget.service deshabilitado."
+    fi
+
     if [ -f "${SERVICE_PATH}" ]; then
         rm -f "${SERVICE_PATH}"
         print_status "info" "Archivo de servicio ${SERVICE_PATH} eliminado."
@@ -434,9 +541,19 @@ do_uninstall() {
         print_status "info" "Archivo de servicio ${SPLASH_SERVICE_PATH} eliminado."
     fi
 
+    if [ -f "/etc/systemd/system/usb_gadget.service" ]; then
+        rm -f "/etc/systemd/system/usb_gadget.service"
+        print_status "info" "Archivo de servicio usb_gadget.service eliminado."
+    fi
+
     if [ -f "${SPLASH_BIN_PATH}" ]; then
         rm -f "${SPLASH_BIN_PATH}"
         print_status "info" "Binario de splash ${SPLASH_BIN_PATH} eliminado."
+    fi
+
+    if [ -f "/usr/local/bin/usb_gadget.sh" ]; then
+        rm -f "/usr/local/bin/usb_gadget.sh"
+        print_status "info" "Script /usr/local/bin/usb_gadget.sh eliminado."
     fi
 
     if [ -d "${PROJECT_DIR}/.venv" ]; then

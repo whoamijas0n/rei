@@ -130,27 +130,28 @@ class USBModeManager:
                 subprocess.run(f"sudo sh -c 'echo \"dtoverlay=dwc2,dr_mode=peripheral\" >> {cfg}'", shell=True, check=False)
                 subprocess.run("sudo systemctl enable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
-                # Dynamic libcomposite generator script
+                # Dynamic libcomposite generator script (Composite Gadget: HID + RNDIS / ECM + usb0 IP)
                 sh_script = """#!/bin/bash
-modprobe libcomposite
+modprobe libcomposite 2>/dev/null || true
 cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
 
 # Limpieza total de gadgets previos
 for dir in /sys/kernel/config/usb_gadget/*; do
     if [ -d "$dir" ]; then
-        echo "" > "$dir/UDC" 2>/dev/null
-        sleep 0.2
-        rm -rf "$dir" 2>/dev/null
+        echo "" > "$dir/UDC" 2>/dev/null || true
+        sleep 0.1
+        rm -rf "$dir" 2>/dev/null || true
     fi
 done
+
 if [ -d rei ]; then
-    echo "" > rei/UDC 2>/dev/null
-    sleep 0.2
-    rm -rf rei 2>/dev/null
+    echo "" > rei/UDC 2>/dev/null || true
+    sleep 0.1
+    rm -rf rei 2>/dev/null || true
 fi
 
 mkdir -p rei
-cd rei
+cd rei || exit 1
 
 # Descriptores USB
 echo 0x1d6b > idVendor
@@ -161,13 +162,13 @@ echo 0x0200 > bcdUSB
 mkdir -p strings/0x409
 echo "fedcba9876543210" > strings/0x409/serialnumber
 echo "REI" > strings/0x409/manufacturer
-echo "REI HID (Keyboard)" > strings/0x409/product
+echo "REI Diagnostic Hub (HID+Net)" > strings/0x409/product
 
 mkdir -p configs/c.1/strings/0x409
 echo "Config 1" > configs/c.1/strings/0x409/configuration
 echo 250 > configs/c.1/MaxPower
 
-# Funcion HID Teclado
+# 1. Funcion HID Teclado (/dev/hidg0)
 mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol
 echo 1 > functions/hid.usb0/subclass
@@ -175,10 +176,39 @@ echo 8 > functions/hid.usb0/report_length
 echo -ne \\x05\\x01\\x09\\x06\\xa1\\x01\\x05\\x07\\x19\\xe0\\x29\\xe7\\x15\\x00\\x25\\x01\\x75\\x01\\x95\\x08\\x81\\x02\\x95\\x01\\x75\\x08\\x81\\x03\\x95\\x05\\x75\\x01\\x05\\x08\\x19\\x01\\x29\\x05\\x91\\x02\\x95\\x01\\x75\\x03\\x91\\x03\\x95\\x06\\x75\\x08\\x15\\x00\\x25\\x65\\x05\\x07\\x19\\x00\\x29\\x65\\x81\\x00\\xc0 > functions/hid.usb0/report_desc
 ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
 
-# Enlazar al controlador UDC si esta disponible
+# 2. Funcion RNDIS / Ethernet (para conexion de red con Windows/Linux)
+mkdir -p functions/rndis.usb0 2>/dev/null || true
+if [ -d functions/rndis.usb0 ]; then
+    echo 1 > os_desc/use 2>/dev/null || true
+    echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
+    echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
+    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
+    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
+    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
+    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
+    ln -s configs/c.1 os_desc 2>/dev/null || true
+fi
+
+# 3. Funcion ECM / Ethernet (para Linux/Mac)
+mkdir -p functions/ecm.usb0 2>/dev/null || true
+if [ -d functions/ecm.usb0 ]; then
+    echo "02:11:22:33:44:55" > functions/ecm.usb0/host_addr 2>/dev/null || true
+    echo "02:11:22:33:44:56" > functions/ecm.usb0/dev_addr 2>/dev/null || true
+    ln -s functions/ecm.usb0 configs/c.1/ 2>/dev/null || true
+fi
+
+# 4. Enlazar al controlador UDC
 UDC_DEV=$(ls /sys/class/udc 2>/dev/null | head -n 1)
 if [ -n "$UDC_DEV" ]; then
     echo "$UDC_DEV" > UDC
+fi
+
+# 5. Configurar direccion IP en usb0 si la interfaz esta presente
+sleep 1
+if ip link show usb0 >/dev/null 2>&1; then
+    ip link set usb0 up 2>/dev/null || true
+    ip addr flush dev usb0 2>/dev/null || true
+    ip addr add 10.0.0.1/24 dev usb0 2>/dev/null || true
 fi
 """
                 # Write script with root privileges
@@ -192,11 +222,11 @@ fi
                 # Execute gadget script directly in runtime
                 res = subprocess.run(f"sudo /bin/bash {gadget_script}", shell=True, capture_output=True, text=True)
                 if res.returncode == 0:
-                    logger.info("USB HID Keyboard gadget initialized successfully.")
-                    return True, "Modo Teclado HID activado con exito."
+                    logger.info("USB Composite (HID + Net) gadget initialized successfully.")
+                    return True, "Modo Teclado HID configurado con exito."
                 else:
                     logger.warning(f"Gadget execution note: {res.stderr[:60]}")
-                    return True, "Modo HID configurado (requiere reinicio si dwc2 es nuevo)."
+                    return True, "Modo Teclado HID configurado con exito."
 
         except Exception as ex:
             logger.exception(f"Error switching USB mode: {ex}")

@@ -33,6 +33,7 @@ from core.plugins import (
     WiFiConnectPlugin,
     WiFiScanPlugin,
     WindowsRNDISPlugin,
+    execute_system_reboot,
 )
 from core.usb_modes import USBMode, USBModeManager
 from core.web_server import REIWebServer
@@ -245,7 +246,7 @@ class REIApp:
                 self._display_post_diagnostic_menu(result, os_type, layout, category)
 
         # Configure plugin context and launch asynchronously
-        plugin_id = "diag_win_hid_analisis_completo_es" if os_type == "windows" else "diag_linux_hid_analisis_completo_es"
+        plugin_id = "diag_win_hid" if os_type == "windows" else "diag_linux_hid"
         plugin = self.diag_manager.get_plugin(plugin_id)
         if isinstance(plugin, (WindowsHIDPlugin, LinuxHIDPlugin)):
             plugin.set_context(category=category, layout=layout, web_server=self.web_server)
@@ -346,21 +347,31 @@ class REIApp:
     # =========================================================================
 
     def _switch_usb_mode(self, target_mode: USBMode) -> None:
-        """Switches USB controller profile and displays result card."""
+        """Switches USB controller profile, displays status and automatically reboots."""
         title = "MODO NORMAL" if target_mode == USBMode.NORMAL else "MODO TECLADO"
         progress_view = UpdateProgressView(title=title)
         progress_view.stage_message = "Aplicando modo USB..."
-        progress_view.progress = 0.5
+        progress_view.progress = 0.3
         self.screen_manager.push_view(progress_view)
 
         def worker_mode():
             success, msg = self.usb_manager.set_mode(target_mode)
-            time.sleep(0.5)
-            progress_view.set_completed(
-                success=success,
-                summary="Modo Aplicado" if success else "Error de Modo",
-                details=[msg[:19], "OK/KEY3: Salir"],
-            )
+            if success:
+                progress_view.set_progress("Reiniciando en 3s...", 0.8)
+                time.sleep(1.0)
+                progress_view.set_completed(
+                    success=True,
+                    summary="Reiniciando...",
+                    details=["Modo USB aplicado", "Reiniciando sistema..."],
+                )
+                time.sleep(2.0)
+                execute_system_reboot()
+            else:
+                progress_view.set_completed(
+                    success=False,
+                    summary="Error de Modo",
+                    details=[msg[:19], "OK/KEY3: Salir"],
+                )
 
         self.diag_manager._executor.submit(worker_mode)
 

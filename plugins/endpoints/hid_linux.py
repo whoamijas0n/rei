@@ -4,6 +4,7 @@ Generates non-destructive Bash payloads and orchestrates Rubber Ducky injection
 for Linux endpoints with automated JSON exfiltration to REI's local FastAPI server.
 """
 
+import base64
 import json
 import logging
 import time
@@ -23,59 +24,70 @@ logger = logging.getLogger("REI.Plugins.Endpoints.Linux")
 
 class LinuxPayloadGenerator:
     """
-    Constructs compact, non-destructive Bash one-liners for target Linux endpoints.
+    Constructs compact, non-destructive Bash scripts and base64-encoded execution commands
+    for target Linux endpoints.
     """
 
     @classmethod
-    def get_bash_payload(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
+    def get_bash_script(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
         """
-        Returns a single-line Bash command that gathers telemetry and posts JSON via curl.
+        Returns the raw Bash script that gathers telemetry and posts JSON via curl.
         """
         cat = category.upper().strip()
         endpoint_uri = f"{server_url.rstrip('/')}/api/v1/endpoint/report"
 
         if "RED" in cat or "CONEXION" in cat or "NETWORK" in cat:
             telemetry_sh = (
-                "ip=$(ip -4 addr show up | grep inet | awk '{print $2}' | head -n 1);"
+                "ip=$(ip -4 addr show up | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1);"
                 "gw=$(ip route | grep default | awk '{print $3}' | head -n 1);"
-                "ping_ok=$(ping -c 1 -W 2 $gw >/dev/null 2>&1 && echo true || echo false);"
-                't="{\\"ip\\":\\"$ip\\",\\"gateway\\":\\"$gw\\",\\"ping_gateway\\":$ping_ok}";'
+                "ping_ok=$(ping -c 1 -W 2 \"$gw\" >/dev/null 2>&1 && echo true || echo false);"
+                "t=\"{\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"ping_gateway\\\":$ping_ok}\";"
             )
         elif "HARDWARE" in cat or "CPU" in cat:
             telemetry_sh = (
-                "cpu=$(top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}');"
+                "cpu=$(top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1);"
                 "ram=$(free | grep Mem | awk '{printf(\"%.1f\", $3/$2 * 100.0)}');"
                 "temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf(\"%.1f\", $1/1000)}' || echo '0');"
-                't="{\\"cpu_percent\\":${cpu:-0},\\"ram_percent\\":${ram:-0},\\"cpu_temp_c\\":${temp:-0}}";'
+                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"cpu_temp_c\\\":${temp:-0}}\";"
             )
         elif "MALWARE" in cat or "VIRUS" in cat:
             telemetry_sh = (
-                "procs=$(ps -eo pid,pcpu,comm --sort=-%cpu | head -n 6 | awk 'NR>1 {printf(\"%s (%s%%) \", $3, $2)}');"
-                "ports=$(ss -tulpn 2>/dev/null | grep LISTEN | head -n 5 | awk '{print $5}' | tr '\\n' ' ');"
-                't="{\\"top_procs\\":\\"$procs\\",\\"listening_ports\\":\\"$ports\\"}";'
+                "procs=$(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2 | tr '\\n' ',' | sed 's/,$//');"
+                "ports=$(ss -tulpn 2>/dev/null | grep LISTEN | awk '{print $5}' | head -n 5 | tr '\\n' ',' | sed 's/,$//');"
+                "t=\"{\\\"top_procs\\\":\\\"$procs\\\",\\\"listening_ports\\\":\\\"$ports\\\"}\";"
             )
         elif "OTROS" in cat or "LOGS" in cat:
             telemetry_sh = (
-                "failed=$(systemctl --failed --no-legend 2>/dev/null | head -n 3 | awk '{print $2}' | tr '\\n' ' ');"
-                "disk=$(df -h / | awk 'NR==2 {print $5}');"
-                't="{\\"failed_services\\":\\"$failed\\",\\"disk_usage\\":\\"$disk\\"}";'
+                "failed=$(systemctl --failed --no-legend 2>/dev/null | awk '{print $2}' | tr '\\n' ',' | sed 's/,$//');"
+                "disk=$(df -h / 2>/dev/null | awk 'NR==2 {print $5}');"
+                "t=\"{\\\"failed_services\\\":\\\"$failed\\\",\\\"disk_usage\\\":\\\"$disk\\\"}\";"
             )
         else:
             # ANALISIS COMPLETO (Consolidated Full Suite)
             telemetry_sh = (
-                "cpu=$(top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}');"
+                "cpu=$(top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1);"
                 "ram=$(free | grep Mem | awk '{printf(\"%.1f\", $3/$2 * 100.0)}');"
-                "ip=$(ip -4 addr show up | grep inet | awk '{print $2}' | head -n 1);"
+                "ip=$(ip -4 addr show up | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1);"
                 "gw=$(ip route | grep default | awk '{print $3}' | head -n 1);"
-                't="{\\"cpu_percent\\":${cpu:-0},\\"ram_percent\\":${ram:-0},\\"ip\\":\\"$ip\\",\\"gateway\\":\\"$gw\\"}";'
+                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\"}\";"
             )
 
-        payload = (
-            f"nohup bash -c 'hn=$(hostname);{telemetry_sh}"
-            f'p="{{\\"os_type\\":\\"linux\\",\\"category\\":\\"{cat}\\",\\"hostname\\":\\"$hn\\",\\"telemetry\\":$t}}";'
-            f"curl -s -X POST -H \"Content-Type: application/json\" -d \"$p\" {endpoint_uri} >/dev/null 2>&1' >/dev/null 2>&1 &"
+        script = (
+            f"hn=$(hostname 2>/dev/null || echo 'linux-client');"
+            f"{telemetry_sh}"
+            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"telemetry\\\":$t}}\";"
+            f"curl -s -m 10 -X POST -H 'Content-Type: application/json' -d \"$p\" {endpoint_uri} >/dev/null 2>&1"
         )
-        return payload
+        return script
+
+    @classmethod
+    def get_bash_payload(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
+        """
+        Returns a single-line Base64-encoded command to execute in background without quoting conflicts.
+        """
+        script = cls.get_bash_script(category=category, server_url=server_url)
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        return f"echo {b64}|base64 -d|sh >/dev/null 2>&1 &"
 
 
 class LinuxHIDPlugin(IDiagnosticPlugin):
@@ -102,7 +114,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
 
     @property
     def id(self) -> str:
-        return f"diag_linux_hid_{self._category.lower().replace(' ', '_')}_{self._layout}"
+        return "diag_linux_hid"
 
     @property
     def name(self) -> str:
@@ -141,10 +153,11 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
             self._injector.press_combination("ctrl+alt", "t")
             time.sleep(1.0)
 
-            # Write bash execution string and press ENTER
-            self._injector.write_text(payload_cmd, layout=self._layout)
-            time.sleep(0.1)
-            self._injector.press_key("enter")
+            # Write bash execution string and press ENTER (leading space avoids history)
+            self._injector.write_text(f" {payload_cmd}\n", layout=self._layout)
+            time.sleep(0.3)
+            # Close terminal cleanly
+            self._injector.write_text("exit\n", layout=self._layout)
 
         except Exception as inj_ex:
             logger.error(f"HID injection failed: {inj_ex}")
@@ -155,7 +168,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     status=DiagnosticStatus.FAILED,
                     overall_status=Severity.CRITICAL,
                     summary="Fallo de inyección USB HID",
-                    details=[f"Error: {str(inj_ex)[:25]}"],
+                    details=["USB HID no disponible", "Active Modo HID en Menu"],
                 )
 
         # Step 3: Await Telemetry over HTTP
