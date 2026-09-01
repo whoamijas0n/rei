@@ -214,7 +214,7 @@ class REIApp:
 
                 deck_wifi_nets.add_card(
                     HeroCard(
-                        title=f"{ssid.upper()[:14]}",
+                        title=f"{ssid.strip().upper()[:16]}",
                         icon_name=icon,
                         on_select=make_select_handler(ssid, is_secured)
                     )

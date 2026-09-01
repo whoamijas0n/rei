@@ -432,6 +432,28 @@ class BaseView(ABC):
             self._font = ImageFont.load_default()
         return self._font
 
+    def get_text_width(self, draw: ImageDraw.ImageDraw, text: str) -> int:
+        """Calculates exact pixel width of a text string."""
+        if hasattr(draw, "textbbox"):
+            bbox = draw.textbbox((0, 0), text, font=self.font)
+            return bbox[2] - bbox[0]
+        elif hasattr(draw, "textlength"):
+            return int(draw.textlength(text, font=self.font))
+        return len(text) * 6
+
+    def draw_centered_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        y: int,
+        screen_width: int = 128,
+        fill: str = "white"
+    ) -> None:
+        """Renders horizontally centered text at specified Y coordinate."""
+        text_w = self.get_text_width(draw, text)
+        text_x = max(2, (screen_width - text_w) // 2)
+        draw.text((text_x, y), text, font=self.font, fill=fill)
+
     def draw_perimeter_border(self, draw: ImageDraw.ImageDraw) -> None:
         """
         Renders the continuous 1px perimeter border.
@@ -488,7 +510,7 @@ class HeroCardDeckView(BaseView):
         self.draw_perimeter_border(draw)
 
         if not self.cards:
-            draw.text((30, 28), "NO ITEMS", fill="white", font=self.font)
+            self.draw_centered_text(draw, "NO ITEMS", y=28, screen_width=width)
             return
 
         total = len(self.cards)
@@ -507,11 +529,9 @@ class HeroCardDeckView(BaseView):
         # 3. Dibujar Icono Centrado (cx=64, cy=24)
         IconRenderer.draw_icon(draw, active_card.icon_name, cx=64, cy=24)
 
-        # 4. Dibujar Título Centrado en Y=44
-        title_text = active_card.title.upper()
-        text_w = len(title_text) * 6
-        text_x = max(4, (width - text_w) // 2)
-        draw.text((text_x, 44), title_text, font=self.font, fill="white")
+        # 4. Dibujar Título Centrado en Y=44 (Strict AGENT.md Spec)
+        title_text = active_card.title.strip().upper()
+        self.draw_centered_text(draw, title_text, y=44, screen_width=width)
 
     def handle_input(self, event: InputEvent) -> ViewAction:
         if not self.cards:
@@ -594,9 +614,8 @@ class DetailCardView(BaseView):
         self.draw_perimeter_border(draw)
 
         # 2. Cabecera centrada
-        header_text = self.title.upper()
-        text_w = len(header_text) * 6
-        draw.text(((width - text_w) // 2, 6), header_text, font=self.font, fill="white")
+        header_text = self.title.strip().upper()
+        self.draw_centered_text(draw, header_text, y=6, screen_width=width)
         draw.line((4, 18, 123, 18), fill="white")
 
         # 3. Contenido limpio (Y=24, espaciado 12px)
@@ -693,9 +712,8 @@ class UpdateProgressView(BaseView):
         self.draw_perimeter_border(draw)
 
         # 2. Cabecera centrada
-        header_text = self.title.upper()
-        text_w = len(header_text) * 6
-        draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
+        header_text = self.title.strip().upper()
+        self.draw_centered_text(draw, header_text, y=5, screen_width=width)
         draw.line((4, 16, 123, 16), fill="white")
 
         if self.is_running:

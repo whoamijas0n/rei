@@ -3,6 +3,7 @@ REI - Virtual Keyboard View for 1.3" OLED (128x64 px)
 Interactive on-screen keyboard operated via 5-way joystick and hardware buttons (KEY1, KEY2, KEY3).
 Provides multi-layer character sets (Lowercase, Uppercase, Numbers, Symbols), high-contrast
 inverted active cell highlighting, text box scrolling, and non-blocking navigation.
+Adheres strictly to AGENT.md minimalist layout standards (Zero Useless Screen Legends).
 """
 
 from dataclasses import dataclass
@@ -40,12 +41,12 @@ class VirtualKeyboardInputView(BaseView):
     Virtual Keyboard View for OLED 128x64 display.
     Allows complete Wi-Fi password entry using only 5-way joystick and physical HAT keys.
     
-    Controls:
-    - Joystick UP / DOWN / LEFT / RIGHT: Move focus in the key matrix.
+    Controls (Physical / Hardware):
+    - Joystick UP / DOWN / LEFT / RIGHT: Move focus in the 4x10 key matrix.
     - Joystick PRESS: Type selected character or trigger key action (Shift, Layer, Space, Backspace, OK).
     - KEY1: Instant Submit & Connect shortcut.
     - KEY2: Instant Backspace / Delete shortcut.
-    - KEY3: Cancel and return without saving.
+    - KEY3: Cancel and return to previous view without saving.
     """
 
     def __init__(
@@ -174,18 +175,17 @@ class VirtualKeyboardInputView(BaseView):
         """
         Renders the Virtual Keyboard to the 128x64 1-bit canvas:
         - 1px continuous perimeter border: (1, 1) to (126, 62)
-        - Top area (y: 2..13): Text input box with SSID, scrolling password, blinking cursor, and layer badge
-        - Key matrix (y: 16..50): 4 rows x 10 cols with high-contrast inverted active cell
-        - Quick action status bar (y: 52..60): Hardware button shortcuts
+        - Top area (y: 2..14): Text input box with scrolling password, blinking cursor, and layer badge
+        - Key matrix (y: 18..59): Spacious 4 rows x 10 cols with high-contrast inverted active cell
         """
         # 1. Borde perimetral continuo
         self.draw_perimeter_border(draw)
 
         # 2. Línea Superior: Cuadro de texto para la contraseña y badge de capa
-        # Cuadro de entrada: x=3..94, y=2..13
-        draw.rectangle((3, 2, 94, 13), outline="white", fill="black")
+        # Cuadro de entrada: x=3..94, y=2..14
+        draw.rectangle((3, 2, 94, 14), outline="white", fill="black")
         
-        # Badge de capa: x=96..124, y=2..13
+        # Badge de capa: x=96..124, y=2..14
         layer_badge = f"[{self._get_layer_badge()}]"
         draw.text((97, 3), layer_badge, font=self.font, fill="white")
 
@@ -204,11 +204,11 @@ class VirtualKeyboardInputView(BaseView):
         draw.text((5, 3), visible_text + cursor_char, font=self.font, fill="white")
 
         # 3. Línea divisoria superior
-        draw.line((2, 14, 125, 14), fill="white")
+        draw.line((2, 15, 125, 15), fill="white")
 
-        # 4. Matriz de Teclas (y: 16..50)
+        # 4. Matriz de Teclas (y: 18..59) - Espaciosa y de alta legibilidad
         layout = self._get_current_layout()
-        row_y_coords = [16, 25, 34, 43]
+        row_y_coords = [18, 29, 40, 51]
         cell_w = 12
 
         for r_idx, row in enumerate(layout):
@@ -222,7 +222,7 @@ class VirtualKeyboardInputView(BaseView):
 
                     if is_focused:
                         # Resaltado invertido (Fondo blanco, texto negro)
-                        draw.rectangle((col_x, row_y, col_x + cell_w - 1, row_y + 7), fill="white")
+                        draw.rectangle((col_x, row_y, col_x + cell_w - 1, row_y + 8), fill="white")
                         draw.text((col_x + 3, row_y), str(char), font=self.font, fill="black")
                     else:
                         draw.text((col_x + 3, row_y), str(char), font=self.font, fill="white")
@@ -238,17 +238,14 @@ class VirtualKeyboardInputView(BaseView):
                     is_focused = (self.cursor_row == 3 and start_col <= self.cursor_col <= end_col)
 
                     # Centrar texto de la tecla funcional en su celda combinada
-                    label_w = len(key_def.label) * 6
+                    label_w = self.get_text_width(draw, key_def.label)
                     text_x = x1 + max(0, (span_count * cell_w - label_w) // 2)
 
                     if is_focused:
-                        draw.rectangle((x1, row_y, x2, row_y + 7), fill="white")
+                        draw.rectangle((x1, row_y, x2, row_y + 8), fill="white")
                         draw.text((text_x, row_y), key_def.label, font=self.font, fill="black")
                     else:
                         draw.text((text_x, row_y), key_def.label, font=self.font, fill="white")
-
-        # 5. Barra de Estado / Atajos Rápidos (y: 52..60)
-        draw.text((4, 52), "K1:OK  K2:DEL  K3:SAL", font=self.font, fill="white")
 
     def _trigger_key_action(self) -> ViewAction:
         """Executes action for the currently focused key in the matrix."""
