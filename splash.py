@@ -2,11 +2,18 @@
 REI - Early Boot Splash Screen
 Ultra-fast, standalone 1-bit monochrome boot splash for 1.3" SH1106 OLED (128x64 px).
 Initializes hardware via SPI (DC=GPIO24, RST=GPIO25, rotate=2) with I2C fallback,
-renders the static centered 'REI' frame, transfers buffer to display GDDRAM, and exits cleanly.
+renders the static centered 'REI' frame, transfers buffer to display GDDRAM with persist=True,
+and exits cleanly without resetting GPIO pins or clearing display memory.
 """
 
+import logging
+import os
 import sys
+import time
 from PIL import Image, ImageDraw
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] REI.Splash: %(message)s")
+logger = logging.getLogger("REI.Splash")
 
 
 def render_splash_frame(width: int = 128, height: int = 64) -> Image.Image:
@@ -58,44 +65,60 @@ def render_splash_frame(width: int = 128, height: int = 64) -> Image.Image:
     return img
 
 
-def display_splash() -> bool:
+def display_splash(max_retries: int = 5, retry_interval: float = 0.2) -> bool:
     """
     Initializes display device, transfers buffer to OLED RAM, and releases bus.
+    Enables persist=True so that SH1106 display RAM is preserved on script exit.
     Returns True if successfully sent to physical display, False otherwise.
     """
     buffer = render_splash_frame(128, 64)
 
-    try:
-        from luma.core.interface.serial import i2c, spi
-        from luma.oled.device import sh1106
-
-        # 1. SPI Interface (Waveshare 1.3" OLED HAT: DC=GPIO24, RST=GPIO25, rotate=2)
+    for attempt in range(1, max_retries + 1):
         try:
-            serial_interface = spi(
-                device=0,
-                port=0,
-                bus_speed_hz=8000000,
-                gpio_DC=24,
-                gpio_RST=25,
-            )
-            device = sh1106(serial_interface, width=128, height=64, rotate=2)
-            device.display(buffer)
-            return True
-        except Exception:
-            pass
+            from luma.core.interface.serial import i2c, spi
+            from luma.oled.device import sh1106
 
-        # 2. I2C Interface Fallback
-        try:
-            serial_interface = i2c(port=1, address=0x3C)
-            device = sh1106(serial_interface, width=128, height=64, rotate=2)
-            device.display(buffer)
-            return True
-        except Exception:
-            pass
+            # 1. SPI Interface (Waveshare 1.3" OLED HAT: DC=GPIO24, RST=GPIO25, rotate=2)
+            try:
+                serial_interface = spi(
+                    device=0,
+                    port=0,
+                    bus_speed_hz=8000000,
+                    gpio_DC=24,
+                    gpio_RST=25,
+                )
+                # Prevent serial cleanup from resetting GPIO RST/DC pins on exit
+                serial_interface._managed = False
 
-    except Exception:
-        pass
+                device = sh1106(serial_interface, width=128, height=64, rotate=2)
+                device.persist = True  # Prevent clearing display RAM & turning off OLED on exit
+                device.display(buffer)
+                logger.info("Splash screen successfully sent to OLED via SPI (persist=True).")
+                return True
+            except Exception as spi_err:
+                logger.debug(f"SPI attempt {attempt}/{max_retries} failed: {spi_err}")
 
+            # 2. I2C Interface Fallback
+            try:
+                serial_interface = i2c(port=1, address=0x3C)
+                device = sh1106(serial_interface, width=128, height=64, rotate=2)
+                device.persist = True
+                device.display(buffer)
+                logger.info("Splash screen successfully sent to OLED via I2C (persist=True).")
+                return True
+            except Exception as i2c_err:
+                logger.debug(f"I2C attempt {attempt}/{max_retries} failed: {i2c_err}")
+
+        except ImportError as imp_err:
+            logger.warning(f"luma.oled dependencies not installed: {imp_err}")
+            return False
+        except Exception as ex:
+            logger.debug(f"General display initialization error (attempt {attempt}): {ex}")
+
+        if attempt < max_retries:
+            time.sleep(retry_interval)
+
+    logger.warning("Splash screen: physical display not ready or unavailable.")
     return False
 
 

@@ -210,11 +210,13 @@ do_install() {
     print_status "step" "Paso 3/5: Habilitando interfaces de hardware (I2C / SPI) y arranque limpio..."
     modprobe i2c-dev 2>/dev/null || true
     modprobe spi-bcm2835 2>/dev/null || true
+    modprobe spidev 2>/dev/null || true
     
     # Habilitar en /etc/modules si no está presente
     if [ -f "/etc/modules" ]; then
         grep -qxF "i2c-dev" /etc/modules || echo "i2c-dev" >> /etc/modules
         grep -qxF "spi-bcm2835" /etc/modules || echo "spi-bcm2835" >> /etc/modules
+        grep -qxF "spidev" /etc/modules || echo "spidev" >> /etc/modules
     fi
 
     # Configuración de Raspberry Pi config.txt si existe
@@ -306,7 +308,8 @@ do_install() {
 [Unit]
 Description=REI - Early Boot Splash Screen
 DefaultDependencies=no
-After=local-fs.target systemd-modules-load.service
+After=systemd-modules-load.service systemd-udevd.service local-fs.target
+Wants=systemd-udevd.service systemd-modules-load.service
 Before=basic.target multi-user.target ${SERVICE_NAME}
 Conflicts=shutdown.target
 
@@ -321,7 +324,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=${PROJECT_DIR}
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=basic.target sysinit.target
 EOF
     chmod 644 "${SPLASH_SERVICE_PATH}"
 
