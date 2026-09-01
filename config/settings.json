@@ -1,0 +1,29 @@
+{
+  "gemini": {
+    "api_key": "",
+    "model": "gemini-1.5-flash",
+    "timeout_seconds": 10
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "report_base_url": "http://10.0.0.1:8000"
+  },
+  "hid": {
+    "device": "/dev/hidg0",
+    "default_layout": "es",
+    "polling_delay_s": 0.015,
+    "timeout_seconds": 30
+  },
+  "display": {
+    "width": 128,
+    "height": 64,
+    "rotate": 2,
+    "target_fps": 30
+  },
+  "usb": {
+    "gadget_script": "/usr/local/bin/usb_gadget.sh",
+    "gadget_service": "usb_gadget.service",
+    "default_mode": "MODO_NORMAL"
+  }
+}

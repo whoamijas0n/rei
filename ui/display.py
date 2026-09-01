@@ -417,6 +417,105 @@ class IconRenderer:
         """Alias for WIFI_FAIL."""
         IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
 
+    @staticmethod
+    def _draw_QR(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """QR Code Matrix icon (20x20)."""
+        draw.rectangle((cx - 8, cy - 8, cx - 3, cy - 3), outline="white", fill="black")
+        draw.rectangle((cx - 6, cy - 6, cx - 5, cy - 5), fill="white")
+        draw.rectangle((cx + 3, cy - 8, cx + 8, cy - 3), outline="white", fill="black")
+        draw.rectangle((cx + 5, cy - 6, cx + 6, cy - 5), fill="white")
+        draw.rectangle((cx - 8, cy + 3, cx - 3, cy + 8), outline="white", fill="black")
+        draw.rectangle((cx - 6, cy + 5, cx - 5, cy + 6), fill="white")
+        draw.point((cx, cy), fill="white")
+        draw.point((cx + 4, cy + 4), fill="white")
+        draw.point((cx + 7, cy + 7), fill="white")
+        draw.line((cx, cy - 4, cx, cy + 4), fill="white")
+
+    @staticmethod
+    def _draw_QRCODE(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_QR(draw, cx, cy)
+
+    @staticmethod
+    def _draw_AI(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """4-point AI Sparkle star icon (20x20)."""
+        draw.polygon([(cx, cy - 8), (cx + 2, cy - 2), (cx + 8, cy), (cx + 2, cy + 2),
+                      (cx, cy + 8), (cx - 2, cy + 2), (cx - 8, cy), (cx - 2, cy - 2)], fill="white")
+        draw.point((cx + 6, cy - 6), fill="white")
+        draw.point((cx - 5, cy + 5), fill="white")
+
+    @staticmethod
+    def _draw_GEMINI(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_AI(draw, cx, cy)
+
+    @staticmethod
+    def _draw_REPORT(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Clipboard Report icon (20x20)."""
+        draw.rectangle((cx - 7, cy - 6, cx + 7, cy + 8), outline="white", fill="black")
+        draw.rectangle((cx - 3, cy - 8, cx + 3, cy - 5), fill="white")
+        draw.line((cx - 4, cy - 2, cx + 4, cy - 2), fill="white")
+        draw.line((cx - 4, cy + 1, cx + 4, cy + 1), fill="white")
+        draw.line((cx - 4, cy + 4, cx + 2, cy + 4), fill="white")
+
+    @staticmethod
+    def _draw_INFORME(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_REPORT(draw, cx, cy)
+
+    @staticmethod
+    def _draw_MALWARE(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Bug / Shield alert icon (20x20)."""
+        draw.ellipse((cx - 5, cy - 4, cx + 5, cy + 6), outline="white", fill="black")
+        draw.line((cx - 7, cy - 2, cx + 7, cy - 2), fill="white")
+        draw.line((cx - 8, cy + 3, cx + 8, cy + 3), fill="white")
+        draw.line((cx - 3, cy - 7, cx - 1, cy - 4), fill="white")
+        draw.line((cx + 3, cy - 7, cx + 1, cy - 4), fill="white")
+
+    @staticmethod
+    def _draw_HARDWARE(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Hardware CPU/Disk icon."""
+        IconRenderer._draw_SYSTEM(draw, cx, cy)
+
+    @staticmethod
+    def _draw_USB(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """USB Connector icon (20x20)."""
+        draw.rectangle((cx - 5, cy - 2, cx + 5, cy + 7), outline="white", fill="black")
+        draw.rectangle((cx - 3, cy - 7, cx + 3, cy - 2), outline="white", fill="black")
+        draw.point((cx - 1, cy - 4), fill="white")
+        draw.point((cx + 1, cy - 4), fill="white")
+        draw.line((cx, cy + 7, cx, cy + 9), fill="white")
+
+    @staticmethod
+    def _draw_USB_NORMAL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_USB(draw, cx, cy)
+
+    @staticmethod
+    def _draw_USB_GADGET(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_ESPAÑOL(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_ES(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_INGLES(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_US(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_KEYBOARD(draw, cx, cy)
+
+    @staticmethod
+    def _draw_COMPLETO(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_WIFI_OK(draw, cx, cy)
+
+    @staticmethod
+    def _draw_OTROS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        IconRenderer._draw_INFO(draw, cx, cy)
+
+
 
 class BaseView(ABC):
     """Abstract Base Class for all OLED views."""
@@ -766,11 +865,90 @@ class UpdateProgressView(BaseView):
         return ViewAction(ViewActionType.NONE)
 
 
+class QRCodeView(BaseView):
+    """
+    Renders a high-density 1-bit QR code on the SH1106 OLED (128x64 px).
+    Left (x=5..55): QR code matrix for mobile smartphone scanning.
+    Right (x=58..124): Descriptive text, URL details, and exit instruction.
+    """
+
+    def __init__(
+        self,
+        title: str = "REPORTE QR",
+        url: str = "http://10.0.0.1:8000/report/latest",
+        subtitle: Optional[str] = None,
+        on_exit: Optional[Callable[[], None]] = None,
+    ):
+        super().__init__(title=title)
+        self.url = url
+        self.subtitle = subtitle or "Escanea con tu movil"
+        self.on_exit = on_exit
+        self._qr_image: Optional[Image.Image] = None
+        self._generate_qr()
+
+    def _generate_qr(self) -> None:
+        """Generates 1-bit QR code image from target URL."""
+        try:
+            import qrcode
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=2,
+                border=1,
+            )
+            qr.add_data(self.url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            self._qr_image = img.convert("1")
+        except Exception as ex:
+            logger.error(f"Error generating QR code for '{self.url}': {ex}")
+            self._qr_image = None
+
+    def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
+        # 1. Continuous Perimeter Border
+        self.draw_perimeter_border(draw)
+
+        if self._qr_image is not None:
+            # 2. Render QR code centered vertically on the left
+            qr_w, qr_h = self._qr_image.size
+            start_x = 5
+            start_y = max(2, (height - qr_h) // 2)
+
+            for qx in range(qr_w):
+                for qy in range(qr_h):
+                    # In qrcode output, 0 is data module (black on white), OLED is inverted
+                    if self._qr_image.getpixel((qx, qy)) == 0:
+                        draw.point((start_x + qx, start_y + qy), fill="white")
+
+            # 3. Text layout on right side
+            text_x = 58
+            draw.text((text_x, 6), "REPORTE", font=self.font, fill="white")
+            draw.text((text_x, 18), "MOVIL QR", font=self.font, fill="white")
+            draw.line((text_x, 30, 122, 30), fill="white")
+
+            # URL / Host info
+            draw.text((text_x, 34), "10.0.0.1", font=self.font, fill="white")
+            draw.text((text_x, 48), "OK/KEY3:Fin", font=self.font, fill="white")
+
+        else:
+            # Fallback if QR generation failed
+            self.draw_centered_text(draw, "ERROR QR", y=20, screen_width=width)
+            self.draw_centered_text(draw, "KEY3: Salir", y=38, screen_width=width)
+
+    def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
+        if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK, InputEvent.KEY2):
+            if self.on_exit:
+                self.on_exit()
+            return ViewAction(ViewActionType.POP_VIEW)
+        return ViewAction(ViewActionType.NONE)
+
+
 # Re-export VirtualKeyboardInputView from dedicated modular component
 from .keyboard_view import VirtualKeyboardInputView, KeyboardLayer
 
 # Backward compatibility alias
 KeyboardInputView = VirtualKeyboardInputView
+
 
 
 

@@ -207,16 +207,20 @@ do_install() {
     echo ""
 
     # 3. Habilitación de Módulos de Hardware (I2C & SPI) y Modo Silencioso
-    print_status "step" "Paso 3/5: Habilitando interfaces de hardware (I2C / SPI) y arranque limpio..."
+    print_status "step" "Paso 3/5: Habilitando interfaces de hardware (I2C / SPI / USB OTG) y arranque limpio..."
     modprobe i2c-dev 2>/dev/null || true
     modprobe spi-bcm2835 2>/dev/null || true
     modprobe spidev 2>/dev/null || true
+    modprobe dwc2 2>/dev/null || true
+    modprobe libcomposite 2>/dev/null || true
     
     # Habilitar en /etc/modules si no está presente
     if [ -f "/etc/modules" ]; then
         grep -qxF "i2c-dev" /etc/modules || echo "i2c-dev" >> /etc/modules
         grep -qxF "spi-bcm2835" /etc/modules || echo "spi-bcm2835" >> /etc/modules
         grep -qxF "spidev" /etc/modules || echo "spidev" >> /etc/modules
+        grep -qxF "dwc2" /etc/modules || echo "dwc2" >> /etc/modules
+        grep -qxF "libcomposite" /etc/modules || echo "libcomposite" >> /etc/modules
     fi
 
     # Configuración de Raspberry Pi config.txt si existe
@@ -228,7 +232,10 @@ do_install() {
             if ! grep -q "^dtparam=spi=on" "$boot_cfg"; then
                 echo "dtparam=spi=on" >> "$boot_cfg"
             fi
-            print_status "info" "Interfaces I2C/SPI habilitadas en ${boot_cfg}"
+            if ! grep -q "^dtoverlay=dwc2" "$boot_cfg"; then
+                echo "dtoverlay=dwc2" >> "$boot_cfg"
+            fi
+            print_status "info" "Interfaces I2C/SPI y USB OTG (dwc2) habilitadas en ${boot_cfg}"
             break
         fi
     done
