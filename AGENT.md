@@ -269,8 +269,13 @@ Cualquier modificación o adición de código por parte de la IA debe cumplir co
   * `supported_interfaces: List[str]` (Serial, SSH, WinRM, SNMP)
   * `@abstractmethod def run_diagnostic(self, transport: BaseTransport, **kwargs) -> DiagnosticResult`
 
+### `splash.py`
+* Script independiente y ultrarrápido para renderizar la pantalla de carga temprana (Boot Splash) con "**REI**" centrado y marco continuo de 1px en el display OLED SH1106 (128x64 px).
+* Se ejecuta como servicio temprano `Type=oneshot` (`rei-splash.service`) en las primeras etapas de `systemd`, liberando el bus de hardware inmediatamente tras enviar el buffer a la memoria del display.
+
 ### `install.sh`
 * Automatiza la instalación de paquetes del sistema (`apt`), módulos de hardware (I2C/SPI) y librerías Python (`requirements.txt`).
-* Despliega y habilita el servicio systemd (`/etc/systemd/system/rei.service`) para autoinicio en el arranque como superusuario (`root`).
+* Configura parámetros de arranque silencioso (`quiet logo.nologo console=tty3`) en `cmdline.txt`.
+* Despliega y habilita el servicio de splash temprano (`/etc/systemd/system/rei-splash.service`) y el servicio principal (`/etc/systemd/system/rei.service`) para autoinicio en el arranque como superusuario (`root`).
 * Provee interfaz de terminal centrada con ASCII Art y menú interactivo o flags (`--install`, `--uninstall` / `--revert`, `--help`).
-* Provee la rutina de reversión completa (`do_uninstall`) para restaurar el estado del sistema sin alterar datos locales ni código fuente.
+* Provee la rutina de reversión completa (`do_uninstall`) para restaurar el estado del sistema eliminando servicios y wrappers sin alterar datos locales ni código fuente.
