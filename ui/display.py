@@ -25,6 +25,7 @@ class ViewActionType(Enum):
     NONE = auto()
     PUSH_VIEW = auto()
     POP_VIEW = auto()
+    POP_TO_ROOT = auto()
     REPLACE_VIEW = auto()
     EXECUTE_TASK = auto()
 
@@ -431,6 +432,28 @@ class BaseView(ABC):
             self._font = ImageFont.load_default()
         return self._font
 
+    def get_text_width(self, draw: ImageDraw.ImageDraw, text: str) -> int:
+        """Calculates exact pixel width of a text string."""
+        if hasattr(draw, "textbbox"):
+            bbox = draw.textbbox((0, 0), text, font=self.font)
+            return bbox[2] - bbox[0]
+        elif hasattr(draw, "textlength"):
+            return int(draw.textlength(text, font=self.font))
+        return len(text) * 6
+
+    def draw_centered_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        y: int,
+        screen_width: int = 128,
+        fill: str = "white"
+    ) -> None:
+        """Renders horizontally centered text at specified Y coordinate."""
+        text_w = self.get_text_width(draw, text)
+        text_x = max(2, (screen_width - text_w) // 2)
+        draw.text((text_x, y), text, font=self.font, fill=fill)
+
     def draw_perimeter_border(self, draw: ImageDraw.ImageDraw) -> None:
         """
         Renders the continuous 1px perimeter border.
@@ -487,7 +510,7 @@ class HeroCardDeckView(BaseView):
         self.draw_perimeter_border(draw)
 
         if not self.cards:
-            draw.text((30, 28), "NO ITEMS", fill="white", font=self.font)
+            self.draw_centered_text(draw, "NO ITEMS", y=28, screen_width=width)
             return
 
         total = len(self.cards)
@@ -506,11 +529,9 @@ class HeroCardDeckView(BaseView):
         # 3. Dibujar Icono Centrado (cx=64, cy=24)
         IconRenderer.draw_icon(draw, active_card.icon_name, cx=64, cy=24)
 
-        # 4. Dibujar Título Centrado en Y=44
-        title_text = active_card.title.upper()
-        text_w = len(title_text) * 6
-        text_x = max(4, (width - text_w) // 2)
-        draw.text((text_x, 44), title_text, font=self.font, fill="white")
+        # 4. Dibujar Título Centrado en Y=44 (Strict AGENT.md Spec)
+        title_text = active_card.title.strip().upper()
+        self.draw_centered_text(draw, title_text, y=44, screen_width=width)
 
     def handle_input(self, event: InputEvent) -> ViewAction:
         if not self.cards:
@@ -560,11 +581,13 @@ class DetailCardView(BaseView):
         self,
         title: str,
         initial_lines: Optional[List[str]] = None,
-        on_refresh: Optional[Callable[[], None]] = None
+        on_refresh: Optional[Callable[[], None]] = None,
+        pop_to_root_on_key1: bool = False
     ):
         super().__init__(title=title)
         self.lines: List[str] = initial_lines or []
         self.on_refresh = on_refresh
+        self.pop_to_root_on_key1 = pop_to_root_on_key1
         self.status_text: str = "LISTO"
         self.is_loading: bool = False
         self.scroll_offset: int = 0
@@ -591,9 +614,8 @@ class DetailCardView(BaseView):
         self.draw_perimeter_border(draw)
 
         # 2. Cabecera centrada
-        header_text = self.title.upper()
-        text_w = len(header_text) * 6
-        draw.text(((width - text_w) // 2, 6), header_text, font=self.font, fill="white")
+        header_text = self.title.strip().upper()
+        self.draw_centered_text(draw, header_text, y=6, screen_width=width)
         draw.line((4, 18, 123, 18), fill="white")
 
         # 3. Contenido limpio (Y=24, espaciado 12px)
@@ -606,7 +628,7 @@ class DetailCardView(BaseView):
                 draw.text((8, y), line[:20], font=self.font, fill="white")
                 y += 12
 
-    def handle_input(self, event: InputEvent) -> ViewAction:
+    def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
         max_scroll = max(0, len(self.lines) - 3)
 
         if event == InputEvent.UP:
@@ -623,8 +645,14 @@ class DetailCardView(BaseView):
                 self.on_refresh()
             return ViewAction(ViewActionType.NONE)
 
-        # Return on Key3, Key1, Press or Back
-        elif event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
+        # KEY1 / Joystick PRESS -> Pop to root if configured, else pop view
+        elif event in (InputEvent.KEY1, InputEvent.PRESS):
+            if self.pop_to_root_on_key1:
+                return ViewAction(ViewActionType.POP_TO_ROOT)
+            return ViewAction(ViewActionType.POP_VIEW)
+
+        # Return on Key3, Back -> Pop view
+        elif event in (InputEvent.KEY3, InputEvent.BACK):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -684,9 +712,8 @@ class UpdateProgressView(BaseView):
         self.draw_perimeter_border(draw)
 
         # 2. Cabecera centrada
-        header_text = self.title.upper()
-        text_w = len(header_text) * 6
-        draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
+        header_text = self.title.strip().upper()
+        self.draw_centered_text(draw, header_text, y=5, screen_width=width)
         draw.line((4, 16, 123, 16), fill="white")
 
         if self.is_running:
@@ -739,104 +766,12 @@ class UpdateProgressView(BaseView):
         return ViewAction(ViewActionType.NONE)
 
 
-class KeyboardInputView(BaseView):
-    """
-    Vista interactiva para ingreso de contraseñas Wi-Fi mediante teclado físico USB.
-    Muestra los caracteres ingresados en tiempo real sobre la pantalla OLED 128x64
-    con cursor activo, soporte para borrado (Backspace), confirmación (Enter/KEY1/PRESS),
-    alternar visibilidad (KEY2/Tab) y cancelación (KEY3/Escape).
-    """
+# Re-export VirtualKeyboardInputView from dedicated modular component
+from .keyboard_view import VirtualKeyboardInputView, KeyboardLayer
 
-    def __init__(
-        self,
-        ssid: str,
-        title: Optional[str] = None,
-        on_submit: Optional[Callable[[str, str], None]] = None,
-        masked: bool = False,
-        max_length: int = 63
-    ):
-        header_title = title or f"CLAVE: {ssid}"
-        super().__init__(title=header_title)
-        self.ssid = ssid
-        self.on_submit = on_submit
-        self.is_masked = masked
-        self.max_length = max_length
-        self.input_text: str = ""
-        self.cursor_visible: bool = True
-        self._cursor_tick: int = 0
+# Backward compatibility alias
+KeyboardInputView = VirtualKeyboardInputView
 
-    def set_text(self, text: str) -> None:
-        """Direct assignment of text (useful for testing)."""
-        self.input_text = text[:self.max_length]
-
-    def update(self) -> None:
-        """Ticks cursor blinking animation at 30 FPS."""
-        self._cursor_tick = (self._cursor_tick + 1) % 30
-        self.cursor_visible = (self._cursor_tick < 15)
-
-    def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
-        # 1. Borde perimetral continuo
-        self.draw_perimeter_border(draw)
-
-        # 2. Encabezado centrado con indicador de modo de máscara [TXT] / [***]
-        mask_badge = "[***]" if self.is_masked else "[TXT]"
-        header_text = f"{self.ssid.upper()[:7]} {mask_badge}"
-        text_w = len(header_text) * 6
-        draw.text(((width - text_w) // 2, 5), header_text, font=self.font, fill="white")
-        draw.line((4, 16, 123, 16), fill="white")
-
-        # 3. Caja de texto para el input
-        draw.rectangle((8, 20, 119, 34), outline="white", fill="black")
-
-        # 4. Texto ingresado con desplazamiento horizontal y cursor
-        display_str = ("*" * len(self.input_text)) if self.is_masked else self.input_text
-        if len(display_str) > 16:
-            visible_str = display_str[-16:]
-        else:
-            visible_str = display_str
-
-        cursor_char = "_" if self.cursor_visible else " "
-        draw.text((12, 22), visible_str + cursor_char, font=self.font, fill="white")
-
-        # 5. Indicaciones de control
-        draw.text((8, 38), "[ENTER/KEY1] Conectar", font=self.font, fill="white")
-        draw.text((8, 50), "KEY2:Ver  KEY3:Salir", font=self.font, fill="white")
-
-    def handle_input(self, event: InputEvent, char: Optional[str] = None) -> ViewAction:
-        # 1. Character typing from physical USB keyboard or terminal
-        if event == InputEvent.CHAR:
-            if char:
-                if len(self.input_text) < self.max_length:
-                    self.input_text += char
-            return ViewAction(ViewActionType.NONE)
-
-        # 2. Backspace
-        elif event == InputEvent.BACKSPACE:
-            if len(self.input_text) > 0:
-                self.input_text = self.input_text[:-1]
-            return ViewAction(ViewActionType.NONE)
-
-        # 3. Toggle Masking (KEY2 or Tab)
-        elif event == InputEvent.KEY2:
-            self.is_masked = not self.is_masked
-            return ViewAction(ViewActionType.NONE)
-
-        # 4. Enter / KEY1 / Joystick PRESS -> Submit Password and connect
-        elif event in (InputEvent.ENTER, InputEvent.KEY1, InputEvent.PRESS):
-            if self.on_submit:
-                self.on_submit(self.ssid, self.input_text)
-                return ViewAction(ViewActionType.NONE)
-            return ViewAction(
-                ViewActionType.EXECUTE_TASK,
-                task_id="sys_wifi_connect",
-                payload={"ssid": self.ssid, "password": self.input_text}
-            )
-
-        # 5. KEY3 / ESCAPE / BACK -> Cancel & Pop
-        elif event in (InputEvent.KEY3, InputEvent.ESCAPE, InputEvent.BACK):
-            return ViewAction(ViewActionType.POP_VIEW)
-
-        return ViewAction(ViewActionType.NONE)
 
 
 class ScreenManager:
@@ -948,6 +883,12 @@ class ScreenManager:
             logger.debug(f"Popped view: {popped.title} (Stack depth: {len(self._view_stack)})")
             return popped
         return None
+
+    def pop_to_root(self) -> None:
+        """Pops all views down to the root view."""
+        if len(self._view_stack) > 1:
+            self._view_stack = [self._view_stack[0]]
+            logger.debug("Popped to root view (Stack depth: 1)")
 
     def set_root_view(self, view: BaseView) -> None:
         """Clears stack and sets the root view."""

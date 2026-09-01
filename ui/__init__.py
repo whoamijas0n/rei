@@ -11,6 +11,9 @@ from .display import (
     DetailCardView,
     HeroCard,
     IconRenderer,
+    VirtualKeyboardInputView,
+    KeyboardInputView,
+    KeyboardLayer,
 )
 
 __all__ = [
@@ -22,4 +25,8 @@ __all__ = [
     "DetailCardView",
     "HeroCard",
     "IconRenderer",
+    "VirtualKeyboardInputView",
+    "KeyboardInputView",
+    "KeyboardLayer",
 ]
+

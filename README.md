@@ -9,6 +9,25 @@ REI es un dispositivo de campo de bolsillo autónomo para diagnóstico rápido d
 - **Manejo de Hardware:** Soporte para Waveshare 1.3" OLED HAT (SPI/I2C), joystick de 5 vías y 3 botones físicos con `gpiozero`.
 - **Monolito Modular:** Plugins desacoplados con contratos estrictos (`IDiagnosticPlugin`).
 - **Alimentación y Utilidades:** Control seguro de apagado (`poweroff`) y reinicio (`reboot`) del sistema operativo con sincronización de almacenamiento previa.
+- **Teclado Virtual Interactivo (Virtual Keyboard):** Ingreso autónomo de contraseñas Wi-Fi sin necesidad de teclados USB físicos, operado 100% mediante el Joystick y los botones físicos del HAT.
+
+## Operación del Teclado Virtual (Wi-Fi Authentication)
+
+Al conectarse a una red protegida por contraseña, se despliega automáticamente el **Teclado Virtual** en la pantalla OLED (128x64 px):
+
+- **Controles del Joystick:**
+  - **`UP` / `DOWN` / `LEFT` / `RIGHT`:** Navegar por la cuadrícula 4x10 de caracteres y teclas funcionales.
+  - **`PRESS` (Centro):** Escribir el carácter enfocado o accionar la tecla funcional (`ABC`/`abc`, `123`, `SYM`, `SP`, `DEL`, `OK`).
+- **Atajos con Botones Físicos:**
+  - **`KEY1`:** **Confirmar / Enviar** contraseña e iniciar la conexión inmediatamente.
+  - **`KEY2`:** **Borrar** (Backspace) el último carácter ingresado.
+  - **`KEY3`:** **Cancelar y Volver** a la lista de redes escaneadas.
+- **Capas de Caracteres Disponibles:**
+  - **`abc` (Minúsculas):** Caracteres `a-z`, `@`, `.`, `_`, `-`, espacio, borrar, confirmación y cambio de capa.
+  - **`ABC` (Mayúsculas):** Caracteres `A-Z`, `@`, `.`, `_`, `-`, etc.
+  - **`123` (Números y Símbolos Básicos):** Dígitos `0-9`, `! @ # $ % ^ & * ( ) - _ + = [ ] { } ; :`.
+  - **`SYM` (Símbolos Extendidos):** Símbolos `~ \` | \\ / ? < > , . ' " $ % ^ & * + = # ! @ : ; ( ) [ ] { }`.
+
 
 ## Jerarquía de Navegación
 

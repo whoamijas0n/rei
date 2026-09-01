@@ -35,6 +35,7 @@ from ui.display import (
     HeroCardDeckView,
     DetailCardView,
     UpdateProgressView,
+    VirtualKeyboardInputView,
     KeyboardInputView,
     HeroCard,
     ViewAction,
@@ -202,7 +203,7 @@ class REIApp:
                 def make_select_handler(target_ssid: str, secured: bool):
                     def handler():
                         if secured:
-                            kb_view = KeyboardInputView(
+                            kb_view = VirtualKeyboardInputView(
                                 ssid=target_ssid,
                                 on_submit=self._connect_to_wifi
                             )
@@ -213,7 +214,7 @@ class REIApp:
 
                 deck_wifi_nets.add_card(
                     HeroCard(
-                        title=f"{ssid.upper()[:14]}",
+                        title=f"{ssid.strip().upper()[:16]}",
                         icon_name=icon,
                         on_select=make_select_handler(ssid, is_secured)
                     )
@@ -223,7 +224,7 @@ class REIApp:
 
     def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
         """Launches Wi-Fi connection worker and shows progress."""
-        if isinstance(self.screen_manager.current_view, KeyboardInputView):
+        if isinstance(self.screen_manager.current_view, (VirtualKeyboardInputView, KeyboardInputView)):
             self.screen_manager.pop_view()
 
         conn_view = UpdateProgressView(title="CONECTANDO...")
@@ -247,9 +248,9 @@ class REIApp:
         is_success = (result.status == DiagnosticStatus.SUCCESS)
 
         if is_success:
-            hero_title = f"CONECTADO: {ssid.upper()[:8]}"
+            hero_title = "CONECTADO"
             icon_name = "WIFI_OK"
-            detail_title = "CONEXION OK"
+            detail_title = "RESUMEN RED"
         else:
             hero_title = "ERROR CONEXION"
             icon_name = "WIFI_FAIL"
@@ -257,7 +258,8 @@ class REIApp:
 
         detail_view = DetailCardView(
             title=detail_title,
-            initial_lines=result.details if result.details else [result.summary]
+            initial_lines=result.details if result.details else [result.summary],
+            pop_to_root_on_key1=True
         )
 
         deck_result = HeroCardDeckView("ESTADO WI-FI")
@@ -535,6 +537,8 @@ class REIApp:
                             self.screen_manager.push_view(action.target_view)
                         elif action.action_type == ViewActionType.POP_VIEW:
                             self.screen_manager.pop_view()
+                        elif action.action_type == ViewActionType.POP_TO_ROOT:
+                            self.screen_manager.pop_to_root()
                         elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
                             self._trigger_task(action.task_id)
 
