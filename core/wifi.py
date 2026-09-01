@@ -166,9 +166,11 @@ class WiFiManager:
                 res = subprocess.run([wpa_cli_bin, "-i", self.interface, "add_network"], capture_output=True, text=True, timeout=5)
                 net_id = res.stdout.strip()
                 if net_id.isdigit():
-                    subprocess.run([wpa_cli_bin, "-i", self.interface, "set_network", net_id, "ssid", f'"{ssid}"'], timeout=5)
+                    escaped_ssid = self._escape_wpa_str(ssid)
+                    subprocess.run([wpa_cli_bin, "-i", self.interface, "set_network", net_id, "ssid", escaped_ssid], timeout=5)
                     if password:
-                        subprocess.run([wpa_cli_bin, "-i", self.interface, "set_network", net_id, "psk", f'"{password}"'], timeout=5)
+                        escaped_psk = self._escape_wpa_str(password)
+                        subprocess.run([wpa_cli_bin, "-i", self.interface, "set_network", net_id, "psk", escaped_psk], timeout=5)
                     else:
                         subprocess.run([wpa_cli_bin, "-i", self.interface, "set_network", net_id, "key_mgmt", "NONE"], timeout=5)
                     subprocess.run([wpa_cli_bin, "-i", self.interface, "enable_network", net_id], timeout=5)
@@ -180,6 +182,12 @@ class WiFiManager:
                 return False, f"Error wpa_cli: {str(ex)[:16]}", {"ssid": ssid, "error": str(ex)}
 
         return False, "Gestor de red no disponible", {"ssid": ssid}
+
+    @staticmethod
+    def _escape_wpa_str(val: str) -> str:
+        """Escapes quotes and backslashes for wpa_cli string parameters."""
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
 
     def _get_interface_ip(self) -> Optional[str]:
         """Reads IPv4 address of interface."""

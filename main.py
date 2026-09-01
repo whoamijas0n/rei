@@ -35,6 +35,7 @@ from ui.display import (
     HeroCardDeckView,
     DetailCardView,
     UpdateProgressView,
+    VirtualKeyboardInputView,
     KeyboardInputView,
     HeroCard,
     ViewAction,
@@ -202,7 +203,7 @@ class REIApp:
                 def make_select_handler(target_ssid: str, secured: bool):
                     def handler():
                         if secured:
-                            kb_view = KeyboardInputView(
+                            kb_view = VirtualKeyboardInputView(
                                 ssid=target_ssid,
                                 on_submit=self._connect_to_wifi
                             )
@@ -223,7 +224,7 @@ class REIApp:
 
     def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
         """Launches Wi-Fi connection worker and shows progress."""
-        if isinstance(self.screen_manager.current_view, KeyboardInputView):
+        if isinstance(self.screen_manager.current_view, (VirtualKeyboardInputView, KeyboardInputView)):
             self.screen_manager.pop_view()
 
         conn_view = UpdateProgressView(title="CONECTANDO...")
