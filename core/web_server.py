@@ -21,7 +21,7 @@ logger = logging.getLogger("REI.Core.WebServer")
 
 try:
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
     from pydantic import BaseModel, Field
     import uvicorn
     FASTAPI_AVAILABLE = True
@@ -88,6 +88,30 @@ class REIWebServer:
         @self.app.get("/health")
         def health():
             return {"status": "ok", "service": "REI Diagnostic Hub", "timestamp": time.time()}
+
+        @self.app.get("/w/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/w", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/payload/windows/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/payload/windows", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/script/windows/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/script/windows", response_class=PlainTextResponse)
+        def get_windows_script(category: str = "COMPLETO"):
+            from plugins.endpoints.hid_windows import WindowsPayloadGenerator
+            norm_cat = urllib.parse.unquote(category).strip("/") if category else "COMPLETO"
+            script = WindowsPayloadGenerator.get_powershell_script(norm_cat or "COMPLETO", server_url=self.base_url)
+            return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
+
+        @self.app.get("/l/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/l", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/payload/linux/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/payload/linux", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/script/linux/{category:path}", response_class=PlainTextResponse)
+        @self.app.get("/api/v1/script/linux", response_class=PlainTextResponse)
+        def get_linux_script(category: str = "COMPLETO"):
+            from plugins.endpoints.hid_linux import LinuxPayloadGenerator
+            norm_cat = urllib.parse.unquote(category).strip("/") if category else "COMPLETO"
+            script = LinuxPayloadGenerator.get_bash_script(norm_cat or "COMPLETO", server_url=self.base_url)
+            return PlainTextResponse(script, media_type="text/plain; charset=utf-8")
 
         @self.app.post("/api/v1/endpoint/report")
         async def receive_report(request: Request):
@@ -368,6 +392,38 @@ class REIWebServer:
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(data.encode("utf-8"))
+                    elif parsed_path == "/w" or parsed_path.startswith("/w/") or parsed_path.startswith("/api/v1/payload/windows") or parsed_path.startswith("/api/v1/script/windows"):
+                        if parsed_path in ("/w", "/w/"):
+                            cat = "COMPLETO"
+                        elif parsed_path.startswith("/w/"):
+                            cat = parsed_path[3:]
+                        elif "/windows/" in parsed_path:
+                            cat = parsed_path.split("/windows/")[-1]
+                        else:
+                            cat = "COMPLETO"
+                        cat = urllib.parse.unquote(cat)
+                        from plugins.endpoints.hid_windows import WindowsPayloadGenerator
+                        script = WindowsPayloadGenerator.get_powershell_script(cat or "COMPLETO", server_url=outer.base_url)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(script.encode("utf-8"))
+                    elif parsed_path == "/l" or parsed_path.startswith("/l/") or parsed_path.startswith("/api/v1/payload/linux") or parsed_path.startswith("/api/v1/script/linux"):
+                        if parsed_path in ("/l", "/l/"):
+                            cat = "COMPLETO"
+                        elif parsed_path.startswith("/l/"):
+                            cat = parsed_path[3:]
+                        elif "/linux/" in parsed_path:
+                            cat = parsed_path.split("/linux/")[-1]
+                        else:
+                            cat = "COMPLETO"
+                        cat = urllib.parse.unquote(cat)
+                        from plugins.endpoints.hid_linux import LinuxPayloadGenerator
+                        script = LinuxPayloadGenerator.get_bash_script(cat or "COMPLETO", server_url=outer.base_url)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/plain; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(script.encode("utf-8"))
                     elif parsed_path.startswith("/api/v1/report/"):
                         rep_id = parsed_path.split("/")[-1]
                         target_id = outer._latest_report_id if rep_id == "latest" else rep_id

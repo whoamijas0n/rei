@@ -165,6 +165,47 @@ class DuckyInjector:
         else:
             logger.info(f"DuckyInjector initialized targeting device: {self.hid_device}")
 
+    @staticmethod
+    def get_udc_state() -> str:
+        """Returns active USB Device Controller connection state."""
+        udc_dir = "/sys/class/udc"
+        if not os.path.exists(udc_dir):
+            return "no_udc"
+        try:
+            controllers = os.listdir(udc_dir)
+            if not controllers:
+                return "no_udc"
+            state_file = os.path.join(udc_dir, controllers[0], "state")
+            if os.path.exists(state_file):
+                with open(state_file, "r") as f:
+                    return f.read().strip().lower()
+        except Exception:
+            pass
+        return "unknown"
+
+    def check_ready(self) -> Tuple[bool, List[str]]:
+        """
+        Validates whether USB HID subsystem is ready to transmit keystrokes.
+        Returns (is_ready: bool, details_if_not_ready: List[str]).
+        """
+        if self.dry_run:
+            return True, []
+
+        if not os.path.exists(self.hid_device):
+            return False, ["Modo HID inactivo", "Active Modo HID en Menu", "en Utilidades > Modo USB"]
+
+        state = self.get_udc_state()
+        if state == "not attached":
+            return False, [
+                "Cable USB desconectado",
+                "Conecte puerto USB a PC",
+                "(Use puerto USB, no PWR)",
+            ]
+        elif state in ("powered", "default", "addressed", "configured"):
+            return True, []
+
+        return True, []
+
     def send_hid_report(self, modifier: int, key_code: int) -> None:
         """
         Sends an 8-byte HID keyboard report followed by an 8-byte release report.
@@ -184,19 +225,37 @@ class DuckyInjector:
         release = b"\x00" * 8
 
         try:
-            with open(self.hid_device, "wb") as fd:
-                fd.write(report)
-                fd.flush()
-                time.sleep(self.polling_delay_s)
-                fd.write(release)
-                fd.flush()
-                time.sleep(self.polling_delay_s)
+            fd = os.open(self.hid_device, os.O_WRONLY | os.O_NONBLOCK)
         except PermissionError as pe:
             logger.error(f"Permission denied writing to {self.hid_device}: {pe}")
             raise
         except OSError as oe:
+            logger.error(f"I/O error opening {self.hid_device}: {oe}")
+            raise
+
+        try:
+            # Send report with timeout to avoid permanent kernel freeze
+            import select
+            _, writable, _ = select.select([], [fd], [], 1.5)
+            if not writable:
+                raise TimeoutError(f"Timeout esperando respuesta de host en {self.hid_device}")
+            os.write(fd, report)
+            time.sleep(self.polling_delay_s)
+
+            # Send release report with timeout
+            _, writable, _ = select.select([], [fd], [], 1.5)
+            if not writable:
+                raise TimeoutError(f"Timeout esperando liberación de tecla en {self.hid_device}")
+            os.write(fd, release)
+            time.sleep(self.polling_delay_s)
+        except OSError as oe:
             logger.error(f"I/O error writing to {self.hid_device}: {oe}")
             raise
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def press_key(self, key_name: str) -> None:
         """Presses and releases a single key by name (e.g. 'enter', 'tab', 'a')."""

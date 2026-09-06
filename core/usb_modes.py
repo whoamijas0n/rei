@@ -72,6 +72,99 @@ class USBModeManager:
 
         return USBMode.NORMAL
 
+    @staticmethod
+    def get_network_manager_config() -> str:
+        """Returns NetworkManager config to keep gadget interfaces unmanaged."""
+        return (
+            "[keyfile]\n"
+            "unmanaged-devices=interface-name:usb*;interface-name:rndis*;interface-name:ecm*\n"
+        )
+
+    @staticmethod
+    def get_dnsmasq_config(ip: str = "10.0.0.1", dhcp_start: str = "10.0.0.2", dhcp_end: str = "10.0.0.10") -> str:
+        """Returns isolated dnsmasq configuration for usb0."""
+        return (
+            "interface=usb0\n"
+            "bind-interfaces\n"
+            "except-interface=lo\n"
+            "except-interface=wlan0\n"
+            "except-interface=eth0\n"
+            f"listen-address={ip}\n"
+            f"dhcp-range=usb0,{dhcp_start},{dhcp_end},255.255.255.0,12h\n"
+            "# CRÍTICO: dhcp-option=3 vacío evita que el host tome a la Raspberry como gateway de Internet\n"
+            "dhcp-option=3\n"
+            f"dhcp-option=6,{ip}\n"
+        )
+
+    def detect_gadget_subnet(self) -> Tuple[str, str, str, str]:
+        """
+        Returns (ip, netmask, dhcp_start, dhcp_end).
+        If wlan0 belongs to 10.0.0.0/24, switches dynamically to 172.20.0.1/24 to prevent routing collisions.
+        """
+        if self.dry_run:
+            return ("10.0.0.1", "255.255.255.0", "10.0.0.2", "10.0.0.10")
+
+        try:
+            res = subprocess.run("ip -4 addr show wlan0 2>/dev/null", shell=True, capture_output=True, text=True)
+            if "inet 10.0.0." in res.stdout:
+                logger.warning("Subnet collision detected with wlan0 (10.0.0.0/24). Using 172.20.0.1/24 for usb0.")
+                return ("172.20.0.1", "255.255.255.0", "172.20.0.2", "172.20.0.10")
+        except Exception as ex:
+            logger.debug(f"Subnet check exception: {ex}")
+
+        return ("10.0.0.1", "255.255.255.0", "10.0.0.2", "10.0.0.10")
+
+    def setup_network_isolation(self) -> bool:
+        """
+        Prevents NetworkManager and dhcpcd from taking over usb0 or modifying the default gateway on wlan0.
+        Configures isolated dnsmasq DHCP/DNS server for usb0 clients.
+        """
+        if self.dry_run:
+            logger.info("[DRY-RUN] Network isolation configured (Simulated).")
+            return True
+
+        try:
+            # 1. NetworkManager configuration
+            if os.path.exists("/etc/NetworkManager/NetworkManager.conf") or os.path.exists("/etc/NetworkManager/conf.d"):
+                nm_conf_dir = "/etc/NetworkManager/conf.d"
+                subprocess.run(f"sudo mkdir -p {nm_conf_dir}", shell=True, check=False)
+                nm_file = f"{nm_conf_dir}/99-rei-usb.conf"
+                nm_content = self.get_network_manager_config()
+                subprocess.run(f"sudo sh -c 'cat > {nm_file} << \"EOF\"\n{nm_content}EOF'", shell=True, check=False)
+                subprocess.run("sudo systemctl reload NetworkManager 2>/dev/null || sudo nmcli general reload 2>/dev/null || true", shell=True, check=False)
+                logger.info("NetworkManager unmanaged rule configured for usb interfaces.")
+
+            # 2. dhcpcd configuration
+            if os.path.exists("/etc/dhcpcd.conf"):
+                subprocess.run(
+                    "sudo sh -c 'grep -q \"denyinterfaces usb\\* rndis\\* ecm\\*\" /etc/dhcpcd.conf || "
+                    "echo \"denyinterfaces usb* rndis* ecm*\" >> /etc/dhcpcd.conf'",
+                    shell=True,
+                    check=False,
+                )
+                logger.info("dhcpcd denyinterfaces rule applied for usb interfaces.")
+
+            # 3. dnsmasq configuration
+            ip, _, dhcp_start, dhcp_end = self.detect_gadget_subnet()
+            dnsmasq_conf_dir = "/etc/dnsmasq.d"
+            subprocess.run(f"sudo mkdir -p {dnsmasq_conf_dir}", shell=True, check=False)
+            dnsmasq_file = f"{dnsmasq_conf_dir}/rei-usb.conf"
+            dnsmasq_content = self.get_dnsmasq_config(ip=ip, dhcp_start=dhcp_start, dhcp_end=dhcp_end)
+            subprocess.run(f"sudo sh -c 'cat > {dnsmasq_file} << \"EOF\"\n{dnsmasq_content}EOF'", shell=True, check=False)
+
+            if os.path.exists("/etc/dnsmasq.conf"):
+                subprocess.run(
+                    "sudo sed -i 's|^#conf-dir=/etc/dnsmasq.d/,\\*\\.conf|conf-dir=/etc/dnsmasq.d/,*.conf|' /etc/dnsmasq.conf 2>/dev/null || true",
+                    shell=True,
+                    check=False,
+                )
+
+            logger.info("Isolated dnsmasq configuration written for usb0.")
+            return True
+        except Exception as ex:
+            logger.error(f"Failed to setup network isolation: {ex}")
+            return False
+
     def set_mode(self, target_mode: USBMode) -> Tuple[bool, str]:
         """
         Transitions the system to the requested USB mode.
@@ -126,12 +219,16 @@ class USBModeManager:
                 return True, "Modo Host (Normal) configurado con exito."
 
             else:
+                # 3. Setup network isolation and dnsmasq before activating gadget
+                self.setup_network_isolation()
+                gadget_ip, _, _, _ = self.detect_gadget_subnet()
+
                 # Configure Peripheral / Gadget mode (Rubber Ducky Keyboard)
                 subprocess.run(f"sudo sh -c 'echo \"dtoverlay=dwc2,dr_mode=peripheral\" >> {cfg}'", shell=True, check=False)
                 subprocess.run("sudo systemctl enable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
                 # Dynamic libcomposite generator script (Composite Gadget: HID + RNDIS / ECM + usb0 IP)
-                sh_script = """#!/bin/bash
+                sh_script = f"""#!/bin/bash
 modprobe libcomposite 2>/dev/null || true
 cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
 
@@ -159,6 +256,11 @@ echo 0x0104 > idProduct
 echo 0x0100 > bcdDevice
 echo 0x0200 > bcdUSB
 
+# Declarar clase compuesta IAD (Interface Association Descriptor)
+echo 0xEF > bDeviceClass
+echo 0x02 > bDeviceSubClass
+echo 0x01 > bDeviceProtocol
+
 mkdir -p strings/0x409
 echo "fedcba9876543210" > strings/0x409/serialnumber
 echo "REI" > strings/0x409/manufacturer
@@ -173,7 +275,8 @@ mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol
 echo 1 > functions/hid.usb0/subclass
 echo 8 > functions/hid.usb0/report_length
-echo -ne \\x05\\x01\\x09\\x06\\xa1\\x01\\x05\\x07\\x19\\xe0\\x29\\xe7\\x15\\x00\\x25\\x01\\x75\\x01\\x95\\x08\\x81\\x02\\x95\\x01\\x75\\x08\\x81\\x03\\x95\\x05\\x75\\x01\\x05\\x08\\x19\\x01\\x29\\x05\\x91\\x02\\x95\\x01\\x75\\x03\\x91\\x03\\x95\\x06\\x75\\x08\\x15\\x00\\x25\\x65\\x05\\x07\\x19\\x00\\x29\\x65\\x81\\x00\\xc0 > functions/hid.usb0/report_desc
+# Inyectar descriptor estándar de teclado de 63 bytes en Base64 para evitar truncamiento por bytes nulos
+echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
 ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
 
 # 2. Funcion RNDIS / Ethernet (para conexion de red con Windows/Linux)
@@ -203,13 +306,23 @@ if [ -n "$UDC_DEV" ]; then
     echo "$UDC_DEV" > UDC
 fi
 
-# 5. Configurar direccion IP en usb0 si la interfaz esta presente
+# 5. Configurar direccion IP en usb0 y reiniciar dnsmasq de forma aislada
+GADGET_IP="{gadget_ip}"
+if ip -4 addr show wlan0 2>/dev/null | grep -q "inet 10.0.0."; then
+    GADGET_IP="172.20.0.1"
+fi
+
 sleep 1
 if ip link show usb0 >/dev/null 2>&1; then
     ip link set usb0 up 2>/dev/null || true
     ip addr flush dev usb0 2>/dev/null || true
-    ip addr add 10.0.0.1/24 dev usb0 2>/dev/null || true
+    ip addr add ${{GADGET_IP}}/24 dev usb0 2>/dev/null || true
+    # Reiniciar dnsmasq aislado para usb0
+    systemctl restart dnsmasq 2>/dev/null || true
 fi
+
+# Asegurar permisos de acceso a /dev/hidg0
+chmod 666 /dev/hidg0 2>/dev/null || true
 """
                 # Write script with root privileges
                 subprocess.run(

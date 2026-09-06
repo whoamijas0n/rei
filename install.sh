@@ -240,7 +240,44 @@ do_install() {
         fi
     done
 
-    # 3.1 Creación del Script de Gadget Compuesto (/usr/local/bin/usb_gadget.sh)
+    # 3.1 Aislamiento de Red (NetworkManager & dhcpcd) y Configuración de dnsmasq
+    print_status "info" "Configurando aislamiento de red en usb0 y servidor DHCP/DNS dnsmasq..."
+    if [ -d "/etc/NetworkManager/conf.d" ] || [ -f "/etc/NetworkManager/NetworkManager.conf" ]; then
+        mkdir -p /etc/NetworkManager/conf.d
+        cat > "/etc/NetworkManager/conf.d/99-rei-usb.conf" << 'EOF'
+[keyfile]
+unmanaged-devices=interface-name:usb*;interface-name:rndis*;interface-name:ecm*
+EOF
+        systemctl reload NetworkManager 2>/dev/null || nmcli general reload 2>/dev/null || true
+        print_status "info" "Regla NetworkManager unmanaged aplicada (/etc/NetworkManager/conf.d/99-rei-usb.conf)."
+    fi
+
+    if [ -f "/etc/dhcpcd.conf" ]; then
+        if ! grep -q "denyinterfaces usb\* rndis\* ecm\*" /etc/dhcpcd.conf; then
+            echo "denyinterfaces usb* rndis* ecm*" >> /etc/dhcpcd.conf
+            print_status "info" "Directiva denyinterfaces añadida a /etc/dhcpcd.conf."
+        fi
+    fi
+
+    mkdir -p /etc/dnsmasq.d
+    cat > "/etc/dnsmasq.d/rei-usb.conf" << 'EOF'
+interface=usb0
+bind-interfaces
+except-interface=lo
+except-interface=wlan0
+except-interface=eth0
+listen-address=10.0.0.1
+dhcp-range=usb0,10.0.0.2,10.0.0.10,255.255.255.0,12h
+# CRÍTICO: dhcp-option=3 vacío evita que el host tome a la Raspberry como gateway de Internet
+dhcp-option=3
+dhcp-option=6,10.0.0.1
+EOF
+    if [ -f "/etc/dnsmasq.conf" ]; then
+        sed -i 's|^#conf-dir=/etc/dnsmasq.d/,\*\.conf|conf-dir=/etc/dnsmasq.d/,*.conf|' /etc/dnsmasq.conf 2>/dev/null || true
+    fi
+    print_status "info" "Configuración aislada de dnsmasq para usb0 establecida."
+
+    # 3.2 Creación del Script de Gadget Compuesto (/usr/local/bin/usb_gadget.sh)
     cat > "/usr/local/bin/usb_gadget.sh" << 'EOF'
 #!/bin/bash
 modprobe libcomposite 2>/dev/null || true
@@ -268,6 +305,11 @@ echo 0x0104 > idProduct
 echo 0x0100 > bcdDevice
 echo 0x0200 > bcdUSB
 
+# Declarar clase compuesta IAD (Interface Association Descriptor)
+echo 0xEF > bDeviceClass
+echo 0x02 > bDeviceSubClass
+echo 0x01 > bDeviceProtocol
+
 mkdir -p strings/0x409
 echo "fedcba9876543210" > strings/0x409/serialnumber
 echo "REI" > strings/0x409/manufacturer
@@ -282,7 +324,8 @@ mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol
 echo 1 > functions/hid.usb0/subclass
 echo 8 > functions/hid.usb0/report_length
-echo -ne \x05\x01\x09\x06\xa1\x01\x05\x07\x19\xe0\x29\xe7\x15\x00\x25\x01\x75\x01\x95\x08\x81\x02\x95\x01\x75\x08\x81\x03\x95\x05\x75\x01\x05\x08\x19\x01\x29\x05\x91\x02\x95\x01\x75\x03\x91\x03\x95\x06\x75\x08\x15\x00\x25\x65\x05\x07\x19\x00\x29\x65\x81\x00\xc0 > functions/hid.usb0/report_desc
+# Inyectar descriptor estándar de teclado de 63 bytes en Base64 para evitar truncamiento por bytes nulos
+echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
 ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
 
 # 2. RNDIS (Windows)
@@ -311,16 +354,26 @@ if [ -n "$UDC_DEV" ]; then
     echo "$UDC_DEV" > UDC
 fi
 
+# 4. Configurar IP en usb0 y reiniciar dnsmasq de forma aislada
+GADGET_IP="10.0.0.1"
+if ip -4 addr show wlan0 2>/dev/null | grep -q "inet 10.0.0."; then
+    GADGET_IP="172.20.0.1"
+fi
+
 sleep 1
 if ip link show usb0 >/dev/null 2>&1; then
     ip link set usb0 up 2>/dev/null || true
     ip addr flush dev usb0 2>/dev/null || true
-    ip addr add 10.0.0.1/24 dev usb0 2>/dev/null || true
+    ip addr add ${GADGET_IP}/24 dev usb0 2>/dev/null || true
+    systemctl restart dnsmasq 2>/dev/null || true
 fi
+
+# Asegurar permisos de acceso a /dev/hidg0
+chmod 666 /dev/hidg0 2>/dev/null || true
 EOF
     chmod 755 "/usr/local/bin/usb_gadget.sh"
 
-    # 3.2 Servicio Systemd usb_gadget.service
+    # 3.3 Servicio Systemd usb_gadget.service
     cat > "/etc/systemd/system/usb_gadget.service" << 'EOF'
 [Unit]
 Description=USB HID/Net Gadget Initialization
@@ -554,6 +607,23 @@ do_uninstall() {
     if [ -f "/usr/local/bin/usb_gadget.sh" ]; then
         rm -f "/usr/local/bin/usb_gadget.sh"
         print_status "info" "Script /usr/local/bin/usb_gadget.sh eliminado."
+    fi
+
+    if [ -f "/etc/NetworkManager/conf.d/99-rei-usb.conf" ]; then
+        rm -f "/etc/NetworkManager/conf.d/99-rei-usb.conf"
+        systemctl reload NetworkManager 2>/dev/null || nmcli general reload 2>/dev/null || true
+        print_status "info" "Regla NetworkManager /etc/NetworkManager/conf.d/99-rei-usb.conf eliminada."
+    fi
+
+    if [ -f "/etc/dnsmasq.d/rei-usb.conf" ]; then
+        rm -f "/etc/dnsmasq.d/rei-usb.conf"
+        systemctl restart dnsmasq 2>/dev/null || true
+        print_status "info" "Configuración dnsmasq /etc/dnsmasq.d/rei-usb.conf eliminada."
+    fi
+
+    if [ -f "/etc/dhcpcd.conf" ]; then
+        sed -i '/denyinterfaces usb\* rndis\* ecm\*/d' /etc/dhcpcd.conf 2>/dev/null || true
+        print_status "info" "Directiva denyinterfaces removida de /etc/dhcpcd.conf."
     fi
 
     if [ -d "${PROJECT_DIR}/.venv" ]; then

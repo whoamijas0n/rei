@@ -1,0 +1,19 @@
+{
+  "timestamp": 1788718002.9118652,
+  "datetime": "2026-09-06 12:06:42",
+  "report_type": "endpoint",
+  "target": "DESKTOP-REI01",
+  "analysis": {
+    "estado": "CRÍTICO",
+    "diagnostico_corto": "Reinicio abrupto / B\nFalla crítica detectada",
+    "acciones_recomendadas": [
+      "Revisar logs de energía y RAM"
+    ],
+    "confianza": 0.95,
+    "origen": "HEURISTIC",
+    "timestamp": 1788718002.9117332
+  },
+  "telemetry": {
+    "mock": true
+  }
+}

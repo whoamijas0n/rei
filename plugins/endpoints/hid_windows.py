@@ -29,14 +29,28 @@ class WindowsPayloadGenerator:
     """
 
     @classmethod
+    def normalize_category(cls, category: str) -> str:
+        """Normalizes diagnostic category names to standard canonical tokens."""
+        cat = category.upper().strip()
+        if "RED" in cat or "CONEXION" in cat or "NETWORK" in cat:
+            return "RED"
+        elif "HARDWARE" in cat or "CPU" in cat:
+            return "HARDWARE"
+        elif "MALWARE" in cat or "VIRUS" in cat or "PROCESOS" in cat:
+            return "MALWARE"
+        elif "OTROS" in cat or "LOGS" in cat or "REGISTROS" in cat:
+            return "LOGS"
+        return "COMPLETO"
+
+    @classmethod
     def get_powershell_script(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
         """
         Returns the raw PowerShell script that gathers telemetry and posts JSON to server_url.
         """
-        cat = category.upper().strip()
+        cat = cls.normalize_category(category)
         endpoint_uri = f"{server_url.rstrip('/')}/api/v1/endpoint/report"
 
-        if "RED" in cat or "CONEXION" in cat or "NETWORK" in cat:
+        if cat == "RED":
             telemetry_ps = """
             $gw=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -and $_.DefaultIPGateway} | Select-Object -First 1 -ExpandProperty DefaultIPGateway);
             $ip=(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled} | Select-Object -First 1 -ExpandProperty IPAddress);
@@ -44,7 +58,7 @@ class WindowsPayloadGenerator:
             $ping=if($gw){(Test-Connection -TargetName $gw -Count 1 -Quiet)}else{$false};
             $t=@{ip=$ip;gateway=$gw;dns=$dns;ping_gateway=$ping};
             """
-        elif "HARDWARE" in cat or "CPU" in cat:
+        elif cat == "HARDWARE":
             telemetry_ps = """
             $cpu=(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average;
             $os=Get-CimInstance Win32_OperatingSystem;
@@ -52,14 +66,14 @@ class WindowsPayloadGenerator:
             $disks=(Get-CimInstance Win32_LogicalDisk | Where-Object {$_.DriveType -eq 3} | ForEach-Object {"$($_.DeviceID) Free:$([math]::Round($_.FreeSpace/1GB,1))GB/$([math]::Round($_.Size/1GB,1))GB"}) -join '; ';
             $t=@{cpu_percent=$cpu;ram_percent=$ram;disks=$disks;cpu_name=(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)};
             """
-        elif "MALWARE" in cat or "VIRUS" in cat:
+        elif cat == "MALWARE":
             telemetry_ps = """
             $av=(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object -First 1 -ExpandProperty displayName);
             $procs=(Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object {"$($_.ProcessName)($([math]::Round($_.CPU,1))s)"}) -join ', ';
             $ports=(Get-NetTCPConnection -State Listen | Select-Object -First 6 | ForEach-Object {"$($_.LocalPort)"}) -join ', ';
             $t=@{antivirus_enabled=$av;top_cpu_procs=$procs;listening_ports=$ports};
             """
-        elif "OTROS" in cat or "LOGS" in cat:
+        elif cat == "LOGS":
             telemetry_ps = """
             $events=(Get-WinEvent -FilterHashtable @{LogName='System';Level=1,2} -MaxEvents 3 | ForEach-Object {"[$($_.TimeCreated.ToString('HH:mm'))] $($_.Message.Substring(0,[math]::Min(60,$_.Message.Length)))"}) -join ' | ';
             $services=(Get-Service | Where-Object {$_.StartType -eq 'Automatic' -and $_.Status -eq 'Stopped'} | Select-Object -First 5 -ExpandProperty Name) -join ', ';
@@ -91,12 +105,13 @@ class WindowsPayloadGenerator:
     @classmethod
     def get_powershell_payload(cls, category: str, server_url: str = "http://10.0.0.1:8000") -> str:
         """
-        Returns a single-line PowerShell command encoded in Base64 (UTF-16LE) using -EncodedCommand.
-        This completely eliminates CLI quotation errors, layout special character corruption,
-        and Windows Run dialog (Win+R) parsing issues.
+        Generates a compact Base64 UTF-16LE micro-stager (<200 chars).
+        Downloads and executes the full PowerShell telemetry script from REI's local web server.
+        Fits easily inside the Windows Run dialog (Win+R) buffer (<260 chars) and types in ~5 seconds.
         """
-        script = cls.get_powershell_script(category=category, server_url=server_url)
-        encoded_bytes = script.encode("utf-16le")
+        cat = cls.normalize_category(category)
+        stager = f"irm {server_url.rstrip('/')}/w/{cat}|iex"
+        encoded_bytes = stager.encode("utf-16le")
         b64_cmd = base64.b64encode(encoded_bytes).decode("ascii")
         return f"powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64_cmd}"
 
@@ -141,10 +156,24 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
         self._layout = layout.lower()
         if web_server:
             self._web_server = web_server
+            if hasattr(web_server, "base_url") and web_server.base_url:
+                self._server_url = web_server.base_url
 
     def run(self, **kwargs) -> DiagnosticResult:
         progress_cb: Optional[Callable[[str, float], None]] = kwargs.get("progress_callback")
         start_time = time.monotonic()
+
+        # Step 0: Validate hardware connection before starting
+        is_ready, not_ready_details = self._injector.check_ready()
+        if not is_ready:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                target_identifier=f"Windows ({self._layout.upper()})",
+                status=DiagnosticStatus.FAILED,
+                overall_status=Severity.WARNING,
+                summary=not_ready_details[0] if not_ready_details else "USB no listo",
+                details=not_ready_details,
+            )
 
         # Step 1: Prepare Payload
         if progress_cb:
@@ -172,13 +201,24 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
         except Exception as inj_ex:
             logger.error(f"HID injection failed: {inj_ex}")
             if not self._injector.dry_run:
+                err_str = str(inj_ex).lower()
+                if "timeout" in err_str or "no responde" in err_str:
+                    details = ["Host no acepta HID", "Verifique cable de datos", "Use puerto USB (no PWR)"]
+                    summary = "Timeout USB HID"
+                elif "desconectado" in err_str:
+                    details = ["Cable desconectado", "Conecte puerto USB a PC", "Use cable de datos"]
+                    summary = "USB desconectado"
+                else:
+                    details = [str(inj_ex)[:20], "Verifique conexión USB"]
+                    summary = "Fallo de inyección"
+
                 return DiagnosticResult(
                     plugin_name=self.name,
                     target_identifier=f"Windows ({self._layout.upper()})",
                     status=DiagnosticStatus.FAILED,
                     overall_status=Severity.CRITICAL,
-                    summary="Fallo de inyección USB HID",
-                    details=["USB HID no disponible", "Active Modo HID en Menu"],
+                    summary=summary,
+                    details=details,
                 )
 
         # Step 3: Await Telemetry over HTTP

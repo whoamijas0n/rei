@@ -1,0 +1,21 @@
+{
+  "timestamp": 1788718002.886774,
+  "datetime": "2026-09-06 12:06:42",
+  "report_type": "switch",
+  "target": "SW-CORE-PISO2",
+  "analysis": {
+    "estado": "CRÍTICO",
+    "diagnostico_corto": "Falla PS2\nErr-disable: Fa0/12",
+    "acciones_recomendadas": [
+      "Reemplazar módulo PS2",
+      "Verificar alimentación AC/DC",
+      "Revisar loop/BPDU en Fa0/12"
+    ],
+    "confianza": 0.95,
+    "origen": "HEURISTIC",
+    "timestamp": 1788718002.8866384
+  },
+  "telemetry": {
+    "mock": "simulated_ios_session"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "timestamp": 1788718002.454543,
+  "datetime": "2026-09-06 12:06:42",
+  "report_type": "endpoint",
+  "target": "test-persist",
+  "analysis": {
+    "estado": "SALUDABLE",
+    "diagnostico_corto": "Sistema Linux OK\nHardware en buen estado",
+    "acciones_recomendadas": [
+      "Mantener parches al día",
+      "Uso regular normal"
+    ],
+    "confianza": 0.95,
+    "origen": "HEURISTIC",
+    "timestamp": 1788718002.4539032
+  },
+  "telemetry": {
+    "os_type": "linux",
+    "os_version": "Debian 12",
+    "hostname": "test-persist",
+    "uptime_seconds": 100,
+    "cpu_model": "ARM Cortex-A53",
+    "cpu_load_pct": 5.0,
+    "ram_total_mb": 512,
+    "ram_used_mb": 200,
+    "ram_free_mb": 312,
+    "drives": [
+      "StorageDriveInfo(device='/dev/mmcblk0p2', size_gb=16, free_gb=8, health_status='OK', smart_alerts=[])"
+    ],
+    "critical_events": [],
+    "network_adapters": [],
+    "raw_payload": {},
+    "timestamp": 1788718002.4538608
+  }
+}
