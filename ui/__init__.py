@@ -9,6 +9,8 @@ from .display import (
     BaseView,
     HeroCardDeckView,
     DetailCardView,
+    DiagnosticResultView,
+    UpdateProgressView,
     HeroCard,
     IconRenderer,
     VirtualKeyboardInputView,
@@ -23,10 +25,13 @@ __all__ = [
     "BaseView",
     "HeroCardDeckView",
     "DetailCardView",
+    "DiagnosticResultView",
+    "UpdateProgressView",
     "HeroCard",
     "IconRenderer",
     "VirtualKeyboardInputView",
     "KeyboardInputView",
     "KeyboardLayer",
 ]
+
 

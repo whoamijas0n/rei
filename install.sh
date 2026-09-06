@@ -26,6 +26,10 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 SPLASH_SERVICE_NAME="rei-splash.service"
 SPLASH_SERVICE_PATH="/etc/systemd/system/${SPLASH_SERVICE_NAME}"
 SPLASH_BIN_PATH="/usr/local/bin/rei-splash"
+GADGET_SERVICE_NAME="rei-usb-gadget.service"
+GADGET_SERVICE_PATH="/etc/systemd/system/${GADGET_SERVICE_NAME}"
+GADGET_SCRIPT_SRC="${PROJECT_DIR}/scripts/setup-usb-gadget.sh"
+GADGET_SCRIPT_DST="/usr/local/bin/setup-usb-gadget.sh"
 PYTHON_BIN="$(command -v python3 || echo "/usr/bin/python3")"
 
 # ------------------------------------------------------------------------------
@@ -206,17 +210,21 @@ do_install() {
     fi
     echo ""
 
-    # 3. Habilitación de Módulos de Hardware (I2C & SPI) y Modo Silencioso
-    print_status "step" "Paso 3/5: Habilitando interfaces de hardware (I2C / SPI) y arranque limpio..."
+    # 3. Habilitación de Módulos de Hardware (I2C, SPI & USB Gadget dwc2/libcomposite)
+    print_status "step" "Paso 3/5: Habilitando interfaces de hardware (I2C / SPI / USB OTG dwc2)..."
     modprobe i2c-dev 2>/dev/null || true
     modprobe spi-bcm2835 2>/dev/null || true
     modprobe spidev 2>/dev/null || true
+    modprobe dwc2 2>/dev/null || true
+    modprobe libcomposite 2>/dev/null || true
     
     # Habilitar en /etc/modules si no está presente
     if [ -f "/etc/modules" ]; then
         grep -qxF "i2c-dev" /etc/modules || echo "i2c-dev" >> /etc/modules
         grep -qxF "spi-bcm2835" /etc/modules || echo "spi-bcm2835" >> /etc/modules
         grep -qxF "spidev" /etc/modules || echo "spidev" >> /etc/modules
+        grep -qxF "dwc2" /etc/modules || echo "dwc2" >> /etc/modules
+        grep -qxF "libcomposite" /etc/modules || echo "libcomposite" >> /etc/modules
     fi
 
     # Configuración de Raspberry Pi config.txt si existe
@@ -228,7 +236,10 @@ do_install() {
             if ! grep -q "^dtparam=spi=on" "$boot_cfg"; then
                 echo "dtparam=spi=on" >> "$boot_cfg"
             fi
-            print_status "info" "Interfaces I2C/SPI habilitadas en ${boot_cfg}"
+            if ! grep -q "^dtoverlay=dwc2" "$boot_cfg"; then
+                echo "dtoverlay=dwc2" >> "$boot_cfg"
+            fi
+            print_status "info" "Interfaces I2C/SPI y USB OTG dwc2 configuradas en ${boot_cfg}"
             break
         fi
     done
@@ -303,6 +314,18 @@ do_install() {
         exec_cmd="${PYTHON_BIN}"
     fi
 
+    # 5.0 Gadget USB Compuesto (/usr/local/bin/setup-usb-gadget.sh & rei-usb-gadget.service)
+    print_status "info" "Instalando script y servicio de Gadget USB compuesto (HID + CDC-ACM)..."
+    if [ -f "${GADGET_SCRIPT_SRC}" ]; then
+        cp -f "${GADGET_SCRIPT_SRC}" "${GADGET_SCRIPT_DST}"
+        chmod 755 "${GADGET_SCRIPT_DST}"
+    fi
+
+    if [ -f "${PROJECT_DIR}/scripts/${GADGET_SERVICE_NAME}" ]; then
+        cp -f "${PROJECT_DIR}/scripts/${GADGET_SERVICE_NAME}" "${GADGET_SERVICE_PATH}"
+        chmod 644 "${GADGET_SERVICE_PATH}"
+    fi
+
     # 5.1 Pantalla de Carga Temprana (rei-splash.service)
     cat > "${SPLASH_SERVICE_PATH}" <<EOF
 [Unit]
@@ -339,8 +362,8 @@ EOF
     cat > "${SERVICE_PATH}" <<EOF
 [Unit]
 Description=REI - Autonomous Diagnostic Hub Service
-After=network.target local-fs.target systemd-modules-load.service ${SPLASH_SERVICE_NAME}
-Wants=network.target
+After=network.target local-fs.target systemd-modules-load.service ${SPLASH_SERVICE_NAME} ${GADGET_SERVICE_NAME}
+Wants=network.target ${GADGET_SERVICE_NAME}
 
 [Service]
 Type=simple
@@ -361,10 +384,14 @@ EOF
     chmod 644 "${SERVICE_PATH}"
 
     systemctl daemon-reload
-    systemctl unmask "${SPLASH_SERVICE_NAME}" "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl unmask "${GADGET_SERVICE_NAME}" "${SPLASH_SERVICE_NAME}" "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl enable "${GADGET_SERVICE_NAME}" >/dev/null 2>&1 || true
     systemctl enable "${SPLASH_SERVICE_NAME}" >/dev/null 2>&1
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
     
+    print_status "info" "Iniciando servicio de gadget USB ${GADGET_SERVICE_NAME}..."
+    systemctl restart "${GADGET_SERVICE_NAME}" >/dev/null 2>&1 || true
+
     print_status "info" "Lanzando pantalla de carga temprana ${SPLASH_SERVICE_NAME}..."
     systemctl restart "${SPLASH_SERVICE_NAME}" >/dev/null 2>&1 || true
 
@@ -376,6 +403,7 @@ EOF
     else
         print_status "info" "Servicios habilitados para el próximo arranque (autoinicio configurado)."
     fi
+
 
     echo ""
     center_divider "━" 68
@@ -400,7 +428,7 @@ do_uninstall() {
     center_divider "─" 50
     echo ""
 
-    print_status "step" "Deteniendo y deshabilitando servicios de autoinicio (${SERVICE_NAME} & ${SPLASH_SERVICE_NAME})..."
+    print_status "step" "Deteniendo y deshabilitando servicios de autoinicio (${SERVICE_NAME}, ${SPLASH_SERVICE_NAME}, ${GADGET_SERVICE_NAME})..."
     
     if systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null; then
         systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
@@ -417,6 +445,16 @@ do_uninstall() {
         print_status "info" "Splash de arranque deshabilitado."
     fi
 
+    if systemctl is-active --quiet "${GADGET_SERVICE_NAME}" 2>/dev/null; then
+        systemctl stop "${GADGET_SERVICE_NAME}" 2>/dev/null || true
+        print_status "info" "Servicio gadget USB detenido."
+    fi
+
+    if systemctl is-enabled --quiet "${GADGET_SERVICE_NAME}" 2>/dev/null; then
+        systemctl disable "${GADGET_SERVICE_NAME}" 2>/dev/null || true
+        print_status "info" "Servicio gadget USB deshabilitado."
+    fi
+
     if [ -f "${SERVICE_PATH}" ]; then
         rm -f "${SERVICE_PATH}"
         print_status "info" "Archivo de servicio ${SERVICE_PATH} eliminado."
@@ -426,6 +464,18 @@ do_uninstall() {
         rm -f "${SPLASH_SERVICE_PATH}"
         print_status "info" "Archivo de servicio ${SPLASH_SERVICE_PATH} eliminado."
     fi
+
+    if [ -f "${GADGET_SERVICE_PATH}" ]; then
+        rm -f "${GADGET_SERVICE_PATH}"
+        print_status "info" "Archivo de servicio ${GADGET_SERVICE_PATH} eliminado."
+    fi
+
+    if [ -f "${GADGET_SCRIPT_DST}" ]; then
+        "${GADGET_SCRIPT_DST}" stop 2>/dev/null || true
+        rm -f "${GADGET_SCRIPT_DST}"
+        print_status "info" "Script de gadget ${GADGET_SCRIPT_DST} eliminado."
+    fi
+
 
     if [ -f "${SPLASH_BIN_PATH}" ]; then
         rm -f "${SPLASH_BIN_PATH}"

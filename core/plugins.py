@@ -13,9 +13,21 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
-from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
+from .interfaces import (
+    IDiagnosticPlugin,
+    DiagnosticResult,
+    DiagnosticStatus,
+    Severity,
+    AIAnalysisResult,
+    EndpointDiagnosticData,
+    NetworkSwitchDiagnosticData,
+)
 from .pisugar import PiSugar3Client, PiSugarTelemetry
 from .wifi import WiFiManager, WiFiNetwork
+from .hid_injector import USBHIDInjector
+from .serial_receiver import USBSerialReceiver, get_windows_collector_script, get_linux_collector_script
+from .switch_serial import SwitchSerialHandler
+from .ai_client import DiagnosticAnalyzer
 
 
 class IPAddressPlugin(IDiagnosticPlugin):
@@ -259,7 +271,241 @@ class SystemStatusPlugin(IDiagnosticPlugin):
         )
 
 
+class WindowsDiagnosticPlugin(IDiagnosticPlugin):
+    """
+    Automated health diagnostic for Windows endpoints.
+    Injects in-memory PowerShell audit via USB HID (Win+R) -> collects WMI/CIM metrics ->
+    receives JSON frame over CDC-ACM serial (/dev/ttyGS0) -> analyzes via Gemini/Heuristics.
+    """
+    def __init__(
+        self,
+        hid_injector: Optional[USBHIDInjector] = None,
+        serial_receiver: Optional[USBSerialReceiver] = None,
+        analyzer: Optional[DiagnosticAnalyzer] = None,
+    ):
+        self._hid = hid_injector or USBHIDInjector()
+        self._receiver = serial_receiver or USBSerialReceiver()
+        self._analyzer = analyzer or DiagnosticAnalyzer()
+
+    @property
+    def id(self) -> str:
+        return "diag_pc_windows"
+
+    @property
+    def name(self) -> str:
+        return "PC WINDOWS"
+
+    @property
+    def category(self) -> str:
+        return "ENDPOINTS"
+
+    def run(self, progress_callback: Optional[Callable[[str, float], None]] = None, **kwargs) -> DiagnosticResult:
+        def update_prog(msg: str, pct: float):
+            if progress_callback:
+                try:
+                    progress_callback(msg, pct)
+                except Exception:
+                    pass
+
+        update_prog("Inyectando payload HID...", 0.10)
+        ps_script = get_windows_collector_script()
+        self._hid.inject_windows_powershell(ps_script)
+
+        update_prog("Esperando telemetria...", 0.25)
+        endpoint_data = self._receiver.wait_for_endpoint_data(
+            timeout=18.0,
+            expected_os="windows",
+            progress_callback=update_prog,
+        )
+
+        if not endpoint_data:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="Sin respuesta del PC",
+                details=["Timeout esperando", "datos en /dev/ttyGS0.", "Verifique USB y Win+R"],
+                severity=Severity.CRITICO,
+            )
+
+        update_prog("Analizando estado (IA)...", 0.90)
+        analysis = self._analyzer.analyze_endpoint(endpoint_data)
+        update_prog("Diagnostico completo", 1.0)
+
+        ram_str = f"RAM: {int(endpoint_data.ram_used_mb)}M/{int(endpoint_data.ram_total_mb)}M"
+        details = [
+            f"Host: {endpoint_data.hostname[:14]}",
+            ram_str,
+        ]
+        if endpoint_data.drives:
+            drv = endpoint_data.drives[0]
+            details.append(f"Disco: {drv.size_gb:.0f}GB ({drv.free_gb:.0f}GB lib)")
+        if endpoint_data.critical_events:
+            details.append("Eventos: Alertas detectadas")
+        for act in analysis.acciones_recomendadas[:2]:
+            details.append(f"> {act[:18]}")
+
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.SUCCESS if analysis.estado != Severity.CRITICO else DiagnosticStatus.WARNING,
+            summary=analysis.diagnostico_corto.replace("\n", " | "),
+            details=details,
+            metrics=endpoint_data.__dict__,
+            ai_analysis=analysis,
+            severity=analysis.estado,
+        )
+
+
+class LinuxDiagnosticPlugin(IDiagnosticPlugin):
+    """
+    Automated health diagnostic for Linux endpoints.
+    Injects in-memory Bash audit via USB HID (terminal shortcut) -> collects metrics ->
+    receives JSON frame over CDC-ACM serial (/dev/ttyGS0) -> analyzes via Gemini/Heuristics.
+    """
+    def __init__(
+        self,
+        hid_injector: Optional[USBHIDInjector] = None,
+        serial_receiver: Optional[USBSerialReceiver] = None,
+        analyzer: Optional[DiagnosticAnalyzer] = None,
+    ):
+        self._hid = hid_injector or USBHIDInjector()
+        self._receiver = serial_receiver or USBSerialReceiver()
+        self._analyzer = analyzer or DiagnosticAnalyzer()
+
+    @property
+    def id(self) -> str:
+        return "diag_pc_linux"
+
+    @property
+    def name(self) -> str:
+        return "PC LINUX"
+
+    @property
+    def category(self) -> str:
+        return "ENDPOINTS"
+
+    def run(self, progress_callback: Optional[Callable[[str, float], None]] = None, **kwargs) -> DiagnosticResult:
+        def update_prog(msg: str, pct: float):
+            if progress_callback:
+                try:
+                    progress_callback(msg, pct)
+                except Exception:
+                    pass
+
+        update_prog("Inyectando payload HID...", 0.10)
+        bash_script = get_linux_collector_script()
+        self._hid.inject_linux_bash(bash_script)
+
+        update_prog("Esperando telemetria...", 0.25)
+        endpoint_data = self._receiver.wait_for_endpoint_data(
+            timeout=18.0,
+            expected_os="linux",
+            progress_callback=update_prog,
+        )
+
+        if not endpoint_data:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary="Sin respuesta del PC",
+                details=["Timeout esperando", "datos en /dev/ttyGS0.", "Verifique USB y terminal"],
+                severity=Severity.CRITICO,
+            )
+
+        update_prog("Analizando estado (IA)...", 0.90)
+        analysis = self._analyzer.analyze_endpoint(endpoint_data)
+        update_prog("Diagnostico completo", 1.0)
+
+        ram_str = f"RAM: {int(endpoint_data.ram_used_mb)}M/{int(endpoint_data.ram_total_mb)}M"
+        details = [
+            f"Host: {endpoint_data.hostname[:14]}",
+            ram_str,
+        ]
+        if endpoint_data.drives:
+            drv = endpoint_data.drives[0]
+            details.append(f"Disco: {drv.size_gb:.0f}GB ({drv.free_gb:.0f}GB lib)")
+        if endpoint_data.critical_events:
+            details.append("Kernel: Alertas detectadas")
+        for act in analysis.acciones_recomendadas[:2]:
+            details.append(f"> {act[:18]}")
+
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.SUCCESS if analysis.estado != Severity.CRITICO else DiagnosticStatus.WARNING,
+            summary=analysis.diagnostico_corto.replace("\n", " | "),
+            details=details,
+            metrics=endpoint_data.__dict__,
+            ai_analysis=analysis,
+            severity=analysis.estado,
+        )
+
+
+class SwitchDiagnosticPlugin(IDiagnosticPlugin):
+    """
+    Serial console auditor for network switches and routers (Cisco, Arista, generic).
+    Auto-detects baudrate (9600/115200), runs non-destructive audit commands ->
+    parses interfaces, CRC errors, power supplies, and syslog -> analyzes via Gemini/Heuristics.
+    """
+    def __init__(
+        self,
+        handler: Optional[SwitchSerialHandler] = None,
+        analyzer: Optional[DiagnosticAnalyzer] = None,
+    ):
+        self._handler = handler or SwitchSerialHandler()
+        self._analyzer = analyzer or DiagnosticAnalyzer()
+
+    @property
+    def id(self) -> str:
+        return "diag_switch_serial"
+
+    @property
+    def name(self) -> str:
+        return "SWITCH / RED"
+
+    @property
+    def category(self) -> str:
+        return "SWITCHES"
+
+    def run(self, progress_callback: Optional[Callable[[str, float], None]] = None, **kwargs) -> DiagnosticResult:
+        def update_prog(msg: str, pct: float):
+            if progress_callback:
+                try:
+                    progress_callback(msg, pct)
+                except Exception:
+                    pass
+
+        update_prog("Iniciando auditoria consola...", 0.10)
+        switch_data = self._handler.audit_switch(progress_callback=update_prog)
+
+        update_prog("Analizando configuracion (IA)...", 0.90)
+        analysis = self._analyzer.analyze_switch(switch_data)
+        update_prog("Auditoria completada", 1.0)
+
+        details = [
+            f"Host: {switch_data.hostname[:14]}",
+            f"Mod:  {switch_data.model[:14]}",
+            f"Ptos: {switch_data.ports_up} UP / {switch_data.ports_down} DOWN",
+        ]
+        if switch_data.ports_err_disabled:
+            details.append(f"ErrDis: {','.join(switch_data.ports_err_disabled[:2])}")
+        if switch_data.ports_with_crc_errors:
+            crc_count = len(switch_data.ports_with_crc_errors)
+            details.append(f"CRC:  {crc_count} puerto(s)")
+        for act in analysis.acciones_recomendadas[:2]:
+            details.append(f"> {act[:18]}")
+
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.SUCCESS if analysis.estado != Severity.CRITICO else DiagnosticStatus.WARNING,
+            summary=analysis.diagnostico_corto.replace("\n", " | "),
+            details=details,
+            metrics=switch_data.__dict__,
+            ai_analysis=analysis,
+            severity=analysis.estado,
+        )
+
+
 class CiscoSerialPlugin(IDiagnosticPlugin):
+
     """Tests RS-232 / USB-to-UART Cisco Console interface."""
 
     @property

@@ -1,0 +1,17 @@
+[Unit]
+Description=REI USB Composite Gadget (HID Keyboard + CDC-ACM Serial)
+Documentation=https://github.com/whoamijas0n/rei
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target
+Before=rei.service sys-subsystem-net-devices-usb0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/setup-usb-gadget.sh
+ExecStop=/usr/local/bin/setup-usb-gadget.sh stop
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

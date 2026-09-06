@@ -11,20 +11,17 @@ import sys
 import time
 from typing import Dict, Optional
 
-from core.interfaces import DiagnosticResult, DiagnosticStatus
+from core.interfaces import DiagnosticResult, DiagnosticStatus, Severity
 from core.manager import DiagnosticManager
 from core.plugins import (
+    WindowsDiagnosticPlugin,
+    LinuxDiagnosticPlugin,
+    SwitchDiagnosticPlugin,
     IPAddressPlugin,
     WiFiScanPlugin,
     WiFiConnectPlugin,
     BatteryStatusPlugin,
     SystemStatusPlugin,
-    CiscoSerialPlugin,
-    CiscoSSHPlugin,
-    SNMPScanPlugin,
-    WindowsRNDISPlugin,
-    LinuxSSHPlugin,
-    VaultPlugin,
     PoweroffPlugin,
     RebootPlugin,
     SystemUpdatePlugin,
@@ -34,6 +31,7 @@ from ui.display import (
     ScreenManager,
     HeroCardDeckView,
     DetailCardView,
+    DiagnosticResultView,
     UpdateProgressView,
     VirtualKeyboardInputView,
     KeyboardInputView,
@@ -86,17 +84,14 @@ class REIApp:
     def _register_plugins(self) -> None:
         """Instantiates and registers all decoupled diagnostic plugins."""
         plugins = [
+            WindowsDiagnosticPlugin(),
+            LinuxDiagnosticPlugin(),
+            SwitchDiagnosticPlugin(),
             IPAddressPlugin(),
             WiFiScanPlugin(),
             WiFiConnectPlugin(),
             BatteryStatusPlugin(),
             SystemStatusPlugin(),
-            CiscoSerialPlugin(),
-            CiscoSSHPlugin(),
-            SNMPScanPlugin(),
-            WindowsRNDISPlugin(),
-            LinuxSSHPlugin(),
-            VaultPlugin(),
             PoweroffPlugin(),
             RebootPlugin(),
             SystemUpdatePlugin(),
@@ -104,6 +99,7 @@ class REIApp:
         ]
         for plugin in plugins:
             self.diag_manager.register_plugin(plugin)
+
 
     def _create_detail_view(self, task_id: str, title: str) -> DetailCardView:
         """Factory for detail card views wired to asynchronous plugin triggers."""
@@ -272,37 +268,44 @@ class REIApp:
         )
         self.screen_manager.push_view(deck_result)
 
+    def _start_diagnostic_flow(self, plugin_id: str, title: str) -> None:
+        """
+        Launches an autonomous diagnostic session (PC Windows, PC Linux, Switch Serial).
+        Displays real-time stage progress on an UpdateProgressView, then displays
+        the final DiagnosticResultView with severity badge and recommendations.
+        """
+        progress_view = UpdateProgressView(title=title)
+        progress_view.stage_message = "Iniciando diagnóstico..."
+        progress_view.progress = 0.05
+        self.screen_manager.push_view(progress_view)
+
+        def on_progress(msg: str, pct: float):
+            progress_view.set_progress(msg, pct)
+
+        def on_done(result: DiagnosticResult):
+            self.screen_manager.pop_view()
+            result_view = DiagnosticResultView(
+                title=title,
+                result=result,
+                pop_to_root_on_exit=True
+            )
+            self.screen_manager.push_view(result_view)
+
+        self.diag_manager.execute_async(
+            plugin_id=plugin_id,
+            on_complete=on_done,
+            on_progress=on_progress
+        )
+
     def _build_menu_hierarchy(self) -> None:
         """
-        Builds the exact navigation hierarchy:
-        - Level 0 (Main): UTILIDADES, SWITCHES / RED, ENDPOINTS PC, BOVEDA / VAULT
-        - Level 1 (Utilidades): CONEXION DE RED, ESTADO BATERIA, ESTADO SISTEMA, ACTUALIZACIONES, ALIMENTACION
-        - Level 2 (Conexion): VER DIRECCION IP, ESCANEAR WI-FI
-        - Level 2 (Actualizaciones): ACTUALIZAR SISTEMA, ACTUALIZAR REI
-        - Level 2 (Alimentacion): APAGAR, REINICIAR
+        Builds the 5-card Hero Card hierarchy strictly aligned with project mission:
+        - [PC WINDOWS]: Automated USB HID/CDC-ACM health check + AI diagnosis
+        - [PC LINUX]: Automated USB HID/CDC-ACM health check + AI diagnosis
+        - [SWITCH / RED]: Automated serial console (9600/115200) audit + AI diagnosis
+        - [WI-FI / RED]: IP Address viewer, local Wi-Fi scanner & connector
+        - [SISTEMA / BATERIA]: PiSugar battery, CPU/RAM stats, updates, power
         """
-
-        # ----------------------------------------------------
-        # LEVEL 2: Sub-menus for CONEXION DE RED
-        # ----------------------------------------------------
-        view_ip_detail = self._create_detail_view("diag_ip_address", "DIRECCION IP")
-
-        deck_net_conn = HeroCardDeckView("CONEXION DE RED")
-        deck_net_conn.add_card(
-            HeroCard(
-                title="VER DIRECCION IP",
-                icon_name="IP",
-                submenu=view_ip_detail,
-                on_select=lambda: self._trigger_task("diag_ip_address")
-            )
-        )
-        deck_net_conn.add_card(
-            HeroCard(
-                title="ESCANEAR WI-FI",
-                icon_name="WIFI",
-                on_select=self._start_wifi_scan
-            )
-        )
 
         # ----------------------------------------------------
         # LEVEL 2: Sub-menus for ACTUALIZACIONES
@@ -353,20 +356,35 @@ class REIApp:
         )
 
         # ----------------------------------------------------
-        # LEVEL 1: Sub-menus for UTILIDADES
+        # LEVEL 1: Sub-menus for WI-FI / RED
+        # ----------------------------------------------------
+        view_ip_detail = self._create_detail_view("diag_ip_address", "DIRECCION IP")
+
+        deck_wifi = HeroCardDeckView("WI-FI / RED")
+        deck_wifi.add_card(
+            HeroCard(
+                title="VER DIRECCION IP",
+                icon_name="IP",
+                submenu=view_ip_detail,
+                on_select=lambda: self._trigger_task("diag_ip_address")
+            )
+        )
+        deck_wifi.add_card(
+            HeroCard(
+                title="ESCANEAR WI-FI",
+                icon_name="WIFI",
+                on_select=self._start_wifi_scan
+            )
+        )
+
+        # ----------------------------------------------------
+        # LEVEL 1: Sub-menus for SISTEMA / BATERIA
         # ----------------------------------------------------
         view_battery_detail = self._create_detail_view("diag_battery", "ESTADO BATERIA")
         view_system_detail = self._create_detail_view("diag_system", "ESTADO SISTEMA")
 
-        deck_utilidades = HeroCardDeckView("UTILIDADES")
-        deck_utilidades.add_card(
-            HeroCard(
-                title="CONEXION DE RED",
-                icon_name="NETWORK",
-                submenu=deck_net_conn
-            )
-        )
-        deck_utilidades.add_card(
+        deck_sistema = HeroCardDeckView("SISTEMA / BATERIA")
+        deck_sistema.add_card(
             HeroCard(
                 title="ESTADO BATERIA",
                 icon_name="BATTERY",
@@ -374,7 +392,7 @@ class REIApp:
                 on_select=lambda: self._trigger_task("diag_battery")
             )
         )
-        deck_utilidades.add_card(
+        deck_sistema.add_card(
             HeroCard(
                 title="ESTADO SISTEMA",
                 icon_name="CPU",
@@ -382,14 +400,14 @@ class REIApp:
                 on_select=lambda: self._trigger_task("diag_system")
             )
         )
-        deck_utilidades.add_card(
+        deck_sistema.add_card(
             HeroCard(
                 title="ACTUALIZACIONES",
                 icon_name="UPDATE",
                 submenu=deck_actualizaciones
             )
         )
-        deck_utilidades.add_card(
+        deck_sistema.add_card(
             HeroCard(
                 title="ALIMENTACION",
                 icon_name="POWER",
@@ -398,84 +416,47 @@ class REIApp:
         )
 
         # ----------------------------------------------------
-        # LEVEL 1: Sub-menus for SWITCHES / RED
-        # ----------------------------------------------------
-        view_serial_detail = self._create_detail_view("diag_cisco_serial", "CISCO SERIAL")
-        view_cisco_ssh_detail = self._create_detail_view("diag_cisco_ssh", "CISCO SSH")
-        view_snmp_detail = self._create_detail_view("diag_snmp_scan", "ESCANER SNMP")
-
-        deck_switches = HeroCardDeckView("SWITCHES / RED")
-        deck_switches.add_card(
-            HeroCard(
-                title="CISCO SERIAL",
-                icon_name="SERIAL",
-                submenu=view_serial_detail,
-                on_select=lambda: self._trigger_task("diag_cisco_serial")
-            )
-        )
-        deck_switches.add_card(
-            HeroCard(
-                title="CISCO SSH",
-                icon_name="SSH",
-                submenu=view_cisco_ssh_detail,
-                on_select=lambda: self._trigger_task("diag_cisco_ssh")
-            )
-        )
-        deck_switches.add_card(
-            HeroCard(
-                title="ESCANER SNMP",
-                icon_name="SNMP",
-                submenu=view_snmp_detail,
-                on_select=lambda: self._trigger_task("diag_snmp_scan")
-            )
-        )
-
-        # ----------------------------------------------------
-        # LEVEL 1: Sub-menus for ENDPOINTS PC
-        # ----------------------------------------------------
-        view_win_rndis_detail = self._create_detail_view("diag_win_rndis", "WINDOWS RNDIS")
-        view_linux_ssh_detail = self._create_detail_view("diag_linux_ssh", "LINUX SSH")
-
-        deck_endpoints = HeroCardDeckView("ENDPOINTS PC")
-        deck_endpoints.add_card(
-            HeroCard(
-                title="WINDOWS USB-RNDIS",
-                icon_name="WINDOWS",
-                submenu=view_win_rndis_detail,
-                on_select=lambda: self._trigger_task("diag_win_rndis")
-            )
-        )
-        deck_endpoints.add_card(
-            HeroCard(
-                title="LINUX SSH",
-                icon_name="LINUX",
-                submenu=view_linux_ssh_detail,
-                on_select=lambda: self._trigger_task("diag_linux_ssh")
-            )
-        )
-
-        # ----------------------------------------------------
-        # LEVEL 1: Sub-menu for BOVEDA / VAULT
-        # ----------------------------------------------------
-        view_vault_detail = self._create_detail_view("diag_vault", "BOVEDA / VAULT")
-
-        # ----------------------------------------------------
-        # LEVEL 0: MAIN ROOT DECK
+        # LEVEL 0: MAIN ROOT DECK (5 Hero Cards)
         # ----------------------------------------------------
         root_deck = HeroCardDeckView("MAIN")
-        root_deck.add_card(HeroCard(title="UTILIDADES", icon_name="TOOLS", submenu=deck_utilidades))
-        root_deck.add_card(HeroCard(title="SWITCHES / RED", icon_name="NETWORK", submenu=deck_switches))
-        root_deck.add_card(HeroCard(title="ENDPOINTS PC", icon_name="ENDPOINT", submenu=deck_endpoints))
         root_deck.add_card(
             HeroCard(
-                title="BOVEDA / VAULT",
-                icon_name="VAULT",
-                submenu=view_vault_detail,
-                on_select=lambda: self._trigger_task("diag_vault")
+                title="PC WINDOWS",
+                icon_name="PC_WINDOWS",
+                on_select=lambda: self._start_diagnostic_flow("diag_pc_windows", "PC WINDOWS")
+            )
+        )
+        root_deck.add_card(
+            HeroCard(
+                title="PC LINUX",
+                icon_name="PC_LINUX",
+                on_select=lambda: self._start_diagnostic_flow("diag_pc_linux", "PC LINUX")
+            )
+        )
+        root_deck.add_card(
+            HeroCard(
+                title="SWITCH / RED",
+                icon_name="SWITCH",
+                on_select=lambda: self._start_diagnostic_flow("diag_switch_serial", "SWITCH / RED")
+            )
+        )
+        root_deck.add_card(
+            HeroCard(
+                title="WI-FI / RED",
+                icon_name="WIFI",
+                submenu=deck_wifi
+            )
+        )
+        root_deck.add_card(
+            HeroCard(
+                title="SISTEMA / BATERIA",
+                icon_name="BATTERY",
+                submenu=deck_sistema
             )
         )
 
         self.screen_manager.set_root_view(root_deck)
+
 
     def _process_background_results(self) -> None:
         """Polls completed diagnostic tasks without blocking the UI loop."""

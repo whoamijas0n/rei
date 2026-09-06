@@ -16,6 +16,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from .input_handler import InputEvent
+from core.interfaces import Severity, DiagnosticResult
 
 logger = logging.getLogger("REI.UI.Display")
 
@@ -193,6 +194,16 @@ class IconRenderer:
     def _draw_LINUX(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
         """Linux Terminal / Tux icon."""
         IconRenderer._draw_SSH(draw, cx, cy)
+
+    @staticmethod
+    def _draw_PC_WINDOWS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WINDOWS icon."""
+        IconRenderer._draw_WINDOWS(draw, cx, cy)
+
+    @staticmethod
+    def _draw_PC_LINUX(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for LINUX icon."""
+        IconRenderer._draw_LINUX(draw, cx, cy)
 
     @staticmethod
     def _draw_TOOLS(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
@@ -658,7 +669,157 @@ class DetailCardView(BaseView):
         return ViewAction(ViewActionType.NONE)
 
 
+class DiagnosticResultView(BaseView):
+    """
+    Rich, scrollable diagnostic result view for 128x64 OLED.
+    Renders:
+    - Continuous perimeter frame: (1, 1) to (126, 62)
+    - Severity status badge at top (Y=3..14):
+      - SALUDABLE: Inverted/bordered pill [✓ SALUDABLE]
+      - ADVERTENCIA: [! ADVERTENCIA]
+      - CRÍTICO: Inverted box [✗ CRÍTICO]
+    - Short diagnostic (max 2 lines) at Y=16..33
+    - Horizontal divider line at Y=35
+    - Scrollable section at Y=38..58 (controlled by Joystick UP/DOWN)
+    - Micro scrollbar indicator on the right edge
+    - Controls:
+      - UP / DOWN: scrolls content
+      - KEY1 / PRESS / KEY3 / BACK: exits view (POP_VIEW)
+    """
+
+    def __init__(
+        self,
+        title: str,
+        result: Optional[DiagnosticResult] = None,
+        severity: Severity = Severity.SALUDABLE,
+        diagnostico_corto: str = "",
+        acciones: Optional[List[str]] = None,
+        detalles: Optional[List[str]] = None,
+        pop_to_root_on_exit: bool = False,
+    ):
+        super().__init__(title=title)
+        self.severity = severity
+        self.diagnostico_corto = diagnostico_corto
+        self.acciones = acciones or []
+        self.detalles = detalles or []
+        self.pop_to_root_on_exit = pop_to_root_on_exit
+        self.scroll_offset: int = 0
+        self._scrollable_lines: List[str] = []
+
+        if result:
+            self.set_from_diagnostic_result(result)
+        else:
+            self._rebuild_scroll_lines()
+
+    def set_from_diagnostic_result(self, result: DiagnosticResult) -> None:
+        """Configures view directly from a DiagnosticResult instance."""
+        if result.ai_analysis:
+            self.severity = result.ai_analysis.estado
+            self.diagnostico_corto = result.ai_analysis.diagnostico_corto
+            self.acciones = result.ai_analysis.acciones_recomendadas
+        else:
+            self.severity = result.severity
+            self.diagnostico_corto = result.summary
+            self.acciones = []
+
+        self.detalles = result.details
+        self.scroll_offset = 0
+        self._rebuild_scroll_lines()
+
+    def _rebuild_scroll_lines(self) -> None:
+        lines: List[str] = []
+        if self.acciones:
+            lines.append("ACCIONES:")
+            for i, act in enumerate(self.acciones, 1):
+                clean_act = act.strip()
+                lines.append(f"{i}. {clean_act[:18]}")
+                if len(clean_act) > 18:
+                    lines.append(f"   {clean_act[18:36]}")
+        if self.detalles:
+            lines.append("TELEMETRIA:")
+            for det in self.detalles:
+                clean_det = det.strip()
+                lines.append(clean_det[:20])
+                if len(clean_det) > 20:
+                    lines.append(f" {clean_det[20:40]}")
+        self._scrollable_lines = lines
+
+    def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
+        # 1. Borde perimetral continuo
+        self.draw_perimeter_border(draw)
+
+        # 2. Header Badge (Y: 3 to 14)
+        badge_text = self.severity.value.upper()
+        if self.severity == Severity.CRITICO:
+            badge_str = f" [!] {badge_text} "
+            bw = self.get_text_width(draw, badge_str)
+            bx = (width - bw) // 2
+            draw.rectangle((bx - 2, 3, bx + bw + 2, 14), fill="white")
+            draw.text((bx, 3), badge_str, font=self.font, fill="black")
+        elif self.severity == Severity.ADVERTENCIA:
+            badge_str = f" [!] {badge_text} "
+            bw = self.get_text_width(draw, badge_str)
+            bx = (width - bw) // 2
+            draw.rectangle((bx - 2, 3, bx + bw + 2, 14), outline="white", fill="black")
+            draw.text((bx, 3), badge_str, font=self.font, fill="white")
+        else:
+            badge_str = f" [OK] {badge_text} "
+            bw = self.get_text_width(draw, badge_str)
+            bx = (width - bw) // 2
+            draw.rectangle((bx - 2, 3, bx + bw + 2, 14), outline="white", fill="black")
+            draw.text((bx, 3), badge_str, font=self.font, fill="white")
+
+        # 3. Diagnostico Corto (2 lines at Y=16, 25)
+        diag_lines = self.diagnostico_corto.split("\n")
+        line1 = diag_lines[0][:21] if len(diag_lines) > 0 else ""
+        line2 = diag_lines[1][:21] if len(diag_lines) > 1 else ""
+        draw.text((6, 16), line1, font=self.font, fill="white")
+        if line2:
+            draw.text((6, 25), line2, font=self.font, fill="white")
+
+        # 4. Divider Line at Y=35
+        draw.line((4, 35, 123, 35), fill="white")
+
+        # 5. Scrollable content (Y=38, 48) - 2 visible lines
+        y = 38
+        visible = self._scrollable_lines[self.scroll_offset : self.scroll_offset + 2]
+        if not visible:
+            draw.text((6, y), "Presione KEY3 para salir", font=self.font, fill="white")
+        else:
+            for line in visible:
+                draw.text((6, y), line[:20], font=self.font, fill="white")
+                y += 10
+
+        # 6. Scrollbar indicator on right edge (X=124..125)
+        total_lines = len(self._scrollable_lines)
+        if total_lines > 2:
+            bar_top = 37
+            bar_height = 23
+            thumb_h = max(4, int(bar_height * (2 / total_lines)))
+            max_scroll = total_lines - 2
+            thumb_y = bar_top + int((self.scroll_offset / max_scroll) * (bar_height - thumb_h))
+            draw.rectangle((124, thumb_y, 125, thumb_y + thumb_h), fill="white")
+
+    def handle_input(self, event: InputEvent) -> ViewAction:
+        total_lines = len(self._scrollable_lines)
+        max_scroll = max(0, total_lines - 2)
+
+        if event == InputEvent.UP:
+            self.scroll_offset = max(0, self.scroll_offset - 1)
+            return ViewAction(ViewActionType.NONE)
+        elif event == InputEvent.DOWN:
+            self.scroll_offset = min(max_scroll, self.scroll_offset + 1)
+            return ViewAction(ViewActionType.NONE)
+        elif event in (InputEvent.KEY3, InputEvent.BACK, InputEvent.KEY1, InputEvent.PRESS):
+            if self.pop_to_root_on_exit:
+                return ViewAction(ViewActionType.POP_TO_ROOT)
+            return ViewAction(ViewActionType.POP_VIEW)
+
+        return ViewAction(ViewActionType.NONE)
+
+
 class UpdateProgressView(BaseView):
+
     """
     Pantalla de progreso bloqueante para actualizaciones de Sistema (APT) o Programa (Git).
     Muestra barra de progreso y fases en tiempo real a 30 FPS en pantalla OLED 128x64.
