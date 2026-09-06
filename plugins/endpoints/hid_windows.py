@@ -184,6 +184,9 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
             server_url=self._server_url,
         )
 
+        # Capture watermark before HID typing to eliminate race conditions
+        watermark = self._web_server.get_report_watermark() if self._web_server else 0
+
         # Step 2: Inject via USB HID
         if progress_cb:
             progress_cb("Inyectando HID...", 0.3)
@@ -227,7 +230,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
 
         report = None
         if self._web_server:
-            report = self._web_server.wait_for_report(timeout_seconds=self._timeout_seconds)
+            report = self._web_server.wait_for_report(watermark=watermark, timeout_seconds=self._timeout_seconds)
 
         # If in dry-run or simulated without receiving report
         if not report:

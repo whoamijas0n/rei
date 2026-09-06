@@ -70,10 +70,62 @@ class TestWebServer(unittest.TestCase):
             "action_plan": ["Ninguna"],
         }
         self.server.attach_ai_analysis(rep_id, ai_data, overall_status="OK")
-
         report = self.server.get_latest_report()
         self.assertIsNotNone(report)
         self.assertEqual(report.ai_analysis, ai_data)
+
+    def test_short_report_endpoint(self):
+        """Verify /r/{report_id} returns HTML report identically to /report/{report_id}."""
+        rep_id = self.server.store_local_report(
+            os_type="LINUX",
+            category="GENERAL",
+            hostname="test-short",
+            telemetry={"ip": "10.0.0.99"},
+        )
+        resp = requests.get(f"http://127.0.0.1:8899/r/{rep_id}", timeout=3)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("REI DIAGNOSTICS", resp.text)
+        self.assertIn("test-short", resp.text)
+
+    def test_wait_for_report_with_watermark_arrived_early(self):
+        """Verify report arriving BEFORE wait_for_report() is called is captured immediately."""
+        watermark = self.server.get_report_watermark()
+
+        # Simulate host sending report while typing is occurring
+        payload = {
+            "os_type": "linux",
+            "category": "COMPLETO",
+            "hostname": "early-arrived-host",
+            "telemetry": {"cpu_percent": 10.0},
+        }
+        post_resp = requests.post("http://127.0.0.1:8899/api/v1/endpoint/report", json=payload, timeout=3)
+        self.assertEqual(post_resp.status_code, 200)
+
+        # wait_for_report called AFTER report has already arrived
+        start = time.monotonic()
+        report = self.server.wait_for_report(watermark=watermark, timeout_seconds=5.0)
+        elapsed = time.monotonic() - start
+
+        self.assertIsNotNone(report)
+        self.assertEqual(report.hostname, "early-arrived-host")
+        # Must return immediately without waiting for timeout
+        self.assertLess(elapsed, 1.0)
+
+    def test_multiple_sequential_reports(self):
+        """Verify multiple sequential diagnostic executions each get their unique report."""
+        for i in range(3):
+            watermark = self.server.get_report_watermark()
+            host = f"host-seq-{i}"
+            payload = {
+                "os_type": "linux",
+                "category": "TEST",
+                "hostname": host,
+                "telemetry": {"run": i},
+            }
+            requests.post("http://127.0.0.1:8899/api/v1/endpoint/report", json=payload, timeout=3)
+            report = self.server.wait_for_report(watermark=watermark, timeout_seconds=5.0)
+            self.assertIsNotNone(report)
+            self.assertEqual(report.hostname, host)
 
 
 if __name__ == "__main__":

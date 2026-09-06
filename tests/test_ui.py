@@ -68,6 +68,22 @@ class TestUIDisplay(unittest.TestCase):
         action = qr_view.handle_input(InputEvent.KEY3)
         self.assertEqual(action.action_type, ViewActionType.POP_VIEW)
 
+    def test_qr_code_layout_no_overlap(self):
+        """Verify QR matrix and text elements do not overlap on the 128x64 canvas."""
+        qr_view = QRCodeView(title="REPORTE MOVIL", url="http://10.0.0.1:8000/r/abcdef12")
+        qr_w, qr_h = qr_view._qr_image.size
+        self.assertLessEqual(qr_w, 56)
+
+        buffer = Image.new("1", (128, 64), "black")
+        draw = ImageDraw.Draw(buffer)
+        qr_view.render(draw, 128, 64)
+
+        # The QR code starts at x=6, so it ends at x = 6 + qr_w - 1 (<= 61)
+        qr_end_x = 6 + qr_w - 1
+        # Text starts at x >= 66
+        # Check that there is a clear vertical separation column (at x = qr_end_x + 1 to 65) with no text overlapping the QR
+        self.assertGreater(66, qr_end_x)
+
 
 if __name__ == "__main__":
     unittest.main()

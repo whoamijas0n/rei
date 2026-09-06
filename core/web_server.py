@@ -70,7 +70,9 @@ class REIWebServer:
         self.base_url = base_url.rstrip("/")
         self._reports: Dict[str, StoredReport] = {}
         self._latest_report_id: Optional[str] = None
+        self._report_counter: int = 0
         self._lock = threading.Lock()
+        self._report_condition = threading.Condition(self._lock)
         self._new_report_event = threading.Event()
         self._server_thread: Optional[threading.Thread] = None
         self._http_server: Optional[HTTPServer] = None
@@ -125,10 +127,12 @@ class REIWebServer:
             with self._lock:
                 self._reports[report_id] = stored
                 self._latest_report_id = report_id
+                self._report_counter += 1
                 self._new_report_event.set()
+                self._report_condition.notify_all()
 
             logger.info(f"Received endpoint report {report_id} from {stored.hostname} ({stored.os_type})")
-            return {"status": "success", "report_id": report_id, "url": f"{self.base_url}/report/{report_id}"}
+            return {"status": "success", "report_id": report_id, "url": f"{self.base_url}/r/{report_id}"}
 
         @self.app.get("/api/v1/report/{report_id}")
         def get_report_json(report_id: str):
@@ -140,6 +144,7 @@ class REIWebServer:
             return report.to_dict()
 
         @self.app.get("/report/{report_id}", response_class=HTMLResponse)
+        @self.app.get("/r/{report_id}", response_class=HTMLResponse)
         def view_html_report(report_id: str):
             target_id = self._latest_report_id if report_id == "latest" else report_id
             with self._lock:
@@ -322,8 +327,27 @@ class REIWebServer:
         with self._lock:
             self._reports[report_id] = stored
             self._latest_report_id = report_id
+            self._report_counter += 1
+            self._new_report_event.set()
+            self._report_condition.notify_all()
 
         return report_id
+
+    def get_report_watermark(self) -> int:
+        """Returns the current report counter for race-free synchronization."""
+        with self._lock:
+            return self._report_counter
+
+    def get_latest_report_id(self) -> Optional[str]:
+        """Returns latest report ID, if any."""
+        with self._lock:
+            return self._latest_report_id
+
+    def get_report(self, report_id: str) -> Optional[StoredReport]:
+        """Returns stored report by ID, or latest if 'latest'."""
+        with self._lock:
+            target_id = self._latest_report_id if report_id == "latest" else report_id
+            return self._reports.get(target_id or "")
 
     def get_latest_report(self) -> Optional[StoredReport]:
         """Returns the most recent stored report."""
@@ -333,20 +357,39 @@ class REIWebServer:
             return None
 
     def get_report_url(self, report_id: Optional[str] = None) -> str:
-        """Returns full URL for QR code encoding."""
+        """Returns compact URL for QR code encoding (fits Version 2 QR matrix)."""
         target_id = report_id or self._latest_report_id or "latest"
-        return f"{self.base_url}/report/{target_id}"
+        return f"{self.base_url}/r/{target_id}"
 
-    def wait_for_report(self, timeout_seconds: float = 30.0) -> Optional[StoredReport]:
+    def wait_for_report(
+        self,
+        watermark: Optional[int] = None,
+        timeout_seconds: float = 30.0,
+    ) -> Optional[StoredReport]:
         """
         Blocks worker thread until a new endpoint report arrives or timeout expires.
-        Does not block UI thread when invoked from DiagnosticManager worker.
+        Immune to race conditions where reports arrive while HID typing is in progress.
         """
-        self._new_report_event.clear()
-        signaled = self._new_report_event.wait(timeout=timeout_seconds)
-        if signaled:
-            return self.get_latest_report()
-        return None
+        deadline = time.monotonic() + timeout_seconds
+
+        with self._lock:
+            # Target watermark: if specified, wait until counter exceeds it.
+            # If not specified, wait until counter exceeds the value at call time.
+            target_watermark = watermark if watermark is not None else self._report_counter
+
+            # If report already arrived while injecting/typing, return immediately!
+            if self._report_counter > target_watermark and self._latest_report_id:
+                return self._reports.get(self._latest_report_id)
+
+            while self._report_counter <= target_watermark:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._report_condition.wait(timeout=remaining)
+
+            if self._latest_report_id:
+                return self._reports.get(self._latest_report_id)
+            return None
 
     def start(self) -> None:
         """Launches the server in a non-blocking background daemon thread."""
@@ -438,7 +481,7 @@ class REIWebServer:
                         else:
                             self.send_response(404)
                             self.end_headers()
-                    elif parsed_path.startswith("/report/"):
+                    elif parsed_path.startswith("/report/") or parsed_path.startswith("/r/"):
                         rep_id = parsed_path.split("/")[-1]
                         target_id = outer._latest_report_id if rep_id == "latest" else rep_id
                         with outer._lock:
@@ -472,9 +515,11 @@ class REIWebServer:
                         with outer._lock:
                             outer._reports[report_id] = stored
                             outer._latest_report_id = report_id
+                            outer._report_counter += 1
                             outer._new_report_event.set()
+                            outer._report_condition.notify_all()
 
-                        resp = json.dumps({"status": "success", "report_id": report_id, "url": f"{outer.base_url}/report/{report_id}"})
+                        resp = json.dumps({"status": "success", "report_id": report_id, "url": f"{outer.base_url}/r/{report_id}"})
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()

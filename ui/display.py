@@ -868,14 +868,14 @@ class UpdateProgressView(BaseView):
 class QRCodeView(BaseView):
     """
     Renders a high-density 1-bit QR code on the SH1106 OLED (128x64 px).
-    Left (x=5..55): QR code matrix for mobile smartphone scanning.
-    Right (x=58..124): Descriptive text, URL details, and exit instruction.
+    Left (x=6..59): QR code matrix for mobile smartphone scanning (zero overlap).
+    Right (x=66..124): Descriptive text, URL details, and exit instruction.
     """
 
     def __init__(
         self,
         title: str = "REPORTE QR",
-        url: str = "http://10.0.0.1:8000/report/latest",
+        url: str = "http://10.0.0.1:8000/r/latest",
         subtitle: Optional[str] = None,
         on_exit: Optional[Callable[[], None]] = None,
     ):
@@ -891,14 +891,14 @@ class QRCodeView(BaseView):
         try:
             import qrcode
             qr = qrcode.QRCode(
-                version=1,
+                version=None,
                 error_correction=qrcode.constants.ERROR_CORRECT_L,
                 box_size=2,
                 border=1,
             )
             qr.add_data(self.url)
             qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white")
+            img = qr.make_image(fill_color="white", back_color="black")
             self._qr_image = img.convert("1")
         except Exception as ex:
             logger.error(f"Error generating QR code for '{self.url}': {ex}")
@@ -911,24 +911,26 @@ class QRCodeView(BaseView):
         if self._qr_image is not None:
             # 2. Render QR code centered vertically on the left
             qr_w, qr_h = self._qr_image.size
-            start_x = 5
-            start_y = max(2, (height - qr_h) // 2)
 
-            for qx in range(qr_w):
-                for qy in range(qr_h):
-                    # In qrcode output, 0 is data module (black on white), OLED is inverted
-                    if self._qr_image.getpixel((qx, qy)) == 0:
-                        draw.point((start_x + qx, start_y + qy), fill="white")
+            if qr_w <= 56 and qr_h <= 56:
+                start_x = 6
+                start_y = max(2, (height - qr_h) // 2)
+            else:
+                start_x = 2
+                start_y = max(1, (height - qr_h) // 2)
 
-            # 3. Text layout on right side
-            text_x = 58
+            # Draw QR bitmap using high-performance PIL bitmap blitting
+            draw.bitmap((start_x, start_y), self._qr_image, fill="white")
+
+            # 3. Text layout strictly on right side with guaranteed zero overlap
+            text_x = max(66, start_x + qr_w + 6)
             draw.text((text_x, 6), "REPORTE", font=self.font, fill="white")
-            draw.text((text_x, 18), "MOVIL QR", font=self.font, fill="white")
-            draw.line((text_x, 30, 122, 30), fill="white")
+            draw.text((text_x, 17), "MOVIL", font=self.font, fill="white")
+            draw.line((text_x, 28, 122, 28), fill="white")
 
             # URL / Host info
-            draw.text((text_x, 34), "10.0.0.1", font=self.font, fill="white")
-            draw.text((text_x, 48), "OK/KEY3:Fin", font=self.font, fill="white")
+            draw.text((text_x, 33), "10.0.0.1", font=self.font, fill="white")
+            draw.text((text_x, 47), "KEY3:FIN", font=self.font, fill="white")
 
         else:
             # Fallback if QR generation failed
