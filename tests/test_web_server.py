@@ -127,6 +127,38 @@ class TestWebServer(unittest.TestCase):
             self.assertIsNotNone(report)
             self.assertEqual(report.hostname, host)
 
+    def test_get_qr_url_dynamic_wifi(self):
+        """Verify get_qr_url uses Wi-Fi IP and 'WIFI' label when wlan0 has an active IP."""
+        with unittest.mock.patch("core.web_server.get_interface_ip") as mock_ip:
+            mock_ip.side_effect = lambda iface: "192.168.1.55" if iface == "wlan0" else None
+            url, label = self.server.get_qr_url("test1234")
+            self.assertEqual(url, f"http://192.168.1.55:{self.server.port}/r/test1234")
+            self.assertEqual(label, "WIFI")
+
+    def test_get_qr_url_fallback_usb(self):
+        """Verify get_qr_url falls back to USB base_url when wlan0 and eth0 are disconnected."""
+        with unittest.mock.patch("core.web_server.get_interface_ip", return_value=None):
+            url, label = self.server.get_qr_url("test1234")
+            self.assertEqual(url, f"{self.server.base_url}/r/test1234")
+            self.assertEqual(label, "USB")
+
+    def test_get_qr_url_force_usb(self):
+        """Verify get_qr_url with force_interface='usb' always returns USB gadget base_url."""
+        with unittest.mock.patch("core.web_server.get_interface_ip", return_value="192.168.1.55"):
+            url, label = self.server.get_qr_url("test1234", force_interface="usb")
+            self.assertEqual(url, f"{self.server.base_url}/r/test1234")
+            self.assertEqual(label, "USB")
+
+    def test_get_report_url_dynamic_flag(self):
+        """Verify get_report_url with dynamic=True resolves Wi-Fi IP, and with dynamic=False preserves base_url."""
+        with unittest.mock.patch("core.web_server.get_interface_ip") as mock_ip:
+            mock_ip.side_effect = lambda iface: "192.168.1.77" if iface == "wlan0" else None
+            dyn_url = self.server.get_report_url("rep1", dynamic=True)
+            self.assertIn("192.168.1.77", dyn_url)
+
+            static_url = self.server.get_report_url("rep1", dynamic=False)
+            self.assertEqual(static_url, f"{self.server.base_url}/r/rep1")
+
 
 if __name__ == "__main__":
     unittest.main()

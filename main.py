@@ -93,6 +93,7 @@ class REIApp:
             host=server_cfg.get("host", "0.0.0.0"),
             port=server_cfg.get("port", 8000),
             base_url=server_cfg.get("report_base_url", "http://10.0.0.1:8000"),
+            qr_preferred_interface=server_cfg.get("qr_preferred_interface", "wlan0"),
         )
         self.web_server.start()
 
@@ -333,12 +334,20 @@ class REIApp:
     def _display_qr_report(self, result: DiagnosticResult) -> None:
         """Pushes the QRCodeView to screen allowing the technician to scan with smartphone."""
         report_id = result.metadata.get("report_id", "latest")
-        report_url = self.web_server.get_report_url(report_id)
+        primary_url, primary_label = self.web_server.get_qr_url(report_id)
+        usb_url, _ = self.web_server.get_qr_url(report_id, force_interface="usb")
+
+        # If primary is already USB (no Wi-Fi/LAN), don't set alt_url
+        alt_url = usb_url if primary_url != usb_url else None
+        alt_label = "USB" if alt_url else None
 
         qr_view = QRCodeView(
             title="REPORTE MOVIL",
-            url=report_url,
+            url=primary_url,
             subtitle="Escanea con tu movil",
+            alt_url=alt_url,
+            net_label=primary_label,
+            alt_label=alt_label,
         )
         self.screen_manager.push_view(qr_view)
 

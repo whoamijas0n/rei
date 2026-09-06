@@ -12,6 +12,7 @@ from enum import Enum, auto
 import logging
 from typing import Callable, Dict, List, Optional, Tuple, Any
 import time
+import urllib.parse
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -868,8 +869,9 @@ class UpdateProgressView(BaseView):
 class QRCodeView(BaseView):
     """
     Renders a high-density 1-bit QR code on the SH1106 OLED (128x64 px).
-    Left (x=6..59): QR code matrix for mobile smartphone scanning (zero overlap).
-    Right (x=66..124): Descriptive text, URL details, and exit instruction.
+    Left (x=2..59): QR code matrix for mobile smartphone scanning (zero overlap).
+    Right (x=66..124): Descriptive text, URL details, network mode, and exit instruction.
+    Supports alternating between Wi-Fi and USB URLs via KEY2.
     """
 
     def __init__(
@@ -877,10 +879,16 @@ class QRCodeView(BaseView):
         title: str = "REPORTE QR",
         url: str = "http://10.0.0.1:8000/r/latest",
         subtitle: Optional[str] = None,
+        alt_url: Optional[str] = None,
+        net_label: Optional[str] = None,
+        alt_label: Optional[str] = None,
         on_exit: Optional[Callable[[], None]] = None,
     ):
         super().__init__(title=title)
         self.url = url
+        self.alt_url = alt_url
+        self.net_label = net_label
+        self.alt_label = alt_label
         self.subtitle = subtitle or "Escanea con tu movil"
         self.on_exit = on_exit
         self._qr_image: Optional[Image.Image] = None
@@ -923,14 +931,33 @@ class QRCodeView(BaseView):
             draw.bitmap((start_x, start_y), self._qr_image, fill="white")
 
             # 3. Text layout strictly on right side with guaranteed zero overlap
-            text_x = max(66, start_x + qr_w + 6)
-            draw.text((text_x, 6), "REPORTE", font=self.font, fill="white")
-            draw.text((text_x, 17), "MOVIL", font=self.font, fill="white")
-            draw.line((text_x, 28, 122, 28), fill="white")
+            text_x = max(66, start_x + qr_w + 4)
+            draw.text((text_x, 5), "REPORTE", font=self.font, fill="white")
+            draw.text((text_x, 15), "MOVIL", font=self.font, fill="white")
+            draw.line((text_x, 26, 122, 26), fill="white")
 
-            # URL / Host info
-            draw.text((text_x, 33), "10.0.0.1", font=self.font, fill="white")
-            draw.text((text_x, 47), "KEY3:FIN", font=self.font, fill="white")
+            # Dynamic network indicator
+            current_label = self.net_label
+            if not current_label:
+                host = urllib.parse.urlparse(self.url).hostname or ""
+                if host.startswith("10.0.0."):
+                    current_label = "USB PC"
+                elif host:
+                    current_label = "WIFI OK"
+                else:
+                    current_label = "NET"
+
+            draw.text((text_x, 29), current_label[:8], font=self.font, fill="white")
+
+            # Action / Toggle hint
+            if self.alt_url:
+                toggle_hint = f"K2:{self.alt_label or 'ALT'}"[:8]
+                draw.text((text_x, 39), toggle_hint, font=self.font, fill="white")
+            else:
+                host_str = (urllib.parse.urlparse(self.url).hostname or "10.0.0.1")[:8]
+                draw.text((text_x, 39), host_str, font=self.font, fill="white")
+
+            draw.text((text_x, 50), "KEY3:FIN", font=self.font, fill="white")
 
         else:
             # Fallback if QR generation failed
@@ -938,6 +965,13 @@ class QRCodeView(BaseView):
             self.draw_centered_text(draw, "KEY3: Salir", y=38, screen_width=width)
 
     def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
+        if event == InputEvent.KEY2 and self.alt_url:
+            # Toggle between primary and alternate URL
+            self.url, self.alt_url = self.alt_url, self.url
+            self.net_label, self.alt_label = self.alt_label, self.net_label
+            self._generate_qr()
+            return ViewAction(ViewActionType.NONE)
+
         if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK, InputEvent.KEY2):
             if self.on_exit:
                 self.on_exit()

@@ -18,6 +18,59 @@ from typing import Dict, List, Optional, Tuple, Any
 logger = logging.getLogger("REI.Core.WiFi")
 
 
+def get_interface_ip(interface: str = "wlan0") -> Optional[str]:
+    """
+    Reads active IPv4 address assigned to a specific network interface.
+    1. Supports simulation mode (REI_DRY_RUN=1 or REI_MOCK_WIFI=1).
+    2. Uses native POSIX fcntl.ioctl SIOCGIFADDR (efficient, zero-subprocess).
+    3. Falls back to `ip -4 addr show <interface>` via subprocess.
+    """
+    if os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_WIFI") == "1":
+        if interface.startswith("wlan"):
+            return "192.168.1.142"
+        elif interface.startswith("eth"):
+            return "192.168.1.150"
+        elif interface.startswith("usb"):
+            return "10.0.0.1"
+        return "192.168.1.142"
+
+    # 1. Direct Linux ioctl SIOCGIFADDR
+    try:
+        import fcntl
+        import struct
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ip_bytes = fcntl.ioctl(
+            s.fileno(),
+            0x8915,  # SIOCGIFADDR
+            struct.pack("256s", interface[:15].encode("utf-8"))
+        )[20:24]
+        ip = socket.inet_ntoa(ip_bytes)
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    # 2. Subprocess fallback: `ip -4 addr show <interface>`
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "addr", "show", interface],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("inet "):
+                    ip = line.split()[1].split("/")[0]
+                    if ip and not ip.startswith("127."):
+                        return ip
+    except Exception:
+        pass
+
+    return None
+
+
 @dataclass
 class WiFiNetwork:
     """Represents a discovered wireless access point."""
@@ -191,12 +244,11 @@ class WiFiManager:
 
     def _get_interface_ip(self) -> Optional[str]:
         """Reads IPv4 address of interface."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
-                return s.getsockname()[0]
-        except Exception:
-            return None
+        return get_interface_ip(self.interface)
+
+    def get_ip(self) -> Optional[str]:
+        """Public accessor for interface's active IPv4 address."""
+        return get_interface_ip(self.interface)
 
     def _sanitize_error(self, err_msg: str) -> str:
         """Converts long network errors to clear concise strings for OLED display."""

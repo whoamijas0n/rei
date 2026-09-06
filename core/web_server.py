@@ -13,9 +13,11 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import urllib.parse
 import uuid
+
+from core.wifi import get_interface_ip
 
 logger = logging.getLogger("REI.Core.WebServer")
 
@@ -64,10 +66,17 @@ class REIWebServer:
     Provides standard http.server fallback if FastAPI/Uvicorn is not yet installed.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8000, base_url: str = "http://10.0.0.1:8000"):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8000,
+        base_url: str = "http://10.0.0.1:8000",
+        qr_preferred_interface: str = "wlan0",
+    ):
         self.host = host
         self.port = port
         self.base_url = base_url.rstrip("/")
+        self.qr_preferred_interface = qr_preferred_interface
         self._reports: Dict[str, StoredReport] = {}
         self._latest_report_id: Optional[str] = None
         self._report_counter: int = 0
@@ -356,8 +365,56 @@ class REIWebServer:
                 return self._reports.get(self._latest_report_id)
             return None
 
-    def get_report_url(self, report_id: Optional[str] = None) -> str:
-        """Returns compact URL for QR code encoding (fits Version 2 QR matrix)."""
+    def get_active_ip(self, preferred_interface: Optional[str] = None) -> Optional[str]:
+        """
+        Attempts to detect the active IPv4 address on Wi-Fi (wlan0) or Ethernet (eth0).
+        Returns None if not connected to an external network.
+        """
+        iface = preferred_interface or self.qr_preferred_interface or "wlan0"
+        ip = get_interface_ip(iface)
+        if ip and not ip.startswith("127.") and not ip.startswith("10.0.0."):
+            return ip
+
+        # Fallback to eth0 if preferred was wlan0
+        if iface != "eth0":
+            eth_ip = get_interface_ip("eth0")
+            if eth_ip and not eth_ip.startswith("127.") and not eth_ip.startswith("10.0.0."):
+                return eth_ip
+
+        return None
+
+    def get_qr_url(
+        self,
+        report_id: Optional[str] = None,
+        force_interface: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        """
+        Returns (qr_url, interface_label) for mobile QR code presentation.
+        Dynamically detects active Wi-Fi (wlan0) or Ethernet (eth0) IP so smartphones
+        on the same network can access the report directly.
+        Falls back to base_url (usb0) if Wi-Fi is disconnected or force_interface='usb'.
+        """
+        target_id = report_id or self._latest_report_id or "latest"
+
+        if force_interface == "usb":
+            return f"{self.base_url}/r/{target_id}", "USB"
+
+        active_ip = self.get_active_ip(self.qr_preferred_interface)
+        if active_ip:
+            label = "WIFI" if self.qr_preferred_interface.startswith("wlan") else "NET"
+            return f"http://{active_ip}:{self.port}/r/{target_id}", label
+
+        # Fallback to USB gadget base_url
+        return f"{self.base_url}/r/{target_id}", "USB"
+
+    def get_report_url(self, report_id: Optional[str] = None, dynamic: bool = False) -> str:
+        """
+        Returns report URL. If dynamic=True, resolves dynamic Wi-Fi/Ethernet IP for smartphone QR scanning.
+        Otherwise, returns standard base_url (http://10.0.0.1:8000/r/...) for USB endpoint communication.
+        """
+        if dynamic:
+            url, _ = self.get_qr_url(report_id)
+            return url
         target_id = report_id or self._latest_report_id or "latest"
         return f"{self.base_url}/r/{target_id}"
 

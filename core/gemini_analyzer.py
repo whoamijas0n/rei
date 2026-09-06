@@ -35,10 +35,40 @@ class GeminiDiagnosticAnalyzer:
         self.api_key = api_key or self._load_api_key()
 
     def _load_api_key(self) -> Optional[str]:
-        """Loads API key from environment variable or settings.json."""
+        """Loads API key from environment variable, .env, settings.local.json or settings.json."""
         env_key = os.environ.get("GEMINI_API_KEY")
         if env_key and env_key.strip():
             return env_key.strip()
+
+        # Check .env in project root or current directory
+        possible_envs = [
+            os.path.join(os.path.dirname(os.path.abspath(self.config_path)), "..", ".env"),
+            os.path.join(os.getcwd(), ".env"),
+        ]
+        for dotenv_path in possible_envs:
+            if os.path.isfile(dotenv_path):
+                try:
+                    with open(dotenv_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith("GEMINI_API_KEY="):
+                                val = line.split("=", 1)[1].strip().strip('"\'')
+                                if val:
+                                    return val
+                except Exception as ex:
+                    logger.debug(f"Could not read .env from {dotenv_path}: {ex}")
+
+        # Check local settings override if present
+        local_cfg = os.path.join(os.path.dirname(self.config_path), "settings.local.json")
+        if os.path.isfile(local_cfg):
+            try:
+                with open(local_cfg, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    key = cfg.get("gemini", {}).get("api_key", "").strip()
+                    if key:
+                        return key
+            except Exception as ex:
+                logger.debug(f"Could not read API key from {local_cfg}: {ex}")
 
         if os.path.isfile(self.config_path):
             try:
