@@ -29,7 +29,9 @@ data/*.csv
 .env
 .env.*
 *.env
+config/settings.json
 config/settings.local.json
+settings.json
 
 # Herramientas de testing y cobertura
 .pytest_cache/

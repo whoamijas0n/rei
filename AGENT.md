@@ -41,7 +41,7 @@ Queda **estrictamente prohibido** el uso de librerías deprecadas, inestables o 
 * **Emulación USB HID & Ducky Payloads:**
   * ✅ **USAR:** Módulo nativo `/dev/hidg0` con tabla de mapeos de scancodes HID para teclados US e ISO Español (soporte de Dead Keys `~`, `^`, `´`, `` ` `` y modificadores Shift/AltGr).
 * **Análisis con Inteligencia Artificial:**
-  * ✅ **USAR:** `google-genai` (SDK oficial) o llamadas HTTP optimizadas a la API REST de Google Gemini (modelo `gemini-1.5-flash` / `gemini-2.0-flash` Free Tier) con timeout estricto de 10s.
+  * ✅ **USAR:** `google-genai` (SDK oficial) o llamadas HTTP optimizadas a la API REST de Google Gemini (modelo `gemini-2.0-flash` Free Tier) con timeout estricto de 10s.
 * **Consola de Red & SSH:**
   * ✅ **USAR:** `netmiko` (v4.3+) o `scrapli`. ❌ **PROHIBIDO:** `paramiko` crudo sin wrapper de paginación.
 * **Diagnóstico Windows Remoto (Fallback):**

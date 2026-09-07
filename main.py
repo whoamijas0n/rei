@@ -99,7 +99,12 @@ class REIApp:
 
         self.usb_manager = USBModeManager()
         self.ducky_injector = DuckyInjector()
-        self.gemini_analyzer = GeminiDiagnosticAnalyzer()
+        gemini_cfg = self.settings.get("gemini", {})
+        self.gemini_analyzer = GeminiDiagnosticAnalyzer(
+            api_key=gemini_cfg.get("api_key"),
+            model=gemini_cfg.get("model"),
+            timeout_seconds=gemini_cfg.get("timeout_seconds"),
+        )
 
         # 4. Register Diagnostic Plugins
         self._register_plugins()
@@ -116,14 +121,20 @@ class REIApp:
         signal.signal(signal.SIGTERM, self._handle_signal)
 
     def _load_settings(self) -> dict:
-        """Loads configuration from config/settings.json."""
-        config_path = "config/settings.json"
-        if os.path.isfile(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as ex:
-                logger.warning(f"Error loading settings from {config_path}: {ex}")
+        """Loads configuration from config/settings.json or project root."""
+        possible_paths = [
+            "config/settings.json",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "settings.json"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json"),
+            "settings.json",
+        ]
+        for config_path in possible_paths:
+            if os.path.isfile(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception as ex:
+                    logger.warning(f"Error loading settings from {config_path}: {ex}")
         return {}
 
     def _register_plugins(self) -> None:
