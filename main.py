@@ -357,9 +357,14 @@ class REIApp:
 
     def _switch_usb_mode(self, target_mode: USBMode) -> None:
         """Switches USB controller profile, displays status and automatically reboots."""
-        title = "MODO NORMAL" if target_mode == USBMode.NORMAL else "MODO TECLADO"
+        if target_mode == USBMode.NORMAL:
+            title = "MODO NORMAL"
+        elif target_mode == USBMode.HID_WINDOWS:
+            title = "HID WINDOWS"
+        else:
+            title = "HID LINUX"
         progress_view = UpdateProgressView(title=title)
-        progress_view.stage_message = "Aplicando modo USB..."
+        progress_view.stage_message = "Configurando Gadget Universal..."
         progress_view.progress = 0.3
         self.screen_manager.push_view(progress_view)
 
@@ -371,7 +376,7 @@ class REIApp:
                 progress_view.set_completed(
                     success=True,
                     summary="Reiniciando...",
-                    details=["Modo USB aplicado", "Reiniciando sistema..."],
+                    details=["Gadget Universal OK", "Reiniciando sistema..."],
                 )
                 time.sleep(2.0)
                 execute_system_reboot()
@@ -542,9 +547,16 @@ class REIApp:
         )
         deck_usb_modes.add_card(
             HeroCard(
-                title="MODO TECLADO HID",
+                title="TECLADO HID LINUX",
                 icon_name="USB_GADGET",
-                on_select=lambda: self._switch_usb_mode(USBMode.HID_KEYBOARD),
+                on_select=lambda: self._switch_usb_mode(USBMode.HID_LINUX),
+            )
+        )
+        deck_usb_modes.add_card(
+            HeroCard(
+                title="TECLADO HID WIN",
+                icon_name="USB_GADGET",
+                on_select=lambda: self._switch_usb_mode(USBMode.HID_WINDOWS),
             )
         )
 

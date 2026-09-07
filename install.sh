@@ -261,40 +261,62 @@ EOF
 
     mkdir -p /etc/dnsmasq.d
     cat > "/etc/dnsmasq.d/rei-usb.conf" << 'EOF'
+port=0
 interface=usb0
-bind-interfaces
-except-interface=lo
+bind-dynamic
+dhcp-authoritative
 except-interface=wlan0
 except-interface=eth0
-listen-address=10.0.0.1
-dhcp-range=usb0,10.0.0.2,10.0.0.10,255.255.255.0,12h
+dhcp-range=10.0.0.2,10.0.0.10,255.255.255.0,12h
 # CRÍTICO: dhcp-option=3 vacío evita que el host tome a la Raspberry como gateway de Internet
 dhcp-option=3
-dhcp-option=6,10.0.0.1
+# CRÍTICO: dhcp-option=6 vacío evita redirigir consultas DNS del host a la Pi
+dhcp-option=6
 EOF
     if [ -f "/etc/dnsmasq.conf" ]; then
         sed -i 's|^#conf-dir=/etc/dnsmasq.d/,\*\.conf|conf-dir=/etc/dnsmasq.d/,*.conf|' /etc/dnsmasq.conf 2>/dev/null || true
     fi
-    print_status "info" "Configuración aislada de dnsmasq para usb0 establecida."
+    systemctl unmask dnsmasq >/dev/null 2>&1 || true
+    systemctl enable dnsmasq >/dev/null 2>&1 || true
+    systemctl restart dnsmasq >/dev/null 2>&1 || true
+    print_status "info" "Configuración aislada de dnsmasq para usb0 establecida y servicio habilitado."
 
     # 3.2 Creación del Script de Gadget Compuesto (/usr/local/bin/usb_gadget.sh)
     cat > "/usr/local/bin/usb_gadget.sh" << 'EOF'
 #!/bin/bash
+# REI_MODE=MODO_TECLADO_HID_LINUX
 modprobe libcomposite 2>/dev/null || true
 cd /sys/kernel/config/usb_gadget/ 2>/dev/null || exit 0
 
+# Limpieza rigurosa de ConfigFS en caliente
 for dir in /sys/kernel/config/usb_gadget/*; do
     if [ -d "$dir" ]; then
         echo "" > "$dir/UDC" 2>/dev/null || true
         sleep 0.1
-        rm -rf "$dir" 2>/dev/null || true
+        rm -f "$dir"/os_desc/* 2>/dev/null || true
+        rm -f "$dir"/configs/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/*/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/*/* 2>/dev/null || true
+        rmdir "$dir"/functions/* 2>/dev/null || true
+        rmdir "$dir"/configs/*/strings/* 2>/dev/null || true
+        rmdir "$dir"/configs/* 2>/dev/null || true
+        rmdir "$dir"/strings/* 2>/dev/null || true
+        rmdir "$dir" 2>/dev/null || true
     fi
 done
 
 if [ -d rei ]; then
     echo "" > rei/UDC 2>/dev/null || true
     sleep 0.1
-    rm -rf rei 2>/dev/null || true
+    rm -f rei/os_desc/* 2>/dev/null || true
+    rm -f rei/configs/*/* 2>/dev/null || true
+    rmdir rei/functions/*/*/* 2>/dev/null || true
+    rmdir rei/functions/*/* 2>/dev/null || true
+    rmdir rei/functions/* 2>/dev/null || true
+    rmdir rei/configs/*/strings/* 2>/dev/null || true
+    rmdir rei/configs/* 2>/dev/null || true
+    rmdir rei/strings/* 2>/dev/null || true
+    rmdir rei 2>/dev/null || true
 fi
 
 mkdir -p rei
@@ -302,10 +324,10 @@ cd rei || exit 1
 
 echo 0x1d6b > idVendor
 echo 0x0104 > idProduct
-echo 0x0100 > bcdDevice
+echo 0x0102 > bcdDevice
 echo 0x0200 > bcdUSB
 
-# Declarar clase compuesta IAD (Interface Association Descriptor)
+# Declarar clase compuesta IAD (Interface Association Descriptor) para usbccgp
 echo 0xEF > bDeviceClass
 echo 0x02 > bDeviceSubClass
 echo 0x01 > bDeviceProtocol
@@ -313,13 +335,30 @@ echo 0x01 > bDeviceProtocol
 mkdir -p strings/0x409
 echo "fedcba9876543210" > strings/0x409/serialnumber
 echo "REI" > strings/0x409/manufacturer
-echo "REI Diagnostic Hub (HID+Net)" > strings/0x409/product
+echo "REI Diagnostic Hub" > strings/0x409/product
 
 mkdir -p configs/c.1/strings/0x409
 echo "Config 1" > configs/c.1/strings/0x409/configuration
 echo 250 > configs/c.1/MaxPower
 
-# 1. Teclado HID (/dev/hidg0)
+# Habilitar descriptores de sistema operativo de Microsoft (MS OS 1.0)
+echo 1 > os_desc/use 2>/dev/null || true
+echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
+echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
+
+# 1. RNDIS (Windows / Linux) - ENLAZADA PRIMERO (Interfaz 0 y 1)
+mkdir -p functions/rndis.usb0 2>/dev/null || true
+if [ -d functions/rndis.usb0 ]; then
+    echo "02:11:22:33:44:57" > functions/rndis.usb0/host_addr 2>/dev/null || true
+    echo "02:11:22:33:44:58" > functions/rndis.usb0/dev_addr 2>/dev/null || true
+    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
+    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
+    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
+    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
+    ln -s configs/c.1 os_desc 2>/dev/null || ln -s ../configs/c.1 os_desc/c.1 2>/dev/null || true
+fi
+
+# 2. Teclado HID (/dev/hidg0) - ENLAZADA SEGUNDO (Interfaz 2)
 mkdir -p functions/hid.usb0
 echo 1 > functions/hid.usb0/protocol
 echo 1 > functions/hid.usb0/subclass
@@ -327,27 +366,6 @@ echo 8 > functions/hid.usb0/report_length
 # Inyectar descriptor estándar de teclado de 63 bytes en Base64 para evitar truncamiento por bytes nulos
 echo "BQEJBqEBBQcZ4CnnFQAlAXUBlQiBApUBdQiBA5UFdQEFCBkBKQWRApUBdQORA5UGdQgVACVlBQcZACllgQDA" | base64 -d > functions/hid.usb0/report_desc
 ln -s functions/hid.usb0 configs/c.1/ 2>/dev/null || true
-
-# 2. RNDIS (Windows)
-mkdir -p functions/rndis.usb0 2>/dev/null || true
-if [ -d functions/rndis.usb0 ]; then
-    echo 1 > os_desc/use 2>/dev/null || true
-    echo 0xcd > os_desc/b_vendor_code 2>/dev/null || true
-    echo MSFT100 > os_desc/qw_sign 2>/dev/null || true
-    mkdir -p functions/rndis.usb0/os_desc/interface.rndis 2>/dev/null || true
-    echo RNDIS > functions/rndis.usb0/os_desc/interface.rndis/compatible_id 2>/dev/null || true
-    echo 5162001 > functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id 2>/dev/null || true
-    ln -s functions/rndis.usb0 configs/c.1/ 2>/dev/null || true
-    ln -s configs/c.1 os_desc 2>/dev/null || true
-fi
-
-# 3. ECM (Linux/Mac)
-mkdir -p functions/ecm.usb0 2>/dev/null || true
-if [ -d functions/ecm.usb0 ]; then
-    echo "02:11:22:33:44:55" > functions/ecm.usb0/host_addr 2>/dev/null || true
-    echo "02:11:22:33:44:56" > functions/ecm.usb0/dev_addr 2>/dev/null || true
-    ln -s functions/ecm.usb0 configs/c.1/ 2>/dev/null || true
-fi
 
 UDC_DEV=$(ls /sys/class/udc 2>/dev/null | head -n 1)
 if [ -n "$UDC_DEV" ]; then
@@ -360,7 +378,13 @@ if ip -4 addr show wlan0 2>/dev/null | grep -q "inet 10.0.0."; then
     GADGET_IP="172.20.0.1"
 fi
 
-sleep 1
+for i in $(seq 1 6); do
+    if ip link show usb0 >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+
 if ip link show usb0 >/dev/null 2>&1; then
     ip link set usb0 up 2>/dev/null || true
     ip addr flush dev usb0 2>/dev/null || true
