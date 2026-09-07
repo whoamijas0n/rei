@@ -53,17 +53,38 @@ class LinuxPayloadGenerator:
 
         if cat == "RED":
             telemetry_sh = (
-                "ip=$(ip -4 addr show up 2>/dev/null | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
-                "gw=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
-                "ping_ok=$(ping -c 1 -W 2 \"$gw\" >/dev/null 2>&1 && echo true || echo false);"
-                "t=\"{\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"ping_gateway\\\":$ping_ok}\";"
+                "def_rt=$(ip -4 route show default 2>/dev/null | grep -v '10.0.0.' | head -n 1);"
+                "if [ -z \"$def_rt\" ]; then def_rt=$(ip -4 route show default 2>/dev/null | head -n 1); fi;"
+                "gw=$(echo \"$def_rt\" | awk '{for(i=1;i<=NF;i++) if($i==\"via\") print $(i+1); else if($i==\"default\" && $(i+1)!=\"dev\") print $3}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "iface=$(echo \"$def_rt\" | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "ip=$(ip -4 addr show dev \"$iface\" 2>/dev/null | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "if [ -z \"$ip\" ]; then ip=$(ip -4 addr show up 2>/dev/null | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n'); fi;"
+                "mac=$(cat /sys/class/net/$iface/address 2>/dev/null | tr -d '\"\\\\\\r\\n');"
+                "speed=$(cat /sys/class/net/$iface/speed 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "operstate=$(cat /sys/class/net/$iface/operstate 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'up');"
+                "carrier=$(cat /sys/class/net/$iface/carrier 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo '1');"
+                "mtu=$(cat /sys/class/net/$iface/mtu 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo '1500');"
+                "dns=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\\n' ',' | sed 's/,$//' | tr -d '\"\\\\\\r');"
+                "dns_ok=$(getent ahosts google.com >/dev/null 2>&1 && echo true || echo false);"
+                "http_code=$(curl -s -o /dev/null -w \"%{http_code}\" --max-time 2 http://connectivitycheck.gstatic.com/generate_204 2>/dev/null || echo 0);"
+                "captive=$( [ \"$http_code\" != \"204\" ] && [ \"$http_code\" != \"200\" ] && [ \"$http_code\" != \"0\" ] && echo true || echo false );"
+                "tcp_conns=$(ss -t state established 2>/dev/null | wc -l | tr -d ' ' || echo 0);"
+                "ping_gw=$( [ -n \"$gw\" ] && ping -c 2 -W 1 \"$gw\" >/dev/null 2>&1 && echo true || echo false );"
+                "ping_ext=$(ping -c 2 -W 1 8.8.8.8 >/dev/null 2>&1 && echo true || echo false );"
+                "gw_rtt=$( [ -n \"$gw\" ] && ping -c 2 -W 1 \"$gw\" 2>/dev/null | awk -F'/' '/rtt/ {print $5}' | tr -d '\"\\\\\\r\\n' || echo '0' );"
+                "hops=$(traceroute -n -q 1 -w 1 -m 4 8.8.8.8 2>/dev/null | awk 'NR>1 {print $1\":\"$2}' | tr '\\n' ';' | sed 's/;$//' | tr -d '\"\\\\\\r');"
+                "arp_gw=$( [ -n \"$gw\" ] && ip neigh show \"$gw\" 2>/dev/null | awk '{print $5}' | head -n 1 | tr -d '\"\\\\\\r\\n' || echo '' );"
+                "wifi_ssid=$(iwgetid -r 2>/dev/null || nmcli -t -f active,ssid dev wifi 2>/dev/null | grep -E '^(sí|yes):' | cut -d: -f2 | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "wifi_sig=$(nmcli -t -f in-use,signal dev wifi 2>/dev/null | grep '^\\*' | cut -d: -f2 | head -n 1 | tr -d '\"\\\\\\r\\n' || echo '');"
+                "osi=\"{\\\"l7_application\\\":{\\\"dns_servers\\\":\\\"$dns\\\",\\\"dns_ok\\\":$dns_ok,\\\"http_status\\\":$http_code,\\\"captive_portal\\\":$captive},\\\"l6_l5_session\\\":{\\\"active_tcp_conns\\\":${tcp_conns:-0}},\\\"l3_network\\\":{\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"ping_gateway\\\":$ping_gw,\\\"ping_internet\\\":$ping_ext,\\\"gateway_rtt_ms\\\":\\\"${gw_rtt:-0}\\\",\\\"mtu\\\":\\\"$mtu\\\",\\\"traceroute_hops\\\":\\\"$hops\\\"},\\\"l2_datalink\\\":{\\\"interface\\\":\\\"$iface\\\",\\\"mac\\\":\\\"$mac\\\",\\\"speed\\\":\\\"$speed\\\",\\\"gateway_arp\\\":\\\"$arp_gw\\\",\\\"wifi_ssid\\\":\\\"$wifi_ssid\\\",\\\"wifi_signal\\\":\\\"$wifi_sig\\\"},\\\"l1_physical\\\":{\\\"carrier\\\":\\\"$carrier\\\",\\\"operstate\\\":\\\"$operstate\\\"}}\";"
+                "t=\"{\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"mac\\\":\\\"$mac\\\",\\\"dns\\\":\\\"$dns\\\",\\\"ping_gateway\\\":$ping_gw,\\\"ping_internet\\\":$ping_ext,\\\"hardware\\\":$hw,\\\"osi_network\\\":$osi}\";"
             )
         elif cat == "HARDWARE":
             telemetry_sh = (
                 "cpu=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1 | tr -d '\"\\\\\\r\\n');"
                 "ram=$(free 2>/dev/null | grep Mem | awk '{printf(\"%.1f\", $3/$2 * 100.0)}' | tr -d '\"\\\\\\r\\n');"
                 "temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf(\"%.1f\", $1/1000)}' | tr -d '\"\\\\\\r\\n' || echo '0');"
-                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"cpu_temp_c\\\":${temp:-0}}\";"
+                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"cpu_temp_c\\\":${temp:-0},\\\"hardware\\\":$hw}\";"
             )
         elif cat == "MALWARE":
             telemetry_sh = (
@@ -82,15 +103,36 @@ class LinuxPayloadGenerator:
             telemetry_sh = (
                 "cpu=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1 | tr -d '\"\\\\\\r\\n');"
                 "ram=$(free 2>/dev/null | grep Mem | awk '{printf(\"%.1f\", $3/$2 * 100.0)}' | tr -d '\"\\\\\\r\\n');"
-                "ip=$(ip -4 addr show up 2>/dev/null | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
-                "gw=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
-                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\"}\";"
+                "def_rt=$(ip -4 route show default 2>/dev/null | grep -v '10.0.0.' | head -n 1);"
+                "if [ -z \"$def_rt\" ]; then def_rt=$(ip -4 route show default 2>/dev/null | head -n 1); fi;"
+                "gw=$(echo \"$def_rt\" | awk '{for(i=1;i<=NF;i++) if($i==\"via\") print $(i+1); else if($i==\"default\" && $(i+1)!=\"dev\") print $3}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "iface=$(echo \"$def_rt\" | awk '{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "ip=$(ip -4 addr show dev \"$iface\" 2>/dev/null | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n');"
+                "if [ -z \"$ip\" ]; then ip=$(ip -4 addr show up 2>/dev/null | grep -v '127.0.0.1' | grep inet | awk '{print $2}' | head -n 1 | tr -d '\"\\\\\\r\\n'); fi;"
+                "mac=$(cat /sys/class/net/$iface/address 2>/dev/null | tr -d '\"\\\\\\r\\n');"
+                "ping_gw=$( [ -n \"$gw\" ] && ping -c 2 -W 1 \"$gw\" >/dev/null 2>&1 && echo true || echo false );"
+                "osi=\"{\\\"l3_network\\\":{\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"ping_gateway\\\":$ping_gw},\\\"l2_datalink\\\":{\\\"interface\\\":\\\"$iface\\\",\\\"mac\\\":\\\"$mac\\\"}}\";"
+                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"ip\\\":\\\"$ip\\\",\\\"gateway\\\":\\\"$gw\\\",\\\"mac\\\":\\\"$mac\\\",\\\"ping_gateway\\\":$ping_gw,\\\"hardware\\\":$hw,\\\"osi_network\\\":$osi}\";"
             )
+
+        hw_sh = (
+            "mfr=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || cat /proc/cpuinfo 2>/dev/null | grep -m1 'Hardware' | cut -d: -f2 | xargs || echo 'Linux');"
+            "model=$(cat /sys/class/dmi/id/product_name 2>/dev/null || cat /proc/device-tree/model 2>/dev/null | tr -d '\\0' || echo 'Host');"
+            "serial=$(cat /sys/class/dmi/id/product_serial 2>/dev/null || echo 'N/A');"
+            "os_name=$(cat /etc/os-release 2>/dev/null | grep -m1 '^PRETTY_NAME=' | cut -d= -f2 | tr -d '\"\\\\\\r\\n' || echo 'Linux');"
+            "kernel=$(uname -r 2>/dev/null | tr -d '\"\\\\\\r\\n');"
+            "cpu_m=$(lscpu 2>/dev/null | grep 'Model name' | cut -d: -f2 | xargs || cat /proc/cpuinfo 2>/dev/null | grep -m1 'model name' | cut -d: -f2 | xargs || echo 'CPU');"
+            "ram_t=$(free -m 2>/dev/null | awk '/Mem:/ {printf(\"%.1f\", $2/1024)}' || echo '0');"
+            "ram_f=$(free -m 2>/dev/null | awk '/Mem:/ {printf(\"%.1f\", $7/1024)}' || echo '0');"
+            "hw=\"{\\\"manufacturer\\\":\\\"$mfr\\\",\\\"model\\\":\\\"$model\\\",\\\"serial\\\":\\\"$serial\\\",\\\"os_name\\\":\\\"$os_name\\\",\\\"kernel\\\":\\\"$kernel\\\",\\\"cpu_model\\\":\\\"$cpu_m\\\",\\\"ram_total_gb\\\":$ram_t,\\\"ram_free_gb\\\":$ram_f}\";"
+        )
 
         script = (
             f"hn=$(hostname 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'linux-client');"
+            f"{hw_sh}"
+            f"osi=\"{{}}\";"
             f"{telemetry_sh}"
-            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"telemetry\\\":$t}}\";"
+            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"hardware\\\":$hw,\\\"osi_network\\\":$osi,\\\"telemetry\\\":$t}}\";"
             f"curl -s -m 10 -X POST -H 'Content-Type: application/json' -d \"$p\" {endpoint_uri} >/dev/null 2>&1 || wget -q --timeout=10 --header='Content-Type: application/json' --post-data=\"$p\" -O- {endpoint_uri} >/dev/null 2>&1"
         )
         return script
@@ -233,11 +275,56 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     "os_type": "LINUX",
                     "category": self._category,
                     "hostname": "linux-client",
+                    "hardware": {
+                        "manufacturer": "Lenovo",
+                        "model": "ThinkPad T14 Gen 2",
+                        "serial": "PF2X9Y1Z",
+                        "os_name": "Ubuntu 22.04.4 LTS",
+                        "kernel": "5.15.0-105-generic",
+                        "cpu_model": "AMD Ryzen 5 PRO 5650U with Radeon Graphics",
+                        "ram_total_gb": 15.4,
+                        "ram_free_gb": 8.7,
+                    },
+                    "osi_network": {
+                        "l7_application": {
+                            "dns_servers": "192.168.1.1,1.1.1.1",
+                            "dns_ok": True,
+                            "http_status": 204,
+                            "captive_portal": False,
+                        },
+                        "l6_l5_session": {
+                            "active_tcp_conns": 18,
+                        },
+                        "l3_network": {
+                            "ip": "192.168.1.88/24",
+                            "gateway": "192.168.1.1",
+                            "ping_gateway": True,
+                            "ping_internet": True,
+                            "gateway_rtt_ms": "1.2",
+                            "mtu": "1500",
+                            "traceroute_hops": "1:192.168.1.1;2:10.10.0.1;3:8.8.8.8",
+                        },
+                        "l2_datalink": {
+                            "interface": "wlan0",
+                            "mac": "34:cf:f6:12:34:56",
+                            "speed": "N/A",
+                            "gateway_arp": "00:11:22:33:44:55",
+                            "wifi_ssid": "Corp_Lab_WiFi",
+                            "wifi_signal": "78",
+                        },
+                        "l1_physical": {
+                            "carrier": "1",
+                            "operstate": "up",
+                        },
+                    },
                     "telemetry": {
                         "cpu_percent": 12.4,
                         "ram_percent": 38.0,
-                        "ip": "10.0.0.3/24",
-                        "gateway": "10.0.0.1",
+                        "ip": "192.168.1.88/24",
+                        "gateway": "192.168.1.1",
+                        "mac": "34:cf:f6:12:34:56",
+                        "ping_gateway": True,
+                        "ping_internet": True,
                     },
                 }
                 rep_id = (
@@ -255,6 +342,8 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     "hostname": "linux-client",
                     "os_type": "LINUX",
                     "category": self._category,
+                    "hardware": report_data["hardware"],
+                    "osi_network": report_data["osi_network"],
                     "telemetry": report_data["telemetry"],
                     "overall_status": "OK",
                     "ai_analysis": None,
@@ -280,25 +369,56 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
             f"Cat:  {self._category[:14]}",
         ]
 
+        hw_data = getattr(report, "hardware", {}) or getattr(report, "telemetry", {}).get("hardware", {})
+        if hw_data:
+            mfr = hw_data.get("manufacturer") or ""
+            model = hw_data.get("model") or "PC"
+            hw_str = f"{mfr} {model}".strip()[:18]
+            metrics.append(DiagnosticMetric(name="Equipo", value=hw_str, status=Severity.INFO))
+            details.append(f"Eq:   {hw_str[:14]}")
+
+        osi_data = getattr(report, "osi_network", {}) or getattr(report, "telemetry", {}).get("osi_network", {})
         t_data = getattr(report, "telemetry", {})
+
         cpu = t_data.get("cpu_percent")
         if cpu is not None:
             c_val = f"{cpu}%"
             c_sev = Severity.CRITICAL if float(cpu) > 90 else (Severity.WARNING if float(cpu) > 75 else Severity.OK)
             metrics.append(DiagnosticMetric(name="Uso CPU", value=c_val, status=c_sev))
-            details.append(f"CPU:  {c_val}")
+            if len(details) < 4:
+                details.append(f"CPU:  {c_val}")
 
         ram = t_data.get("ram_percent")
         if ram is not None:
             r_val = f"{ram}%"
             r_sev = Severity.CRITICAL if float(ram) > 90 else Severity.OK
             metrics.append(DiagnosticMetric(name="Uso RAM", value=r_val, status=r_sev))
-            details.append(f"RAM:  {r_val}")
 
-        ip = t_data.get("ip")
-        if ip:
-            metrics.append(DiagnosticMetric(name="IP Host", value=str(ip)[:15], status=Severity.INFO))
-            details.append(f"IP:   {str(ip)[:14]}")
+        # Network OSI Metrics
+        l3 = osi_data.get("l3_network", {}) if isinstance(osi_data, dict) else {}
+        l7 = osi_data.get("l7_application", {}) if isinstance(osi_data, dict) else {}
+        l2 = osi_data.get("l2_datalink", {}) if isinstance(osi_data, dict) else {}
+
+        ip_val = l3.get("ip") or t_data.get("ip")
+        if ip_val:
+            metrics.append(DiagnosticMetric(name="IP Host", value=str(ip_val)[:15], status=Severity.INFO))
+            if len(details) < 4:
+                details.append(f"IP:   {str(ip_val)[:14]}")
+
+        gw_val = l3.get("gateway") or t_data.get("gateway")
+        gw_ping = l3.get("ping_gateway") if "ping_gateway" in l3 else t_data.get("ping_gateway")
+        if gw_val:
+            gw_status = Severity.OK if gw_ping else Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="Gateway", value=f"{gw_val} ({'OK' if gw_ping else 'FAIL'})", status=gw_status))
+
+        mac_val = l2.get("mac") or t_data.get("mac")
+        if mac_val:
+            metrics.append(DiagnosticMetric(name="MAC", value=str(mac_val), status=Severity.INFO))
+
+        dns_ok = l7.get("dns_ok")
+        if dns_ok is not None:
+            dns_status = Severity.OK if dns_ok else Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="DNS Status", value="Resuelto" if dns_ok else "Fallo", status=dns_status))
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
 

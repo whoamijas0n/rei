@@ -46,6 +46,46 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(res["overall_status"], "WARN")
         self.assertTrue(len(res["root_causes"]) >= 2)
 
+    def test_local_fallback_osi_apipa_and_gateway_failure(self):
+        """Verify fallback detects APIPA address and Gateway down."""
+        data = {
+            "os_type": "WINDOWS",
+            "category": "RED / CONEXION",
+            "telemetry": {"ip": "169.254.12.34", "ping_gateway": False},
+            "osi_network": {
+                "l3_network": {"ip": "169.254.12.34", "ping_gateway": False},
+            },
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("APIPA", causes_str)
+        self.assertIn("Gateway", causes_str)
+
+    def test_local_fallback_osi_dns_and_captive_portal(self):
+        """Verify fallback detects captive portal and DNS failure."""
+        data = {
+            "os_type": "LINUX",
+            "category": "RED / CONEXION",
+            "telemetry": {"ping_gateway": True, "ping_internet": True},
+            "osi_network": {
+                "l7_application": {"captive_portal": True, "dns_ok": False},
+                "l3_network": {"ping_gateway": True, "ping_internet": True},
+            },
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertIn(res["overall_status"], ("WARN", "CRIT"))
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("cautivo", causes_str)
+        self.assertIn("DNS", causes_str)
+
+    def test_build_analysis_prompt_includes_osi_directives(self):
+        """Verify the prompt explicitly instructs OSI Top-Down analysis."""
+        prompt = self.analyzer._build_analysis_prompt({"os_type": "WINDOWS", "category": "RED"})
+        self.assertIn("Modelo OSI", prompt)
+        self.assertIn("Capa 7 a Capa 1", prompt)
+        self.assertIn("Conecta los puntos", prompt)
+
     def test_json_parsing_with_code_fences(self):
         """Verify clean extraction of JSON enclosed in markdown code fences."""
         raw_llm = """```json

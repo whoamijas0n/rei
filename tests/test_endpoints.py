@@ -203,6 +203,88 @@ class TestEndpoints(unittest.TestCase):
         self.assertEqual(deserialized_linux["os_type"], "linux")
         self.assertTrue(deserialized_linux["telemetry"]["ping_gateway"])
 
+    def test_hardware_and_osi_telemetry_windows(self):
+        """Verify Windows script includes hardware and OSI Layer 7-1 extraction."""
+        raw_net = WindowsPayloadGenerator.get_powershell_script("RED / CONEXION")
+        self.assertIn("Win32_ComputerSystem", raw_net)
+        self.assertIn("Win32_BIOS", raw_net)
+        self.assertIn("Win32_OperatingSystem", raw_net)
+        self.assertIn("l7_application", raw_net)
+        self.assertIn("google.com", raw_net)
+        self.assertIn("msftconnecttest.com", raw_net)
+        self.assertIn("l4_transport", raw_net)
+        self.assertIn("l3_network", raw_net)
+        self.assertIn("tracert", raw_net)
+        self.assertIn("l2_datalink", raw_net)
+        self.assertIn("netsh wlan", raw_net)
+        self.assertIn("l1_physical", raw_net)
+
+        # Verify dry run plugin extracts hardware and OSI metrics
+        injector = DuckyInjector(dry_run=True)
+        plugin = WindowsHIDPlugin(category="RED / CONEXION", keyboard_layout="es", injector=injector)
+        result = plugin.run()
+        self.assertEqual(result.status, DiagnosticStatus.SUCCESS)
+        metric_names = [m.name for m in result.metrics]
+        self.assertIn("Equipo", metric_names)
+        self.assertIn("Gateway", metric_names)
+        self.assertIn("DNS Status", metric_names)
+
+    def test_hardware_and_osi_telemetry_linux(self):
+        """Verify Linux script includes hardware and OSI Layer 7-1 extraction."""
+        raw_net = LinuxPayloadGenerator.get_bash_script("RED / CONEXION")
+        self.assertIn("/sys/class/dmi/id", raw_net)
+        self.assertIn("/etc/os-release", raw_net)
+        self.assertIn("l7_application", raw_net)
+        self.assertIn("nameserver", raw_net)
+        self.assertIn("generate_204", raw_net)
+        self.assertIn("l3_network", raw_net)
+        self.assertIn("traceroute", raw_net)
+        self.assertIn("l2_datalink", raw_net)
+        self.assertIn("l1_physical", raw_net)
+
+        # Verify dry run plugin extracts hardware and OSI metrics
+        injector = DuckyInjector(dry_run=True)
+        plugin = LinuxHIDPlugin(category="RED / CONEXION", keyboard_layout="es", injector=injector)
+        result = plugin.run()
+        self.assertEqual(result.status, DiagnosticStatus.SUCCESS)
+        metric_names = [m.name for m in result.metrics]
+        self.assertIn("Equipo", metric_names)
+        self.assertIn("Gateway", metric_names)
+        self.assertIn("DNS Status", metric_names)
+
+    def test_mobile_html_renders_hardware_and_osi(self):
+        """Verify HTML report includes Hardware Identity and OSI diagnostic tables."""
+        server = REIWebServer(host="127.0.0.1", port=8993, base_url="http://127.0.0.1:8993")
+        rep_id = server.store_local_report(
+            os_type="WINDOWS",
+            category="RED",
+            hostname="PC-AUDIT",
+            telemetry={"ip": "192.168.1.50"},
+            hardware={
+                "manufacturer": "HP",
+                "model": "EliteBook 840 G8",
+                "serial": "5CG1234XYZ",
+                "os_name": "Microsoft Windows 11 Enterprise",
+            },
+            osi_network={
+                "l7_application": {"dns_ok": True, "dns_servers": ["192.168.1.1"]},
+                "l3_network": {"ip": "192.168.1.50", "gateway": "192.168.1.1", "ping_gateway": True},
+                "l2_datalink": {"adapter": "Wi-Fi 6", "mac": "00:11:22:33:44:55", "wifi": {"ssid": "CorpNet", "signal_pct": 90}},
+                "l1_physical": {"status": "Up"},
+            },
+        )
+        report = server.get_report(rep_id)
+        self.assertIsNotNone(report)
+        html_out = server._render_mobile_html(report)
+        self.assertIn("IDENTIDAD Y HARDWARE DEL HOST", html_out)
+        self.assertIn("EliteBook 840 G8", html_out)
+        self.assertIn("5CG1234XYZ", html_out)
+        self.assertIn("MODELO OSI", html_out)
+        self.assertIn("CAPA 7: APLICACIÓN", html_out)
+        self.assertIn("CAPA 3: RED", html_out)
+        self.assertIn("CAPA 2: ENLACE DE DATOS", html_out)
+        self.assertIn("CorpNet", html_out)
+
 
 if __name__ == "__main__":
     unittest.main()

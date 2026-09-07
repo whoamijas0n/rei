@@ -43,6 +43,8 @@ class StoredReport:
         self.hostname = data.get("hostname") or data.get("telemetry", {}).get("hostname", "Host Remoto")
         self.telemetry = data.get("telemetry", {})
         self.metrics = data.get("metrics", [])
+        self.hardware = data.get("hardware") or self.telemetry.get("hardware", {})
+        self.osi_network = data.get("osi_network") or self.telemetry.get("osi_network") or self.telemetry.get("osi", {})
         self.ai_analysis: Optional[Dict[str, Any]] = None
         self.overall_status = "OK"
 
@@ -54,6 +56,8 @@ class StoredReport:
             "category": self.category,
             "hostname": self.hostname,
             "overall_status": self.overall_status,
+            "hardware": self.hardware,
+            "osi_network": self.osi_network,
             "telemetry": self.telemetry,
             "metrics": self.metrics,
             "ai_analysis": self.ai_analysis,
@@ -168,7 +172,7 @@ class REIWebServer:
             return self._render_mobile_html(report)
 
     def _render_mobile_html(self, report: StoredReport) -> str:
-        """Renders mobile-optimized dark mode Cyberdeck HTML report."""
+        """Renders mobile-optimized dark mode Cyberdeck HTML report with Hardware & OSI Diagnostics."""
         dt_str = datetime.datetime.fromtimestamp(report.created_at).strftime("%Y-%m-%d %H:%M:%S")
 
         status_color = "#10b981"  # OK Green
@@ -177,7 +181,154 @@ class REIWebServer:
         elif report.overall_status in ("CRIT", "CRITICAL", "FAIL"):
             status_color = "#ef4444"
 
-        # AI section HTML
+        # 1. Hardware & Host Identity Card
+        hw = report.hardware or (report.telemetry.get("hardware") if isinstance(report.telemetry, dict) else {})
+        hw_html = ""
+        if hw and isinstance(hw, dict):
+            mfr = html.escape(str(hw.get("manufacturer") or hw.get("mfr") or "N/A"))
+            model = html.escape(str(hw.get("model") or "PC"))
+            serial = html.escape(str(hw.get("serial") or hw.get("serial_number") or "N/A"))
+            os_name = html.escape(str(hw.get("os_name") or hw.get("os") or report.os_type))
+            os_ver = html.escape(str(hw.get("os_version") or hw.get("ver") or hw.get("kernel") or hw.get("os_build") or ""))
+            cpu_m = html.escape(str(hw.get("cpu_model") or hw.get("cpu") or "N/A"))
+            ram_tot = hw.get("ram_total_gb") or hw.get("ram_gb") or "N/A"
+            ram_free = hw.get("ram_free_gb") or "N/A"
+
+            hw_html = f"""
+            <div class="card">
+                <div class="card-header">💻 IDENTIDAD Y HARDWARE DEL HOST</div>
+                <table>
+                    <tbody>
+                        <tr><td><strong>Equipo / Marca:</strong></td><td>{mfr} {model}</td></tr>
+                        <tr><td><strong>Número de Serie:</strong></td><td><code>{serial}</code></td></tr>
+                        <tr><td><strong>Sistema Operativo:</strong></td><td>{os_name} {os_ver}</td></tr>
+                        <tr><td><strong>Procesador (CPU):</strong></td><td>{cpu_m}</td></tr>
+                        <tr><td><strong>Memoria RAM:</strong></td><td>{ram_tot} GB total ({ram_free} GB libre)</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            """
+
+        # 2. OSI Stack Network Diagnostics
+        osi = report.osi_network or (report.telemetry.get("osi_network") or report.telemetry.get("osi", {}) if isinstance(report.telemetry, dict) else {})
+        osi_html = ""
+        if osi and isinstance(osi, dict):
+            l7 = osi.get("l7_application", {}) if isinstance(osi.get("l7_application"), dict) else {}
+            l6_l5 = osi.get("l6_l5_session", {}) if isinstance(osi.get("l6_l5_session"), dict) else {}
+            l4 = osi.get("l4_transport", {}) if isinstance(osi.get("l4_transport"), dict) else {}
+            l3 = osi.get("l3_network", {}) if isinstance(osi.get("l3_network"), dict) else {}
+            l2 = osi.get("l2_datalink", {}) if isinstance(osi.get("l2_datalink"), dict) else {}
+            l1 = osi.get("l1_physical", {}) if isinstance(osi.get("l1_physical"), dict) else {}
+
+            # L7 details
+            dns_srv = l7.get("dns_servers")
+            dns_srv_str = ", ".join(dns_srv) if isinstance(dns_srv, list) else str(dns_srv or "N/A")
+            dns_ok = l7.get("dns_ok") or l7.get("dns_resolution_ok")
+            dns_badge = '<span class="status-pill pill-ok">OK</span>' if dns_ok else '<span class="status-pill pill-crit">FAIL</span>'
+            dns_ms = l7.get("dns_ms") or l7.get("dns_response_time_ms")
+            dns_time_str = f" ({dns_ms} ms)" if dns_ms else ""
+
+            captive = l7.get("captive_portal") or l7.get("captive_portal_detected")
+            captive_alert = ""
+            if captive:
+                captive_alert = '<div class="alert-box alert-warn">⚠️ <strong>ALERTA PORTAL CAUTIVO:</strong> Redirección web detectada. Se requiere inicio de sesión en red.</div>'
+
+            http_st = l7.get("http_status") or l7.get("http_outbound_status")
+            http_str = f"Código {http_st}" if http_st else "N/A"
+
+            # L6/L5 details
+            dom_name = l6_l5.get("domain_name") or "N/A"
+            tcp_conns = l6_l5.get("active_tcp_conns") or l6_l5.get("active_established_tcp_conns") or 0
+
+            # L4 details
+            p53 = l4.get("gateway_port53_open") or l4.get("gateway_dns_port_53_open")
+            p443 = l4.get("internet_port443_open") or l4.get("internet_https_port_443_open")
+            p53_str = '<span class="status-pill pill-ok">Abierto [✓]</span>' if p53 else '<span class="status-pill pill-warn">Cerrado/Timeout</span>'
+            p443_str = '<span class="status-pill pill-ok">Abierto [✓]</span>' if p443 else '<span class="status-pill pill-warn">Cerrado/Timeout</span>'
+
+            # L3 details
+            ip_addr = l3.get("ip") or l3.get("ipv4_address") or "N/A"
+            mask = l3.get("subnet") or "N/A"
+            gw_ip = l3.get("gateway") or l3.get("default_gateway") or "N/A"
+            gw_ping = l3.get("ping_gateway") or l3.get("gateway_ping_ok")
+            gw_ping_badge = '<span class="status-pill pill-ok">OK</span>' if gw_ping else '<span class="status-pill pill-crit">FAIL</span>'
+            ext_ping = l3.get("ping_internet") or l3.get("internet_ping_ok")
+            ext_ping_badge = '<span class="status-pill pill-ok">OK</span>' if ext_ping else '<span class="status-pill pill-crit">FAIL</span>'
+            mtu_val = l3.get("mtu") or 1500
+            hops = l3.get("traceroute_hops") or []
+            hops_str = ""
+            if isinstance(hops, list):
+                hops_items = []
+                for h in hops:
+                    if isinstance(h, list) and len(h) >= 2:
+                        hops_items.append(f"#{h[0]}: {h[1]}")
+                    elif isinstance(h, dict):
+                        hops_items.append(f"#{h.get('hop')}: {h.get('ip')}")
+                    else:
+                        hops_items.append(str(h))
+                hops_str = " → ".join(hops_items)
+            elif isinstance(hops, str):
+                hops_str = hops.replace(";", " → ")
+
+            # L2 details
+            adapter = l2.get("adapter") or l2.get("interface_name") or l2.get("interface") or "N/A"
+            mac = l2.get("mac") or l2.get("mac_address") or "N/A"
+            dhcp_on = l2.get("dhcp_enabled") or l2.get("is_dhcp")
+            dhcp_str = "DHCP Automático" if dhcp_on else "IP Estática"
+            dhcp_srv = l2.get("dhcp_server") or "N/A"
+            arp_gw = l2.get("gateway_arp") or l2.get("gateway_mac_arp") or l2.get("gateway_mac_resolved_arp") or "N/A"
+
+            wifi = l2.get("wifi", {}) if isinstance(l2.get("wifi"), dict) else {}
+            wifi_html = ""
+            if wifi and (wifi.get("is_wifi") or wifi.get("ssid")):
+                w_ssid = html.escape(str(wifi.get("ssid") or "N/A"))
+                w_sig = wifi.get("signal_pct") or wifi.get("signal") or "N/A"
+                w_ch = wifi.get("channel") or "N/A"
+                wifi_html = f"<tr><td><strong>📡 Enlace Wi-Fi:</strong></td><td>SSID: <strong>{w_ssid}</strong> | Señal: <strong>{w_sig}%</strong> | Canal: <strong>{w_ch}</strong></td></tr>"
+
+            # L1 details
+            link_spd = l1.get("link_speed") or l2.get("speed") or l2.get("link_speed") or "N/A"
+            carrier = l1.get("carrier") or l1.get("link_carrier") or "1"
+            oper_st = l1.get("status") or l1.get("operstate") or "Up"
+            carrier_str = '<span class="status-pill pill-ok">Conectado [✓]</span>' if str(carrier) in ("1", "True", "true") else '<span class="status-pill pill-crit">Desconectado</span>'
+
+            osi_html = f"""
+            <div class="card osi-card">
+                <div class="card-header">🌐 ANÁLISIS DE RED ESTRUCTURADO (MODELO OSI)</div>
+                {captive_alert}
+                <table>
+                    <tbody>
+                        <tr class="layer-header"><td colspan="2">CAPA 7: APLICACIÓN (DNS / HTTP)</td></tr>
+                        <tr><td>Resolución DNS:</td><td>{dns_badge} Servidores: {dns_srv_str}{dns_time_str}</td></tr>
+                        <tr><td>Salida Web (HTTP):</td><td>{http_str}</td></tr>
+
+                        <tr class="layer-header"><td colspan="2">CAPAS 6 & 5: PRESENTACIÓN Y SESIÓN</td></tr>
+                        <tr><td>Dominio / Red:</td><td>{dom_name} ({tcp_conns} sockets TCP activos)</td></tr>
+
+                        <tr class="layer-header"><td colspan="2">CAPA 4: TRANSPORTE (SOCKETS TCP)</td></tr>
+                        <tr><td>Puertos Clave:</td><td>Gateway 53: {p53_str} | Internet 443: {p443_str}</td></tr>
+
+                        <tr class="layer-header"><td colspan="2">CAPA 3: RED (ENRUTAMIENTO, PING & TRACEROUTE)</td></tr>
+                        <tr><td>Dirección IPv4:</td><td><strong>{ip_addr}</strong> (Máscara: {mask} | MTU: {mtu_val})</td></tr>
+                        <tr><td>Puerta de Enlace:</td><td>{gw_ip} (Ping: {gw_ping_badge})</td></tr>
+                        <tr><td>Internet (8.8.8.8):</td><td>Ping: {ext_ping_badge}</td></tr>
+                        {f'<tr><td>Traceroute:</td><td><small>{hops_str}</small></td></tr>' if hops_str else ''}
+
+                        <tr class="layer-header"><td colspan="2">CAPA 2: ENLACE DE DATOS (INTERFACES & ARP)</td></tr>
+                        <tr><td>Adaptador / MAC:</td><td>{adapter} (<code>{mac}</code>)</td></tr>
+                        <tr><td>Configuración IP:</td><td>{dhcp_str} (Servidor: {dhcp_srv})</td></tr>
+                        <tr><td>Resolución ARP GW:</td><td><code>{arp_gw}</code></td></tr>
+                        {wifi_html}
+
+                        <tr class="layer-header"><td colspan="2">CAPA 1: FÍSICA (ENLACE Y MEDIO)</td></tr>
+                        <tr><td>Estado de Enlace:</td><td>{oper_st} | Velocidad: {link_spd}</td></tr>
+                        <tr><td>Detección Portadora:</td><td>{carrier_str}</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            """
+
+        # 3. AI section HTML
         ai_html = ""
         if report.ai_analysis:
             summary = html.escape(report.ai_analysis.get("summary", "Sin resumen"))
@@ -204,15 +355,18 @@ class REIWebServer:
             </div>
             """
 
-        # Telemetry metrics cards
+        # 4. Additional telemetry metrics cards
         telemetry_rows = ""
-        for k, v in report.telemetry.items():
-            k_clean = html.escape(str(k).replace("_", " ").title())
-            if isinstance(v, (dict, list)):
-                v_clean = f"<pre>{html.escape(str(v))}</pre>"
-            else:
-                v_clean = html.escape(str(v))
-            telemetry_rows += f"<tr><td><strong>{k_clean}</strong></td><td>{v_clean}</td></tr>"
+        if isinstance(report.telemetry, dict):
+            for k, v in report.telemetry.items():
+                if k in ("hardware", "osi_network", "osi"):
+                    continue
+                k_clean = html.escape(str(k).replace("_", " ").title())
+                if isinstance(v, (dict, list)):
+                    v_clean = f"<pre>{html.escape(str(v))}</pre>"
+                else:
+                    v_clean = html.escape(str(v))
+                telemetry_rows += f"<tr><td><strong>{k_clean}</strong></td><td>{v_clean}</td></tr>"
 
         return f"""<!DOCTYPE html>
 <html lang="es">
@@ -266,11 +420,20 @@ class REIWebServer:
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
         }}
         .ai-card {{ border-color: #8b5cf6; }}
+        .osi-card {{ border-color: #0284c7; }}
         .card-header {{ font-weight: 700; margin-bottom: 0.5rem; font-size: 0.95rem; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
         td {{ padding: 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
+        .layer-header {{ background: #1e293b; color: #38bdf8; font-weight: 800; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.5px; }}
+        .status-pill {{ padding: 2px 7px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; display: inline-block; }}
+        .pill-ok {{ background: #059669; color: #fff; }}
+        .pill-warn {{ background: #d97706; color: #fff; }}
+        .pill-crit {{ background: #dc2626; color: #fff; }}
+        .alert-box {{ padding: 0.6rem 0.8rem; border-radius: 6px; margin-bottom: 0.75rem; font-size: 0.85rem; }}
+        .alert-warn {{ background: #451a03; border: 1px solid #f59e0b; color: #fde68a; }}
         ul, ol {{ padding-left: 1.25rem; margin-top: 0.5rem; font-size: 0.85rem; }}
         li {{ margin-bottom: 0.4rem; }}
+        code {{ background: #0f172a; padding: 2px 5px; border-radius: 4px; font-family: monospace; font-size: 0.8rem; color: #38bdf8; }}
         pre {{ background: #0b1120; padding: 0.5rem; border-radius: 4px; overflow-x: auto; font-size: 0.75rem; }}
         .footer {{ text-align: center; font-size: 0.75rem; color: var(--text-muted); margin-top: 2rem; }}
     </style>
@@ -285,16 +448,22 @@ class REIWebServer:
         <div><strong>Categoría:</strong> {report.category} | <strong>Fecha:</strong> {dt_str}</div>
     </div>
 
+    {hw_html}
+
+    {osi_html}
+
     {ai_html}
 
+    {f'''
     <div class="card">
-        <div class="card-header">📊 TELEMETRÍA DE ENDPOINT</div>
+        <div class="card-header">📊 TELEMETRÍA ADICIONAL</div>
         <table>
             <tbody>
-                {telemetry_rows or "<tr><td>Sin telemetría detallada.</td></tr>"}
+                {telemetry_rows}
             </tbody>
         </table>
     </div>
+    ''' if telemetry_rows else ''}
 
     <div class="footer">
         REI Autonomous Multi-Interface Diagnostic Hub • v2.2
@@ -318,6 +487,8 @@ class REIWebServer:
         telemetry: Dict[str, Any],
         overall_status: str = "OK",
         ai_analysis: Optional[Dict[str, Any]] = None,
+        hardware: Optional[Dict[str, Any]] = None,
+        osi_network: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Stores a report constructed locally by REI and returns its report_id."""
         report_id = str(uuid.uuid4())[:8]
@@ -328,10 +499,16 @@ class REIWebServer:
                 "category": category,
                 "hostname": hostname,
                 "telemetry": telemetry,
+                "hardware": hardware or (telemetry.get("hardware", {}) if isinstance(telemetry, dict) else {}),
+                "osi_network": osi_network or (telemetry.get("osi_network") or telemetry.get("osi", {}) if isinstance(telemetry, dict) else {}),
             },
         )
         stored.overall_status = overall_status
         stored.ai_analysis = ai_analysis
+        if hardware:
+            stored.hardware = hardware
+        if osi_network:
+            stored.osi_network = osi_network
 
         with self._lock:
             self._reports[report_id] = stored

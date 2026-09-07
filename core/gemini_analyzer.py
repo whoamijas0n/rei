@@ -226,24 +226,31 @@ class GeminiDiagnosticAnalyzer:
             return self._generate_local_fallback_analysis(diagnostic_data, reason=f"Error inesperado al conectar con Gemini: {type(ex).__name__}.")
 
     def _build_analysis_prompt(self, data: Dict[str, Any]) -> str:
-        """Constructs an expert IT diagnostician prompt."""
+        """Constructs an expert IT and Network diagnostician prompt following the OSI Top-Down model."""
         data_str = json.dumps(data, indent=2, ensure_ascii=False)
-        return f"""Eres un Ingeniero Principal de Soporte de TI y Ciberseguridad. Analiza la siguiente telemetría de un host diagnosticado por el dispositivo REI.
+        return f"""Eres un Ingeniero Principal de Redes, Infraestructura TI y Ciberseguridad. Analiza la siguiente telemetría de un host (identidad de hardware y pila de red organizada de arriba hacia abajo según el Modelo OSI: Capa 7 a Capa 1) recolectada por el dispositivo de campo REI.
 
-TELEMETRÍA:
+TELEMETRÍA RECOLECTADA:
 {data_str}
+
+DIRECTIVAS CRÍTICAS DE ANÁLISIS:
+1. Conecta los puntos entre capas (OSI Top-Down):
+   - Si la Capa 7 falla (resolución DNS o tráfico HTTP), determina si la causa raíz es de Capa 3 (pérdida de paquetes, ruta por defecto, ping Gateway/Internet), Capa 2 (falla de DHCP, dirección APIPA 169.254, baja señal Wi-Fi < 40%, conflicto ARP) o Capa 1 (cable desconectado, carrier down, negociación a 100M).
+   - Identifica con precisión el dominio de la falla: ¿Es problema del ENDPOINT (driver, adaptador, IP estática errónea, portal cautivo no autenticado) o de la INFRAESTRUCTURA (DHCP agotado, switch caído, DNS caído, corte del ISP)?
+2. Considera el hardware del host (fabricante, modelo, CPU, RAM) para correlacionar posibles limitaciones de rendimiento o drivers.
+3. Proporciona comandos técnicos de remediación accionables y específicos para el sistema operativo detectado (PowerShell / netsh para Windows, ip / nmcli / systemd para Linux).
 
 Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
 {{
-  "summary": "Resumen ejecutivo de 2 líneas describiendo el estado general del equipo.",
+  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del equipo y la red, indicando causa principal y severidad.",
   "overall_status": "OK" | "WARN" | "CRIT",
   "root_causes": [
-    "Problema o anomalía 1 detectada",
-    "Problema o anomalía 2 detectada"
+    "Causa raíz 1 identificada (indicando capa OSI afectada)",
+    "Causa raíz 2 identificada"
   ],
   "action_plan": [
-    "Paso 1 técnico o comando para resolver el problema",
-    "Paso 2 técnico o comando recomendado"
+    "Comando de terminal o acción técnica 1 para solucionar la falla",
+    "Comando de terminal o acción técnica 2 recomendado"
   ]
 }}"""
 
@@ -269,9 +276,13 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
     def _generate_local_fallback_analysis(self, data: Dict[str, Any], reason: str = "") -> Dict[str, Any]:
         """
         Rule-based heuristic fallback analysis when Gemini API is unreachable.
-        Guarantees UI resiliency without throwing exceptions.
+        Evaluates the network stack layer by layer (OSI Top-Down) and host hardware.
         """
-        telemetry = data.get("telemetry", {})
+        telemetry = data.get("telemetry", {}) if isinstance(data.get("telemetry"), dict) else {}
+        osi = data.get("osi_network") or telemetry.get("osi_network") or telemetry.get("osi", {})
+        osi = osi if isinstance(osi, dict) else {}
+        hw = data.get("hardware") or telemetry.get("hardware", {})
+        hw = hw if isinstance(hw, dict) else {}
         os_type = str(data.get("os_type", "")).upper()
         category = str(data.get("category", "")).upper()
 
@@ -279,35 +290,94 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
         action_plan: List[str] = []
         status = "OK"
 
-        # Check CPU Temp / RAM
+        # 1. Check Hardware (CPU & RAM)
         cpu_usage = telemetry.get("cpu_percent") or telemetry.get("cpu_usage")
         if cpu_usage and isinstance(cpu_usage, (int, float)) and cpu_usage > 90:
-            root_causes.append(f"Uso crítico de CPU al {cpu_usage}%")
-            action_plan.append("Verificar procesos con alto consumo (Taskmgr / htop)")
+            root_causes.append(f"[Hardware] Uso crítico de CPU al {cpu_usage}%")
+            cmd = "Get-Process | Sort-Object CPU -Descending | Select-Object -First 5" if os_type == "WINDOWS" else "top -b -n 1 | head -n 15"
+            action_plan.append(f"Identificar procesos saturando la CPU: {cmd}")
             status = "WARN"
 
         mem_usage = telemetry.get("ram_percent") or telemetry.get("ram_usage")
         if mem_usage and isinstance(mem_usage, (int, float)) and mem_usage > 90:
-            root_causes.append(f"Saturación de memoria RAM ({mem_usage}%)")
-            action_plan.append("Reiniciar servicios o expandir memoria del host")
+            root_causes.append(f"[Hardware] Saturación de memoria RAM ({mem_usage}%)")
+            action_plan.append("Reiniciar servicios o expandir memoria RAM del host")
             status = "WARN"
 
-        # Check Network
-        ping_ok = telemetry.get("ping_gateway") or telemetry.get("ping_internet")
-        if ping_ok is False:
-            root_causes.append("Fallo de conectividad hacia la puerta de enlace o Internet")
-            action_plan.append("Revisar cable ethernet / adaptador Wi-Fi y configuración DHCP/DNS")
+        # 2. Check OSI Layer 1 & 2 (Physical & Data Link)
+        l1 = osi.get("l1_physical", {}) if isinstance(osi.get("l1_physical"), dict) else {}
+        l2 = osi.get("l2_datalink", {}) if isinstance(osi.get("l2_datalink"), dict) else {}
+        carrier = l1.get("carrier") or l1.get("link_carrier")
+        oper_st = str(l1.get("status") or l1.get("operstate") or "").upper()
+        if str(carrier) in ("0", "False", "false") or oper_st == "DOWN":
+            root_causes.append("[L1 Física] Interfaz de red desconectada o cable desconectado")
+            action_plan.append("Verificar conexión física del cable RJ45 o encender el adaptador de red")
             status = "CRIT"
 
-        # Check Malware / Antivirus
+        wifi = l2.get("wifi", {}) if isinstance(l2.get("wifi"), dict) else {}
+        wifi_sig = wifi.get("signal_pct") or wifi.get("signal")
+        if wifi_sig is not None:
+            try:
+                sig_val = int(wifi_sig)
+                if sig_val < 35:
+                    root_causes.append(f"[L2 Enlace] Señal Wi-Fi deficiente ({sig_val}%), alta probabilidad de pérdida de paquetes")
+                    action_plan.append("Reubicar el equipo más cerca del Access Point o cambiar a banda 5 GHz")
+                    if status != "CRIT":
+                        status = "WARN"
+            except (ValueError, TypeError):
+                pass
+
+        # 3. Check OSI Layer 3 (Network, IP, Gateway, Ping)
+        l3 = osi.get("l3_network", {}) if isinstance(osi.get("l3_network"), dict) else {}
+        ip_addr = str(l3.get("ip") or telemetry.get("ip") or "")
+        if "169.254." in ip_addr:
+            root_causes.append("[L3 Red] Dirección APIPA (169.254.x.x): Falla de negociación DHCP")
+            dhcp_cmd = "ipconfig /renew" if os_type == "WINDOWS" else "sudo dhclient -r && sudo dhclient"
+            action_plan.append(f"Renovar concesión DHCP: {dhcp_cmd} o revisar servidor DHCP")
+            status = "CRIT"
+
+        ping_gw = l3.get("ping_gateway") if "ping_gateway" in l3 else telemetry.get("ping_gateway")
+        if ping_gw is False:
+            root_causes.append("[L3 Red] Puerta de enlace (Default Gateway) no responde a ping ICMP")
+            gw_cmd = "Test-Connection (Get-NetRoute -DestinationPrefix '0.0.0.0/0').NextHop" if os_type == "WINDOWS" else "ip route show default"
+            action_plan.append(f"Verificar ruta y enlace hacia Gateway: {gw_cmd}")
+            status = "CRIT"
+
+        ping_ext = l3.get("ping_internet") if "ping_internet" in l3 else telemetry.get("ping_internet")
+        if ping_gw is True and ping_ext is False:
+            root_causes.append("[L3 Red] Gateway responde pero no hay salida a Internet (8.8.8.8)")
+            action_plan.append("Revisar conexión WAN del router o estado del enlace del ISP")
+            status = "CRIT"
+
+        # 4. Check OSI Layer 7 (Application: DNS & Captive Portal)
+        l7 = osi.get("l7_application", {}) if isinstance(osi.get("l7_application"), dict) else {}
+        captive = l7.get("captive_portal") or l7.get("captive_portal_detected")
+        if captive:
+            root_causes.append("[L7 Aplicación] Portal cautivo detectado bloqueando tráfico web hacia Internet")
+            action_plan.append("Abrir navegador web en el host para autenticarse en el portal de red")
+            if status != "CRIT":
+                status = "WARN"
+
+        dns_ok = l7.get("dns_ok") if "dns_ok" in l7 else l7.get("dns_resolution_ok")
+        if dns_ok is False:
+            if ping_ext is True:
+                root_causes.append("[L7 Aplicación] Falla de resolución DNS mientras la conectividad IP externa funciona")
+                dns_cmd = "Set-DnsClientServerAddress -InterfaceAlias '*' -ServerAddresses 8.8.8.8,1.1.1.1" if os_type == "WINDOWS" else "echo 'nameserver 8.8.8.8' | sudo tee /etc/resolv.conf"
+                action_plan.append(f"Cambiar servidores DNS a públicos (8.8.8.8 / 1.1.1.1): {dns_cmd}")
+            else:
+                root_causes.append("[L7 Aplicación] Falla de resolución DNS por falta de salida a red")
+                action_plan.append("Resolver primero la conectividad de Capa 3 antes del servicio de nombres")
+            status = "CRIT"
+
+        # 5. Check Malware / Antivirus
         defender_active = telemetry.get("antivirus_enabled")
         if defender_active is False:
-            root_causes.append("Protección antivirus desactivada en el host")
+            root_causes.append("[Seguridad] Protección antivirus desactivada en el host")
             action_plan.append("Habilitar Windows Defender o software antivirus corporativo")
             status = "CRIT"
 
         if not root_causes:
-            root_causes.append("Parámetros nominales. No se encontraron fallas críticas.")
+            root_causes.append("Pila de red nominal (Capa 7 a Capa 1). No se detectaron anomalías.")
             action_plan.append("Mantener monitoreo preventivo y parches de seguridad al día.")
 
         summary_suffix = f" [{reason}]" if reason else ""
