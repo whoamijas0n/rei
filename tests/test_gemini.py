@@ -208,6 +208,74 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertEqual(res["root_causes"], ["Sin fallas"])
         self.assertEqual(res["action_plan"], ["Continuar monitoreo"])
 
+    def test_local_fallback_hardware_smart_failure(self):
+        """Verify fallback detects SMART impending failure as CRITICAL."""
+        data = {
+            "os_type": "WINDOWS",
+            "category": "ANALISIS HARDWARE",
+            "hardware_audit": {
+                "storage": {
+                    "physical_drives": [
+                        {"model": "Seagate Barracuda 2TB", "smart_fail": True}
+                    ]
+                }
+            }
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("SMART", causes_str)
+        self.assertIn("Seagate", causes_str)
+
+    def test_local_fallback_hardware_disk_full(self):
+        """Verify fallback detects low disk space (< 5% as CRIT, < 10% as WARN)."""
+        data_crit = {
+            "os_type": "WINDOWS",
+            "category": "ANALISIS HARDWARE",
+            "hardware_audit": {
+                "storage": {
+                    "volumes": [
+                        {"drive": "C:", "free_pct": 3.5}
+                    ]
+                }
+            }
+        }
+        res_crit = self.analyzer.analyze_diagnostic(data_crit)
+        self.assertEqual(res_crit["overall_status"], "CRIT")
+        causes_crit = " ".join(res_crit["root_causes"])
+        self.assertIn("< 5%", causes_crit)
+
+        data_warn = {
+            "os_type": "WINDOWS",
+            "category": "ANALISIS HARDWARE",
+            "hardware_audit": {
+                "storage": {
+                    "volumes": [
+                        {"drive": "D:", "free_pct": 8.0}
+                    ]
+                }
+            }
+        }
+        res_warn = self.analyzer.analyze_diagnostic(data_warn)
+        self.assertEqual(res_warn["overall_status"], "WARN")
+        causes_warn = " ".join(res_warn["root_causes"])
+        self.assertIn("< 10%", causes_warn)
+
+    def test_local_fallback_hardware_cpu_overheating(self):
+        """Verify fallback detects severe CPU overheating (> 85°C as CRIT)."""
+        data = {
+            "os_type": "LINUX",
+            "category": "ANALISIS HARDWARE",
+            "hardware_audit": {
+                "cpu": {"load_pct": 30.0, "temp_c": 91.5}
+            }
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("91.5", causes_str)
+        self.assertIn("Térmica", causes_str)
+
 
 if __name__ == "__main__":
     unittest.main()

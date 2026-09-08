@@ -687,7 +687,7 @@ class REIApp:
             deck = HeroCardDeckView("TIPO PROBLEMA")
             categories = [
                 ("RED / CONEXION", "NETWORK"),
-                ("HARDWARE / CPU", "HARDWARE"),
+                ("ANALISIS HARDWARE", "HARDWARE"),
                 ("ANALISIS MALWARE", "MALWARE"),
                 ("OTROS PROBLEMAS", "OTROS"),
                 ("ANALISIS COMPLETO", "COMPLETO"),

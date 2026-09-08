@@ -44,6 +44,7 @@ class StoredReport:
         self.telemetry = data.get("telemetry", {})
         self.metrics = data.get("metrics", [])
         self.hardware = data.get("hardware") or self.telemetry.get("hardware", {})
+        self.hardware_audit = data.get("hardware_audit") or self.telemetry.get("hardware_audit", {})
         self.osi_network = data.get("osi_network") or self.telemetry.get("osi_network") or self.telemetry.get("osi", {})
         self.ai_analysis: Optional[Dict[str, Any]] = None
         self.overall_status = "OK"
@@ -57,6 +58,7 @@ class StoredReport:
             "hostname": self.hostname,
             "overall_status": self.overall_status,
             "hardware": self.hardware,
+            "hardware_audit": self.hardware_audit,
             "osi_network": self.osi_network,
             "telemetry": self.telemetry,
             "metrics": self.metrics,
@@ -204,6 +206,175 @@ class REIWebServer:
                         <tr><td><strong>Sistema Operativo:</strong></td><td>{os_name} {os_ver}</td></tr>
                         <tr><td><strong>Procesador (CPU):</strong></td><td>{cpu_m}</td></tr>
                         <tr><td><strong>Memoria RAM:</strong></td><td>{ram_tot} GB total ({ram_free} GB libre)</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            """
+
+        # 1.5 Deep Hardware Audit (Comprehensive Subsystems)
+        hw_audit = getattr(report, "hardware_audit", None) or (report.telemetry.get("hardware_audit") if isinstance(report.telemetry, dict) else {})
+        hw_audit_html = ""
+        if hw_audit and isinstance(hw_audit, dict) and any(k in hw_audit for k in ("system", "cpu", "memory", "storage", "graphics", "battery")):
+            sys_info = hw_audit.get("system", {}) if isinstance(hw_audit.get("system"), dict) else {}
+            cpu_info = hw_audit.get("cpu", {}) if isinstance(hw_audit.get("cpu"), dict) else {}
+            mem_info = hw_audit.get("memory", {}) if isinstance(hw_audit.get("memory"), dict) else {}
+            storage_info = hw_audit.get("storage", {}) if isinstance(hw_audit.get("storage"), dict) else {}
+            graphics_info = hw_audit.get("graphics", []) if isinstance(hw_audit.get("graphics"), list) else []
+            battery_info = hw_audit.get("battery") if isinstance(hw_audit.get("battery"), dict) else None
+
+            # Motherboard & BIOS
+            b_mfr = html.escape(str(sys_info.get("board_mfr") or sys_info.get("manufacturer") or "N/A"))
+            b_prod = html.escape(str(sys_info.get("board_product") or sys_info.get("model") or "N/A"))
+            bios_v = html.escape(str(sys_info.get("bios_version") or "N/A"))
+            bios_d = html.escape(str(sys_info.get("bios_date") or ""))
+            bios_str = f"{bios_v} ({bios_d})" if bios_d else bios_v
+
+            # Battery row
+            bat_row = ""
+            if battery_info and battery_info.get("present"):
+                ch = battery_info.get("charge_pct", 0)
+                st = html.escape(str(battery_info.get("status") or "Conectada"))
+                ch_color = "pill-ok" if ch > 30 else ("pill-warn" if ch > 15 else "pill-crit")
+                bat_row = f"""<tr><td><strong>🔋 Batería:</strong></td><td><span class="status-pill {ch_color}">{ch}%</span> ({st})</td></tr>"""
+
+            # CPU & Thermals
+            c_name = html.escape(str(cpu_info.get("name") or "N/A"))
+            c_cores = cpu_info.get("cores") or "N/A"
+            c_threads = cpu_info.get("threads") or "N/A"
+            c_load = cpu_info.get("load_pct", 0)
+            try:
+                c_load_float = float(c_load)
+            except (ValueError, TypeError):
+                c_load_float = 0.0
+            c_load_color = "pill-crit" if c_load_float > 90 else ("pill-warn" if c_load_float > 75 else "pill-ok")
+            c_mhz = cpu_info.get("current_mhz") or cpu_info.get("max_mhz")
+            c_freq_str = f" | Reloj: {c_mhz} MHz" if c_mhz else ""
+            c_temp = cpu_info.get("temp_c")
+            c_temp_row = ""
+            if c_temp is not None:
+                try:
+                    c_temp_float = float(c_temp)
+                    if c_temp_float > 0:
+                        t_color = "pill-crit" if c_temp_float > 85 else ("pill-warn" if c_temp_float > 75 else "pill-ok")
+                        c_temp_row = f"""<tr><td>Temperatura CPU:</td><td><span class="status-pill {t_color}">{c_temp}°C</span>{' ⚠️ Estrangulamiento Térmico' if c_temp_float > 85 else ''}</td></tr>"""
+                except (ValueError, TypeError):
+                    pass
+
+            # Memory & Slots
+            m_tot = mem_info.get("total_gb", 0)
+            m_used = mem_info.get("used_gb", 0)
+            m_free = mem_info.get("free_gb", 0)
+            m_pct = mem_info.get("usage_pct", 0)
+            try:
+                m_pct_float = float(m_pct)
+            except (ValueError, TypeError):
+                m_pct_float = 0.0
+            m_pct_color = "pill-crit" if m_pct_float > 90 else ("pill-warn" if m_pct_float > 80 else "pill-ok")
+            slots_used = mem_info.get("slots_used")
+            slots_tot = mem_info.get("slots_total")
+            slots_str = f" ({slots_used} de {slots_tot} ranuras ocupadas)" if slots_tot else ""
+
+            dimms = mem_info.get("dimms", [])
+            dimms_html = ""
+            if dimms and isinstance(dimms, list):
+                dimm_items = []
+                for d in dimms:
+                    if isinstance(d, dict):
+                        d_slot = d.get("slot") or "Slot"
+                        d_sz = d.get("size_gb") or "?"
+                        d_spd = f" @ {d.get('speed_mhz')}MHz" if d.get("speed_mhz") else ""
+                        d_mfr = f" ({d.get('mfr')})" if d.get("mfr") else ""
+                        dimm_items.append(f"<li><code>{d_slot}</code>: {d_sz} GB{d_spd}{d_mfr}</li>")
+                if dimm_items:
+                    dimms_html = f"<tr><td>Módulos Físicos:</td><td><ul style='margin:0;padding-left:1rem'>{''.join(dimm_items)}</ul></td></tr>"
+
+            # Storage & SMART
+            p_drives = storage_info.get("physical_drives", [])
+            drives_rows = []
+            if p_drives and isinstance(p_drives, list):
+                for pd in p_drives:
+                    if isinstance(pd, dict):
+                        pd_name = html.escape(str(pd.get("model") or pd.get("name") or "Unidad de Disco"))
+                        pd_sz = pd.get("size_gb") or pd.get("size") or "N/A"
+                        pd_bus = pd.get("bus") or ""
+                        pd_bus_str = f" [{pd_bus}]" if pd_bus else ""
+                        pd_smart = pd.get("smart_fail")
+                        smart_pill = ""
+                        if pd_smart is True:
+                            smart_pill = ' <span class="status-pill pill-crit">⚠️ FALLO SMART</span>'
+                        elif pd_smart is False:
+                            smart_pill = ' <span class="status-pill pill-ok">SMART OK</span>'
+
+                        rot = pd.get("rotational")
+                        media_type = "HDD Mecánico" if rot is True else ("SSD/NVMe" if rot is False else "")
+                        media_str = f" ({media_type})" if media_type else ""
+
+                        drives_rows.append(f"<li><strong>{pd_name}</strong> - {pd_sz}{' GB' if isinstance(pd_sz, (int, float)) else ''}{pd_bus_str}{media_str}{smart_pill}</li>")
+
+            vols = storage_info.get("volumes", [])
+            vol_rows = []
+            if vols and isinstance(vols, list):
+                for v in vols:
+                    if isinstance(v, dict):
+                        v_drv = html.escape(str(v.get("drive") or v.get("mount") or "Vol"))
+                        v_sz = v.get("size_gb") or v.get("size") or "?"
+                        v_free = v.get("free_gb") or v.get("free") or "?"
+                        v_fs = v.get("fs") or ""
+                        v_pct = v.get("free_pct")
+                        if v_pct is not None:
+                            try:
+                                f_pct_num = float(v_pct)
+                                v_pill = '<span class="status-pill pill-crit">Crítico</span>' if f_pct_num < 5 else ('<span class="status-pill pill-warn">Bajo</span>' if f_pct_num < 10 else '<span class="status-pill pill-ok">OK</span>')
+                                vol_rows.append(f"<tr><td>Unidad <strong>{v_drv}</strong> ({v_fs}):</td><td>{v_free} GB libres de {v_sz} GB ({v_pct}% libre) {v_pill}</td></tr>")
+                            except (ValueError, TypeError):
+                                vol_rows.append(f"<tr><td>Unidad <strong>{v_drv}</strong>:</td><td>{v_free} libre / {v_sz}</td></tr>")
+                        else:
+                            use_pct = v.get("use_pct") or "N/A"
+                            vol_rows.append(f"<tr><td>Montaje <strong>{v_drv}</strong>:</td><td>{v_free} libre de {v_sz} (Uso: {use_pct})</td></tr>")
+
+            # Graphics
+            gpus_html = ""
+            if graphics_info and isinstance(graphics_info, list):
+                gpu_items = []
+                for g in graphics_info:
+                    if isinstance(g, dict):
+                        g_name = html.escape(str(g.get("name") or "GPU"))
+                        g_vram = f" | VRAM: {g.get('vram_mb')} MB" if g.get("vram_mb") else ""
+                        g_drv = f" | Driver: {g.get('driver')}" if g.get("driver") else ""
+                        g_res = f" | Res: {g.get('res')}" if g.get("res") else ""
+                        gpu_items.append(f"<li>{g_name}{g_vram}{g_drv}{g_res}</li>")
+                if gpu_items:
+                    gpus_html = f"""
+                    <tr class="layer-header"><td colspan="2">GRÁFICOS Y PANTALLA (GPU)</td></tr>
+                    <tr><td>Adaptadores de Video:</td><td><ul style='margin:0;padding-left:1rem'>{''.join(gpu_items)}</ul></td></tr>
+                    """
+
+            hw_audit_html = f"""
+            <div class="card hw-card">
+                <div class="card-header">⚙️ AUDITORÍA EXHAUSTIVA DE HARDWARE</div>
+                <table>
+                    <tbody>
+                        <tr class="layer-header"><td colspan="2">PLACA BASE, FIRMWARE Y ENERGÍA</td></tr>
+                        <tr><td>Motherboard:</td><td>{b_mfr} {b_prod}</td></tr>
+                        <tr><td>BIOS / UEFI:</td><td>{bios_str}</td></tr>
+                        {bat_row}
+
+                        <tr class="layer-header"><td colspan="2">PROCESADOR (CPU) Y TÉRMICA</td></tr>
+                        <tr><td>Modelo:</td><td><strong>{c_name}</strong></td></tr>
+                        <tr><td>Núcleos / Hilos:</td><td>{c_cores} Cores / {c_threads} Threads{c_freq_str}</td></tr>
+                        <tr><td>Uso de CPU:</td><td><span class="status-pill {c_load_color}">{c_load}%</span></td></tr>
+                        {c_temp_row}
+
+                        <tr class="layer-header"><td colspan="2">MEMORIA RAM Y TOPOLOGÍA</td></tr>
+                        <tr><td>Capacidad:</td><td><strong>{m_used} GB usados</strong> de {m_tot} GB total ({m_free} GB libre)</td></tr>
+                        <tr><td>Saturación:</td><td><span class="status-pill {m_pct_color}">{m_pct}%</span>{slots_str}</td></tr>
+                        {dimms_html}
+
+                        <tr class="layer-header"><td colspan="2">ALMACENAMIENTO Y SALUD SMART</td></tr>
+                        {f'<tr><td>Unidades Físicas:</td><td><ul style="margin:0;padding-left:1rem">{"".join(drives_rows)}</ul></td></tr>' if drives_rows else ''}
+                        {''.join(vol_rows)}
+
+                        {gpus_html}
                     </tbody>
                 </table>
             </div>
@@ -359,7 +530,7 @@ class REIWebServer:
         telemetry_rows = ""
         if isinstance(report.telemetry, dict):
             for k, v in report.telemetry.items():
-                if k in ("hardware", "osi_network", "osi"):
+                if k in ("hardware", "hardware_audit", "osi_network", "osi"):
                     continue
                 k_clean = html.escape(str(k).replace("_", " ").title())
                 if isinstance(v, (dict, list)):
@@ -421,6 +592,7 @@ class REIWebServer:
         }}
         .ai-card {{ border-color: #8b5cf6; }}
         .osi-card {{ border-color: #0284c7; }}
+        .hw-card {{ border-color: #06b6d4; }}
         .card-header {{ font-weight: 700; margin-bottom: 0.5rem; font-size: 0.95rem; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
         td {{ padding: 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
@@ -449,6 +621,8 @@ class REIWebServer:
     </div>
 
     {hw_html}
+
+    {hw_audit_html}
 
     {osi_html}
 
@@ -488,6 +662,7 @@ class REIWebServer:
         overall_status: str = "OK",
         ai_analysis: Optional[Dict[str, Any]] = None,
         hardware: Optional[Dict[str, Any]] = None,
+        hardware_audit: Optional[Dict[str, Any]] = None,
         osi_network: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Stores a report constructed locally by REI and returns its report_id."""
@@ -500,6 +675,7 @@ class REIWebServer:
                 "hostname": hostname,
                 "telemetry": telemetry,
                 "hardware": hardware or (telemetry.get("hardware", {}) if isinstance(telemetry, dict) else {}),
+                "hardware_audit": hardware_audit or (telemetry.get("hardware_audit", {}) if isinstance(telemetry, dict) else {}),
                 "osi_network": osi_network or (telemetry.get("osi_network") or telemetry.get("osi", {}) if isinstance(telemetry, dict) else {}),
             },
         )
@@ -507,6 +683,8 @@ class REIWebServer:
         stored.ai_analysis = ai_analysis
         if hardware:
             stored.hardware = hardware
+        if hardware_audit:
+            stored.hardware_audit = hardware_audit
         if osi_network:
             stored.osi_network = osi_network
 

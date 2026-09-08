@@ -81,10 +81,26 @@ class LinuxPayloadGenerator:
             )
         elif cat == "HARDWARE":
             telemetry_sh = (
-                "cpu=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1 | tr -d '\"\\\\\\r\\n');"
-                "ram=$(free 2>/dev/null | grep Mem | awk '{printf(\"%.1f\", $3/$2 * 100.0)}' | tr -d '\"\\\\\\r\\n');"
-                "temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf(\"%.1f\", $1/1000)}' | tr -d '\"\\\\\\r\\n' || echo '0');"
-                "t=\"{\\\"cpu_percent\\\":${cpu:-0},\\\"ram_percent\\\":${ram:-0},\\\"cpu_temp_c\\\":${temp:-0},\\\"hardware\\\":$hw}\";"
+                "cpu_cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 1);"
+                "cpu_cur_mhz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null | awk '{printf(\"%.0f\", $1/1000)}' || lscpu 2>/dev/null | grep 'CPU MHz' | awk '{print $NF}' | cut -d'.' -f1 || echo 0);"
+                "cpu_max_mhz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null | awk '{printf(\"%.0f\", $1/1000)}' || lscpu 2>/dev/null | grep 'CPU max MHz' | awk '{print $NF}' | cut -d'.' -f1 || echo 0);"
+                "cpu_load=$(top -bn1 2>/dev/null | grep 'Cpu(s)' | awk '{print $2 + $4}' | cut -d'.' -f1 | tr -d '\"\\\\\\r\\n');"
+                "temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf(\"%.1f\", $1/1000)}' | tr -d '\"\\\\\\r\\n' || echo 0);"
+                "ram_tot=$(free -m 2>/dev/null | awk '/Mem:/ {printf(\"%.1f\", $2/1024)}' || echo 0);"
+                "ram_free=$(free -m 2>/dev/null | awk '/Mem:/ {printf(\"%.1f\", $7/1024)}' || echo 0);"
+                "ram_used=$(free -m 2>/dev/null | awk '/Mem:/ {printf(\"%.1f\", ($2-$7)/1024)}' || echo 0);"
+                "ram_pct=$(free 2>/dev/null | grep Mem | awk '{printf(\"%.1f\", ($3/$2)*100.0)}' | tr -d '\"\\\\\\r\\n' || echo 0);"
+                "board_mfr=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "board_prod=$(cat /sys/class/dmi/id/board_name 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "bios_ver=$(cat /sys/class/dmi/id/bios_version 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "bios_date=$(cat /sys/class/dmi/id/bios_date 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "bat_cap=$(cat /sys/class/power_supply/BAT0/capacity 2>/dev/null || cat /sys/class/power_supply/BAT1/capacity 2>/dev/null || echo '');"
+                "bat_stat=$(cat /sys/class/power_supply/BAT0/status 2>/dev/null || cat /sys/class/power_supply/BAT1/status 2>/dev/null || echo '');"
+                "p_disks=$(lsblk -d -n -o NAME,MODEL,SIZE,ROTA,TRAN 2>/dev/null | awk '{printf(\"{\\\"name\\\":\\\"%s\\\",\\\"model\\\":\\\"%s\\\",\\\"size\\\":\\\"%s\\\",\\\"rotational\\\":%s,\\\"bus\\\":\\\"%s\\\"},\", $1, $2, $3, ($4==\"1\"?\"true\":\"false\"), $5)}' | sed 's/,$//');"
+                "vols=$(df -h -x tmpfs -x devtmpfs -x squashfs 2>/dev/null | awk 'NR>1 {printf(\"{\\\"drive\\\":\\\"%s\\\",\\\"size\\\":\\\"%s\\\",\\\"used\\\":\\\"%s\\\",\\\"free\\\":\\\"%s\\\",\\\"use_pct\\\":\\\"%s\\\",\\\"mount\\\":\\\"%s\\\"},\", $1, $2, $3, $4, $5, $6)}' | sed 's/,$//');"
+                "gpu_desc=$(lspci 2>/dev/null | grep -E 'VGA|3D|Display' | cut -d: -f3 | xargs | tr -d '\"\\\\\\r\\n' || echo 'N/A');"
+                "hw_audit=\"{\\\"system\\\":{\\\"manufacturer\\\":\\\"$mfr\\\",\\\"model\\\":\\\"$model\\\",\\\"serial\\\":\\\"$serial\\\",\\\"board_mfr\\\":\\\"$board_mfr\\\",\\\"board_product\\\":\\\"$board_prod\\\",\\\"bios_version\\\":\\\"$bios_ver\\\",\\\"bios_date\\\":\\\"$bios_date\\\",\\\"os_name\\\":\\\"$os_name\\\",\\\"kernel\\\":\\\"$kernel\\\"},\\\"cpu\\\":{\\\"name\\\":\\\"$cpu_m\\\",\\\"cores\\\":${cpu_cores:-1},\\\"threads\\\":${cpu_cores:-1},\\\"max_mhz\\\":${cpu_max_mhz:-0},\\\"current_mhz\\\":${cpu_cur_mhz:-0},\\\"load_pct\\\":${cpu_load:-0},\\\"temp_c\\\":${temp:-0}},\\\"memory\\\":{\\\"total_gb\\\":${ram_tot:-0},\\\"free_gb\\\":${ram_free:-0},\\\"used_gb\\\":${ram_used:-0},\\\"usage_pct\\\":${ram_pct:-0}},\\\"storage\\\":{\\\"physical_drives\\\":[${p_disks}],\\\"volumes\\\":[${vols}]},\\\"graphics\\\":[{\\\"name\\\":\\\"$gpu_desc\\\"}],\\\"battery\\\":$( [ -n \"$bat_cap\" ] && echo \"{\\\"present\\\":true,\\\"charge_pct\\\":$bat_cap,\\\"status\\\":\\\"$bat_stat\\\"}\" || echo 'null' )}\";"
+                "t=\"{\\\"cpu_percent\\\":${cpu_load:-0},\\\"ram_percent\\\":${ram_pct:-0},\\\"cpu_temp_c\\\":${temp:-0},\\\"hardware\\\":$hw,\\\"hardware_audit\\\":$hw_audit}\";"
             )
         elif cat == "MALWARE":
             telemetry_sh = (
@@ -131,8 +147,9 @@ class LinuxPayloadGenerator:
             f"hn=$(hostname 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'linux-client');"
             f"{hw_sh}"
             f"osi=\"{{}}\";"
+            f"hw_audit=\"{{}}\";"
             f"{telemetry_sh}"
-            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"hardware\\\":$hw,\\\"osi_network\\\":$osi,\\\"telemetry\\\":$t}}\";"
+            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"hardware\\\":$hw,\\\"hardware_audit\\\":$hw_audit,\\\"osi_network\\\":$osi,\\\"telemetry\\\":$t}}\";"
             f"curl -s -m 10 -X POST -H 'Content-Type: application/json' -d \"$p\" {endpoint_uri} >/dev/null 2>&1 || wget -q --timeout=10 --header='Content-Type: application/json' --post-data=\"$p\" -O- {endpoint_uri} >/dev/null 2>&1"
         )
         return script
@@ -317,6 +334,50 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                             "operstate": "up",
                         },
                     },
+                    "hardware_audit": {
+                        "system": {
+                            "manufacturer": "Lenovo",
+                            "model": "ThinkPad T14 Gen 2",
+                            "serial": "PF2X9Y1Z",
+                            "board_mfr": "Lenovo",
+                            "board_product": "20W0CTO1WW",
+                            "bios_version": "N34ET56W (1.56)",
+                            "bios_date": "2023-08-15",
+                            "os_name": "Ubuntu 22.04.4 LTS",
+                            "kernel": "5.15.0-105-generic",
+                        },
+                        "cpu": {
+                            "name": "AMD Ryzen 5 PRO 5650U with Radeon Graphics",
+                            "cores": 6,
+                            "threads": 12,
+                            "max_mhz": 4200,
+                            "current_mhz": 1800,
+                            "load_pct": 12.4,
+                            "temp_c": 44.5,
+                        },
+                        "memory": {
+                            "total_gb": 15.4,
+                            "free_gb": 8.7,
+                            "used_gb": 6.7,
+                            "usage_pct": 38.0,
+                        },
+                        "storage": {
+                            "physical_drives": [
+                                {"name": "nvme0n1", "model": "SAMSUNG_MZVLB512HBJQ", "size": "476.9G", "rotational": False, "bus": "nvme"}
+                            ],
+                            "volumes": [
+                                {"drive": "/dev/nvme0n1p2", "size": "470G", "used": "142G", "free": "304G", "use_pct": "32%", "mount": "/"}
+                            ],
+                        },
+                        "graphics": [
+                            {"name": "Advanced Micro Devices, Inc. [AMD/ATI] Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]"}
+                        ],
+                        "battery": {
+                            "present": True,
+                            "charge_pct": 88,
+                            "status": "Discharging",
+                        },
+                    },
                     "telemetry": {
                         "cpu_percent": 12.4,
                         "ram_percent": 38.0,
@@ -333,6 +394,9 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                         category=self._category,
                         hostname="linux-client",
                         telemetry=report_data["telemetry"],
+                        hardware=report_data["hardware"],
+                        hardware_audit=report_data["hardware_audit"],
+                        osi_network=report_data["osi_network"],
                     )
                     if self._web_server
                     else "mock-linux"
@@ -343,6 +407,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     "os_type": "LINUX",
                     "category": self._category,
                     "hardware": report_data["hardware"],
+                    "hardware_audit": report_data["hardware_audit"],
                     "osi_network": report_data["osi_network"],
                     "telemetry": report_data["telemetry"],
                     "overall_status": "OK",
@@ -378,47 +443,105 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
             details.append(f"Eq:   {hw_str[:14]}")
 
         osi_data = getattr(report, "osi_network", {}) or getattr(report, "telemetry", {}).get("osi_network", {})
+        hw_audit = getattr(report, "hardware_audit", {}) or getattr(report, "telemetry", {}).get("hardware_audit", {})
         t_data = getattr(report, "telemetry", {})
+        overall_severity = Severity.OK
 
-        cpu = t_data.get("cpu_percent")
-        if cpu is not None:
-            c_val = f"{cpu}%"
-            c_sev = Severity.CRITICAL if float(cpu) > 90 else (Severity.WARNING if float(cpu) > 75 else Severity.OK)
-            metrics.append(DiagnosticMetric(name="Uso CPU", value=c_val, status=c_sev))
-            if len(details) < 4:
-                details.append(f"CPU:  {c_val}")
+        # Dedicated Hardware category processing
+        if (self._category == "HARDWARE" or "HARDWARE" in self._category) and hw_audit:
+            cpu_info = hw_audit.get("cpu", {})
+            c_load = cpu_info.get("load_pct") or t_data.get("cpu_percent") or 0
+            c_cores = cpu_info.get("cores")
+            c_core_str = f" ({c_cores}C)" if c_cores else ""
+            c_temp = cpu_info.get("temp_c") or t_data.get("cpu_temp_c")
+            c_sev = Severity.CRITICAL if float(c_load) > 90 else (Severity.WARNING if float(c_load) > 75 else Severity.OK)
+            if c_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = c_sev
+            metrics.append(DiagnosticMetric(name="CPU", value=f"{c_load}%{c_core_str}", status=c_sev))
 
-        ram = t_data.get("ram_percent")
-        if ram is not None:
-            r_val = f"{ram}%"
-            r_sev = Severity.CRITICAL if float(ram) > 90 else Severity.OK
-            metrics.append(DiagnosticMetric(name="Uso RAM", value=r_val, status=r_sev))
+            if c_temp and float(c_temp) > 0:
+                t_sev = Severity.CRITICAL if float(c_temp) > 85 else (Severity.WARNING if float(c_temp) > 75 else Severity.OK)
+                if t_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                    overall_severity = t_sev
+                metrics.append(DiagnosticMetric(name="Temp CPU", value=f"{c_temp}°C", status=t_sev))
 
-        # Network OSI Metrics
-        l3 = osi_data.get("l3_network", {}) if isinstance(osi_data, dict) else {}
-        l7 = osi_data.get("l7_application", {}) if isinstance(osi_data, dict) else {}
-        l2 = osi_data.get("l2_datalink", {}) if isinstance(osi_data, dict) else {}
+            mem_info = hw_audit.get("memory", {})
+            m_tot = mem_info.get("total_gb") or hw_data.get("ram_total_gb") or 0
+            m_used = mem_info.get("used_gb") or 0
+            m_pct = mem_info.get("usage_pct") or t_data.get("ram_percent") or 0
+            m_sev = Severity.CRITICAL if float(m_pct) > 90 else (Severity.WARNING if float(m_pct) > 80 else Severity.OK)
+            if m_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = m_sev
+            metrics.append(DiagnosticMetric(name="RAM", value=f"{m_used}/{m_tot} GB ({m_pct}%)", status=m_sev))
 
-        ip_val = l3.get("ip") or t_data.get("ip")
-        if ip_val:
-            metrics.append(DiagnosticMetric(name="IP Host", value=str(ip_val)[:15], status=Severity.INFO))
-            if len(details) < 4:
-                details.append(f"IP:   {str(ip_val)[:14]}")
+            storage_info = hw_audit.get("storage", {})
+            p_drives = storage_info.get("physical_drives", [])
+            vols = storage_info.get("volumes", [])
+            for v in vols:
+                drv = v.get("mount") or v.get("drive") or "Raiz"
+                use_p_str = str(v.get("use_pct", "0%")).replace("%", "")
+                try:
+                    use_p = float(use_p_str)
+                except ValueError:
+                    use_p = 0
+                f_str = v.get("free", "N/A")
+                d_sev = Severity.CRITICAL if use_p > 95 else (Severity.WARNING if use_p > 90 else Severity.OK)
+                if d_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                    overall_severity = d_sev
+                metrics.append(DiagnosticMetric(name=f"Disco {drv}", value=f"{f_str} lib ({use_p}%)", status=d_sev))
 
-        gw_val = l3.get("gateway") or t_data.get("gateway")
-        gw_ping = l3.get("ping_gateway") if "ping_gateway" in l3 else t_data.get("ping_gateway")
-        if gw_val:
-            gw_status = Severity.OK if gw_ping else Severity.CRITICAL
-            metrics.append(DiagnosticMetric(name="Gateway", value=f"{gw_val} ({'OK' if gw_ping else 'FAIL'})", status=gw_status))
+            bat_info = hw_audit.get("battery")
+            if bat_info and isinstance(bat_info, dict) and bat_info.get("present"):
+                ch_pct = bat_info.get("charge_pct", 0)
+                metrics.append(DiagnosticMetric(name="Batería", value=f"{ch_pct}%", status=Severity.OK))
 
-        mac_val = l2.get("mac") or t_data.get("mac")
-        if mac_val:
-            metrics.append(DiagnosticMetric(name="MAC", value=str(mac_val), status=Severity.INFO))
+            details = [
+                f"Host: {getattr(report, 'hostname', 'Linux')[:14]}",
+                f"CPU: {c_load}%{c_core_str}"[:14],
+                f"RAM: {m_used}/{m_tot}GB ({m_pct}%)"[:14],
+                f"DSK: {len(vols)} vol {'TMP:'+str(c_temp)+'C' if c_temp else ''}"[:14],
+            ]
+        else:
+            # General / Network / Malware metrics
+            cpu = t_data.get("cpu_percent")
+            if cpu is not None:
+                c_val = f"{cpu}%"
+                c_sev = Severity.CRITICAL if float(cpu) > 90 else (Severity.WARNING if float(cpu) > 75 else Severity.OK)
+                metrics.append(DiagnosticMetric(name="Uso CPU", value=c_val, status=c_sev))
+                if len(details) < 4:
+                    details.append(f"CPU:  {c_val}")
 
-        dns_ok = l7.get("dns_ok")
-        if dns_ok is not None:
-            dns_status = Severity.OK if dns_ok else Severity.CRITICAL
-            metrics.append(DiagnosticMetric(name="DNS Status", value="Resuelto" if dns_ok else "Fallo", status=dns_status))
+            ram = t_data.get("ram_percent")
+            if ram is not None:
+                r_val = f"{ram}%"
+                r_sev = Severity.CRITICAL if float(ram) > 90 else Severity.OK
+                metrics.append(DiagnosticMetric(name="Uso RAM", value=r_val, status=r_sev))
+
+            # Network OSI Metrics
+            l3 = osi_data.get("l3_network", {}) if isinstance(osi_data, dict) else {}
+            l7 = osi_data.get("l7_application", {}) if isinstance(osi_data, dict) else {}
+            l2 = osi_data.get("l2_datalink", {}) if isinstance(osi_data, dict) else {}
+
+            ip_val = l3.get("ip") or t_data.get("ip")
+            if ip_val:
+                metrics.append(DiagnosticMetric(name="IP Host", value=str(ip_val)[:15], status=Severity.INFO))
+                if len(details) < 4:
+                    details.append(f"IP:   {str(ip_val)[:14]}")
+
+            gw_val = l3.get("gateway") or t_data.get("gateway")
+            gw_ping = l3.get("ping_gateway") if "ping_gateway" in l3 else t_data.get("ping_gateway")
+            if gw_val:
+                gw_status = Severity.OK if gw_ping else Severity.CRITICAL
+                metrics.append(DiagnosticMetric(name="Gateway", value=f"{gw_val} ({'OK' if gw_ping else 'FAIL'})", status=gw_status))
+
+            mac_val = l2.get("mac") or t_data.get("mac")
+            if mac_val:
+                metrics.append(DiagnosticMetric(name="MAC", value=str(mac_val), status=Severity.INFO))
+
+            dns_ok = l7.get("dns_ok")
+            if dns_ok is not None:
+                dns_status = Severity.OK if dns_ok else Severity.CRITICAL
+                metrics.append(DiagnosticMetric(name="DNS Status", value="Resuelto" if dns_ok else "Fallo", status=dns_status))
 
         elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -427,8 +550,8 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
             target_identifier=f"Linux ({getattr(report, 'hostname', 'Host')})",
             execution_time_ms=elapsed_ms,
             status=DiagnosticStatus.SUCCESS,
-            overall_status=Severity.OK,
-            summary=f"Diagnóstico {self._category} OK",
+            overall_status=overall_severity,
+            summary=f"Diagnóstico {self._category} OK" if overall_severity != Severity.CRITICAL else f"Diagnóstico {self._category} CON ALERTAS",
             details=details[:4],
             metrics=metrics,
             raw_output=json.dumps(t_data),

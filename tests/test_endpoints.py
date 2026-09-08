@@ -285,6 +285,112 @@ class TestEndpoints(unittest.TestCase):
         self.assertIn("CAPA 2: ENLACE DE DATOS", html_out)
         self.assertIn("CorpNet", html_out)
 
+    def test_windows_hardware_payload_audit(self):
+        """Verify Windows PowerShell script for HARDWARE gathers comprehensive subsystem audit."""
+        for cat in ("ANALISIS HARDWARE", "HARDWARE"):
+            raw_hw = WindowsPayloadGenerator.get_powershell_script(cat)
+            self.assertIn("Win32_BaseBoard", raw_hw)
+            self.assertIn("Win32_BIOS", raw_hw)
+            self.assertIn("Win32_Processor", raw_hw)
+            self.assertIn("Win32_PhysicalMemory", raw_hw)
+            self.assertIn("Win32_DiskDrive", raw_hw)
+            self.assertIn("MSStorageDriver_FailurePredictStatus", raw_hw)
+            self.assertIn("Win32_LogicalDisk", raw_hw)
+            self.assertIn("Win32_VideoController", raw_hw)
+            self.assertIn("hardware_audit", raw_hw)
+
+    def test_linux_hardware_payload_audit(self):
+        """Verify Linux Bash script for HARDWARE gathers comprehensive subsystem audit."""
+        for cat in ("ANALISIS HARDWARE", "HARDWARE"):
+            raw_hw = LinuxPayloadGenerator.get_bash_script(cat)
+            self.assertIn("/sys/class/dmi/id", raw_hw)
+            self.assertIn("lsblk", raw_hw)
+            self.assertIn("df -h", raw_hw)
+            self.assertIn("thermal_zone0", raw_hw)
+            self.assertIn("lspci", raw_hw)
+            self.assertIn("hardware_audit", raw_hw)
+
+    def test_hardware_plugin_metrics_windows_and_linux(self):
+        """Verify dry run execution for HARDWARE extracts dedicated hardware metrics."""
+        injector = DuckyInjector(dry_run=True)
+        win_plugin = WindowsHIDPlugin(category="ANALISIS HARDWARE", keyboard_layout="es", injector=injector)
+        win_res = win_plugin.run()
+        self.assertEqual(win_res.status, DiagnosticStatus.SUCCESS)
+        win_metric_names = [m.name for m in win_res.metrics]
+        self.assertIn("CPU", win_metric_names)
+        self.assertIn("RAM", win_metric_names)
+        self.assertIn("Salud SMART", win_metric_names)
+        self.assertTrue(any("Disco" in m for m in win_metric_names))
+
+        linux_plugin = LinuxHIDPlugin(category="ANALISIS HARDWARE", keyboard_layout="es", injector=injector)
+        linux_res = linux_plugin.run()
+        self.assertEqual(linux_res.status, DiagnosticStatus.SUCCESS)
+        linux_metric_names = [m.name for m in linux_res.metrics]
+        self.assertIn("CPU", linux_metric_names)
+        self.assertIn("RAM", linux_metric_names)
+        self.assertIn("Temp CPU", linux_metric_names)
+        self.assertTrue(any("Disco" in m for m in linux_metric_names))
+
+    def test_mobile_html_renders_deep_hardware_audit(self):
+        """Verify mobile HTML report displays full hardware audit card with subsystems."""
+        server = REIWebServer(host="127.0.0.1", port=8994, base_url="http://127.0.0.1:8994")
+        rep_id = server.store_local_report(
+            os_type="WINDOWS",
+            category="ANALISIS HARDWARE",
+            hostname="DESKTOP-RIG",
+            telemetry={"cpu_percent": 14.5},
+            hardware={"manufacturer": "ASUSTeK", "model": "ROG STRIX B550-F"},
+            hardware_audit={
+                "system": {
+                    "board_mfr": "ASUSTeK COMPUTER INC.",
+                    "board_product": "ROG STRIX B550-F GAMING",
+                    "bios_version": "3002",
+                    "bios_date": "2023-02-23",
+                },
+                "cpu": {
+                    "name": "AMD Ryzen 7 5800X 8-Core Processor",
+                    "cores": 8,
+                    "threads": 16,
+                    "load_pct": 14.5,
+                    "current_mhz": 3800,
+                },
+                "memory": {
+                    "total_gb": 32.0,
+                    "used_gb": 11.2,
+                    "free_gb": 20.8,
+                    "usage_pct": 35.0,
+                    "slots_used": 2,
+                    "slots_total": 4,
+                    "dimms": [
+                        {"slot": "DIMM_A2", "size_gb": 16.0, "speed_mhz": 3600, "mfr": "Corsair"},
+                        {"slot": "DIMM_B2", "size_gb": 16.0, "speed_mhz": 3600, "mfr": "Corsair"},
+                    ],
+                },
+                "storage": {
+                    "physical_drives": [
+                        {"model": "Samsung SSD 980 PRO 1TB", "size_gb": 1000.2, "bus": "NVMe", "smart_fail": False}
+                    ],
+                    "volumes": [
+                        {"drive": "C:", "fs": "NTFS", "size_gb": 930.5, "free_gb": 650.2, "free_pct": 69.8}
+                    ],
+                },
+                "graphics": [
+                    {"name": "NVIDIA GeForce RTX 3080", "driver": "536.23", "vram_mb": 10240, "res": "2560 x 1440"}
+                ],
+            },
+        )
+        report = server.get_report(rep_id)
+        self.assertIsNotNone(report)
+        html_out = server._render_mobile_html(report)
+        self.assertIn("AUDITORÍA EXHAUSTIVA DE HARDWARE", html_out)
+        self.assertIn("ROG STRIX B550-F GAMING", html_out)
+        self.assertIn("Ryzen 7 5800X", html_out)
+        self.assertIn("DIMM_A2", html_out)
+        self.assertIn("Corsair", html_out)
+        self.assertIn("Samsung SSD 980 PRO", html_out)
+        self.assertIn("SMART OK", html_out)
+        self.assertIn("GeForce RTX 3080", html_out)
+
 
 if __name__ == "__main__":
     unittest.main()

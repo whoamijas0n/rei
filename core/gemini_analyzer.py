@@ -226,26 +226,31 @@ class GeminiDiagnosticAnalyzer:
             return self._generate_local_fallback_analysis(diagnostic_data, reason=f"Error inesperado al conectar con Gemini: {type(ex).__name__}.")
 
     def _build_analysis_prompt(self, data: Dict[str, Any]) -> str:
-        """Constructs an expert IT and Network diagnostician prompt following the OSI Top-Down model."""
+        """Constructs an expert IT, Network, and Hardware diagnostician prompt following the OSI Top-Down model and hardware subsystem analysis."""
         data_str = json.dumps(data, indent=2, ensure_ascii=False)
-        return f"""Eres un Ingeniero Principal de Redes, Infraestructura TI y Ciberseguridad. Analiza la siguiente telemetría de un host (identidad de hardware y pila de red organizada de arriba hacia abajo según el Modelo OSI: Capa 7 a Capa 1) recolectada por el dispositivo de campo REI.
+        return f"""Eres un Ingeniero Principal de Redes, Infraestructura TI, Diagnóstico de Hardware y Ciberseguridad. Analiza la siguiente telemetría de un host (identidad de hardware, subsistemas físicos de Placa/CPU/RAM/Almacenamiento/GPU, y pila de red organizada según el Modelo OSI: Capa 7 a Capa 1) recolectada por el dispositivo de campo REI.
 
 TELEMETRÍA RECOLECTADA:
 {data_str}
 
 DIRECTIVAS CRÍTICAS DE ANÁLISIS:
-1. Conecta los puntos entre capas (OSI Top-Down):
+1. Conecta los puntos en Red (Modelo OSI Top-Down):
    - Si la Capa 7 falla (resolución DNS o tráfico HTTP), determina si la causa raíz es de Capa 3 (pérdida de paquetes, ruta por defecto, ping Gateway/Internet), Capa 2 (falla de DHCP, dirección APIPA 169.254, baja señal Wi-Fi < 40%, conflicto ARP) o Capa 1 (cable desconectado, carrier down, negociación a 100M).
    - Identifica con precisión el dominio de la falla: ¿Es problema del ENDPOINT (driver, adaptador, IP estática errónea, portal cautivo no autenticado) o de la INFRAESTRUCTURA (DHCP agotado, switch caído, DNS caído, corte del ISP)?
-2. Considera el hardware del host (fabricante, modelo, CPU, RAM) para correlacionar posibles limitaciones de rendimiento o drivers.
-3. Proporciona comandos técnicos de remediación accionables y específicos para el sistema operativo detectado (PowerShell / netsh para Windows, ip / nmcli / systemd para Linux).
+2. Audita los Subsistemas de Hardware:
+   - Almacenamiento y Salud SMART: Si alguna unidad física predice fallos SMART (PredictFailure / smart_fail), catalógala inmediatamente como CRÍTICO y prioriza respaldo.
+   - Espacio en Disco: Si alguna partición tiene < 10% de espacio disponible, alertar riesgo de bloqueo; si tiene < 5%, marcar CRÍTICO.
+   - Procesador y Térmica: Correlaciona carga de CPU y temperatura. Si supera los 80°C, alerta sobre estrangulamiento térmico (thermal throttling).
+   - Memoria RAM: Evalúa saturación (> 90%) y slots/módulos para posibles cuellos de botella o necesidad de ampliación.
+   - Energía / Batería: Evalúa nivel de carga y desgaste en equipos portátiles.
+3. Proporciona comandos técnicos de remediación accionables y específicos para el sistema operativo detectado (PowerShell / WMI para Windows, bash / ip / smartctl / systemctl para Linux).
 
 Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
 {{
-  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del equipo y la red, indicando causa principal y severidad.",
+  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del equipo, hardware y red, indicando causas principales y severidad.",
   "overall_status": "OK" | "WARN" | "CRIT",
   "root_causes": [
-    "Causa raíz 1 identificada (indicando capa OSI afectada)",
+    "Causa raíz 1 identificada (indicando subsistema de hardware o capa OSI afectada)",
     "Causa raíz 2 identificada"
   ],
   "action_plan": [
@@ -276,13 +281,15 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
     def _generate_local_fallback_analysis(self, data: Dict[str, Any], reason: str = "") -> Dict[str, Any]:
         """
         Rule-based heuristic fallback analysis when Gemini API is unreachable.
-        Evaluates the network stack layer by layer (OSI Top-Down) and host hardware.
+        Evaluates the network stack layer by layer (OSI Top-Down) and all hardware subsystems.
         """
         telemetry = data.get("telemetry", {}) if isinstance(data.get("telemetry"), dict) else {}
         osi = data.get("osi_network") or telemetry.get("osi_network") or telemetry.get("osi", {})
         osi = osi if isinstance(osi, dict) else {}
         hw = data.get("hardware") or telemetry.get("hardware", {})
         hw = hw if isinstance(hw, dict) else {}
+        hw_audit = data.get("hardware_audit") or telemetry.get("hardware_audit", {})
+        hw_audit = hw_audit if isinstance(hw_audit, dict) else {}
         os_type = str(data.get("os_type", "")).upper()
         category = str(data.get("category", "")).upper()
 
@@ -292,6 +299,8 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
 
         # 1. Check Hardware (CPU & RAM)
         cpu_usage = telemetry.get("cpu_percent") or telemetry.get("cpu_usage")
+        if cpu_usage is None and hw_audit.get("cpu"):
+            cpu_usage = hw_audit["cpu"].get("load_pct")
         if cpu_usage and isinstance(cpu_usage, (int, float)) and cpu_usage > 90:
             root_causes.append(f"[Hardware] Uso crítico de CPU al {cpu_usage}%")
             cmd = "Get-Process | Sort-Object CPU -Descending | Select-Object -First 5" if os_type == "WINDOWS" else "top -b -n 1 | head -n 15"
@@ -299,10 +308,86 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
             status = "WARN"
 
         mem_usage = telemetry.get("ram_percent") or telemetry.get("ram_usage")
+        if mem_usage is None and hw_audit.get("memory"):
+            mem_usage = hw_audit["memory"].get("usage_pct")
         if mem_usage and isinstance(mem_usage, (int, float)) and mem_usage > 90:
             root_causes.append(f"[Hardware] Saturación de memoria RAM ({mem_usage}%)")
             action_plan.append("Reiniciar servicios o expandir memoria RAM del host")
             status = "WARN"
+
+        # 1.1 CPU Thermals & Throttling
+        cpu_info = hw_audit.get("cpu", {}) if isinstance(hw_audit.get("cpu"), dict) else {}
+        cpu_temp = cpu_info.get("temp_c") or telemetry.get("cpu_temp_c")
+        if cpu_temp is not None:
+            try:
+                temp_val = float(cpu_temp)
+                if temp_val > 85:
+                    root_causes.append(f"[Térmica] Temperatura crítica de CPU ({temp_val}°C): Riesgo de estrangulamiento térmico y apagado")
+                    action_plan.append("Limpiar ventiladores/disipador y reemplazar pasta térmica")
+                    status = "CRIT"
+                elif temp_val > 75:
+                    root_causes.append(f"[Térmica] Temperatura elevada en procesador ({temp_val}°C)")
+                    action_plan.append("Verificar flujo de aire del chasis y carga térmica")
+                    if status != "CRIT":
+                        status = "WARN"
+            except (ValueError, TypeError):
+                pass
+
+        # 1.2 Storage & SMART Health
+        storage_info = hw_audit.get("storage", {}) if isinstance(hw_audit.get("storage"), dict) else {}
+        p_drives = storage_info.get("physical_drives", []) if isinstance(storage_info.get("physical_drives"), list) else []
+        for pd in p_drives:
+            if isinstance(pd, dict) and pd.get("smart_fail") is True:
+                d_name = pd.get("model") or pd.get("name") or "Unidad de almacenamiento"
+                root_causes.append(f"[Almacenamiento] Falla predictiva SMART en disco {d_name}. Daño inminente.")
+                action_plan.append(f"Respaldar datos de inmediato y sustituir la unidad de disco {d_name}.")
+                status = "CRIT"
+
+        vols = storage_info.get("volumes", []) if isinstance(storage_info.get("volumes"), list) else []
+        for v in vols:
+            if isinstance(v, dict):
+                d_id = v.get("drive") or v.get("mount") or "Volumen"
+                free_pct = v.get("free_pct")
+                use_pct = v.get("use_pct")
+                try:
+                    if free_pct is not None:
+                        f_pct = float(free_pct)
+                        if f_pct < 5:
+                            root_causes.append(f"[Almacenamiento] Espacio crítico en volumen {d_id} (< 5% libre)")
+                            action_plan.append(f"Liberar espacio urgentemente en unidad {d_id}")
+                            status = "CRIT"
+                        elif f_pct < 10:
+                            root_causes.append(f"[Almacenamiento] Poco espacio libre en volumen {d_id} (< 10% libre)")
+                            action_plan.append(f"Limpiar archivos temporales y depurar volumen {d_id}")
+                            if status != "CRIT":
+                                status = "WARN"
+                    elif use_pct is not None:
+                        u_pct = float(str(use_pct).replace("%", ""))
+                        if u_pct > 95:
+                            root_causes.append(f"[Almacenamiento] Espacio crítico en montaje {d_id} ({u_pct}% en uso)")
+                            action_plan.append(f"Liberar espacio en partición {d_id}")
+                            status = "CRIT"
+                        elif u_pct > 90:
+                            root_causes.append(f"[Almacenamiento] Partición casi llena en {d_id} ({u_pct}% en uso)")
+                            action_plan.append(f"Limpiar registros y archivos en {d_id}")
+                            if status != "CRIT":
+                                status = "WARN"
+                except (ValueError, TypeError):
+                    pass
+
+        # 1.3 Battery Status
+        bat_info = hw_audit.get("battery") if isinstance(hw_audit.get("battery"), dict) else None
+        if bat_info and bat_info.get("present"):
+            b_ch = bat_info.get("charge_pct")
+            b_st = str(bat_info.get("status", "")).lower()
+            try:
+                if b_ch is not None and float(b_ch) < 10 and ("discharg" in b_st or "descarg" in b_st):
+                    root_causes.append(f"[Energía] Batería crítica ({b_ch}%) sin conexión AC")
+                    action_plan.append("Conectar el adaptador de corriente inmediatamente")
+                    if status != "CRIT":
+                        status = "WARN"
+            except (ValueError, TypeError):
+                pass
 
         # 2. Check OSI Layer 1 & 2 (Physical & Data Link)
         l1 = osi.get("l1_physical", {}) if isinstance(osi.get("l1_physical"), dict) else {}
@@ -377,8 +462,12 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
             status = "CRIT"
 
         if not root_causes:
-            root_causes.append("Pila de red nominal (Capa 7 a Capa 1). No se detectaron anomalías.")
-            action_plan.append("Mantener monitoreo preventivo y parches de seguridad al día.")
+            if "HARDWARE" in category or "CPU" in category:
+                root_causes.append("Subsistemas de hardware nominales (CPU, RAM, Discos y Firmware).")
+                action_plan.append("Mantener monitoreo preventivo y ventilación adecuada.")
+            else:
+                root_causes.append("Pila de red nominal (Capa 7 a Capa 1). No se detectaron anomalías.")
+                action_plan.append("Mantener monitoreo preventivo y parches de seguridad al día.")
 
         summary_suffix = f" [{reason}]" if reason else ""
         summary = f"Diagnóstico {category} ({os_type}): Estado general {status}.{summary_suffix}"
