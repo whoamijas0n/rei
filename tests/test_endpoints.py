@@ -391,6 +391,98 @@ class TestEndpoints(unittest.TestCase):
         self.assertIn("SMART OK", html_out)
         self.assertIn("GeForce RTX 3080", html_out)
 
+    def test_windows_malware_payload_audit(self):
+        """Verify Windows PowerShell script for MALWARE gathers comprehensive live threat audit."""
+        for cat in ("ANALISIS MALWARE", "MALWARE"):
+            raw_mal = WindowsPayloadGenerator.get_powershell_script(cat)
+            self.assertIn("AntiVirusProduct", raw_mal)
+            self.assertIn("productState", raw_mal)
+            self.assertIn("HNetCfg.FwPolicy2", raw_mal)
+            self.assertIn("Get-Process", raw_mal)
+            self.assertIn("AppData\\\\Local\\\\Temp", raw_mal)
+            self.assertIn("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", raw_mal)
+            self.assertIn("Get-NetTCPConnection", raw_mal)
+            self.assertIn("malware_audit", raw_mal)
+
+    def test_linux_malware_payload_audit(self):
+        """Verify Linux Bash script for MALWARE gathers comprehensive live threat audit."""
+        for cat in ("ANALISIS MALWARE", "MALWARE"):
+            raw_mal = LinuxPayloadGenerator.get_bash_script(cat)
+            self.assertIn("clamdscan", raw_mal)
+            self.assertIn("AppArmor", raw_mal)
+            self.assertIn("/proc/[0-9]*/exe", raw_mal)
+            self.assertIn("crontab -l", raw_mal)
+            self.assertIn("ss -tunp", raw_mal)
+            self.assertIn("/etc/hosts", raw_mal)
+            self.assertIn("malware_audit", raw_mal)
+
+    def test_malware_plugin_metrics_windows_and_linux(self):
+        """Verify dry run execution for MALWARE extracts dedicated threat metrics."""
+        injector = DuckyInjector(dry_run=True)
+        win_plugin = WindowsHIDPlugin(category="ANALISIS MALWARE", keyboard_layout="es", injector=injector)
+        win_res = win_plugin.run()
+        self.assertEqual(win_res.status, DiagnosticStatus.SUCCESS)
+        win_metric_names = [m.name for m in win_res.metrics]
+        self.assertIn("Antivirus", win_metric_names)
+        self.assertIn("Nivel Amenaza", win_metric_names)
+        self.assertIn("Proc Sospechosos", win_metric_names)
+        self.assertIn("Persistencias", win_metric_names)
+        self.assertIn("Conexiones C2", win_metric_names)
+
+        linux_plugin = LinuxHIDPlugin(category="ANALISIS MALWARE", keyboard_layout="es", injector=injector)
+        linux_res = linux_plugin.run()
+        self.assertEqual(linux_res.status, DiagnosticStatus.SUCCESS)
+        linux_metric_names = [m.name for m in linux_res.metrics]
+        self.assertIn("Antivirus", linux_metric_names)
+        self.assertIn("Nivel Amenaza", linux_metric_names)
+        self.assertIn("Proc Sospechosos", linux_metric_names)
+        self.assertIn("Persistencias", linux_metric_names)
+        self.assertIn("Conexiones C2", linux_metric_names)
+
+    def test_mobile_html_renders_malware_audit(self):
+        """Verify mobile HTML report displays full malware audit card with threat indicators."""
+        server = REIWebServer(host="127.0.0.1", port=8993, base_url="http://127.0.0.1:8993")
+        rep_id = server.store_local_report(
+            os_type="WINDOWS",
+            category="ANALISIS MALWARE",
+            hostname="WORKSTATION-SEC",
+            telemetry={"threat_level": "MEDIO"},
+            malware_audit={
+                "defenses": {
+                    "antivirus_name": "Microsoft Defender Antivirus",
+                    "antivirus_active": True,
+                    "firewall_enabled": True,
+                },
+                "threat_score": 30,
+                "threat_level": "MEDIO",
+                "suspicious_processes": [
+                    {"pid": 4812, "name": "miner.exe", "path": "C:\\Users\\User\\AppData\\Local\\Temp\\miner.exe", "reason": "Ejecución desde temporal"}
+                ],
+                "persistence": [
+                    {"type": "Registro Run", "name": "Updater", "path": "C:\\Temp\\run.bat", "location": "HKCU"}
+                ],
+                "network_c2": {
+                    "established_connections": [
+                        {"remote_ip": "198.51.100.23", "remote_port": 4444, "process": "miner.exe", "suspicious": True}
+                    ],
+                    "hosts_file_hijack": True,
+                },
+                "recent_artifacts": [
+                    {"name": "dropper.exe", "path": "C:\\Users\\User\\AppData\\Local\\Temp\\dropper.exe", "size_kb": 24.5, "date": "2026-09-07"}
+                ],
+            },
+        )
+        report = server.get_report(rep_id)
+        self.assertIsNotNone(report)
+        html_out = server._render_mobile_html(report)
+        self.assertIn("AUDITORÍA DE SEGURIDAD Y ANÁLISIS DE AMENAZAS", html_out)
+        self.assertIn("malware-card", html_out)
+        self.assertIn("miner.exe", html_out)
+        self.assertIn("SOSPECHOSO", html_out)
+        self.assertIn("198.51.100.23", html_out)
+        self.assertIn("ALTERADO / HIJACK", html_out)
+        self.assertIn("dropper.exe", html_out)
+
 
 if __name__ == "__main__":
     unittest.main()

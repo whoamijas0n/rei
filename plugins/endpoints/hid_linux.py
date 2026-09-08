@@ -104,9 +104,83 @@ class LinuxPayloadGenerator:
             )
         elif cat == "MALWARE":
             telemetry_sh = (
-                "procs=$(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2 | tr -d '\"\\\\\\r\\n' | tr '\\n' ',' | sed 's/,$//');"
-                "ports=$(ss -tulpn 2>/dev/null | grep LISTEN | awk '{print $5}' | head -n 5 | tr -d '\"\\\\\\r\\n' | tr '\\n' ',' | sed 's/,$//');"
-                "t=\"{\\\"top_procs\\\":\\\"$procs\\\",\\\"listening_ports\\\":\\\"$ports\\\"}\";"
+                "av_name=$(command -v clamdscan >/dev/null && echo 'ClamAV' || (command -v rkhunter >/dev/null && echo 'rkhunter' || echo 'Ninguno'));"
+                "av_act=$( [ \"$av_name\" != \"Ninguno\" ] && echo true || echo false );"
+                "fw_on=$( (command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'active') || iptables -L -n 2>/dev/null | grep -q 'Chain' && echo true || echo false );"
+                "sec_mod=\"Ninguno\";"
+                "if [ -d /sys/kernel/security/apparmor ]; then sec_mod=\"AppArmor\"; elif command -v getenforce >/dev/null 2>&1; then sec_mod=\"SELinux-$(getenforce 2>/dev/null)\"; fi;"
+                "defenses=\"{\\\"antivirus_name\\\":\\\"$av_name\\\",\\\"antivirus_active\\\":$av_act,\\\"firewall_enabled\\\":$fw_on,\\\"security_module\\\":\\\"$sec_mod\\\"}\";"
+                "susp_p=\"\"; susp_p_cnt=0;"
+                "for exe in /proc/[0-9]*/exe; do "
+                "[ -r \"$exe\" ] 2>/dev/null || continue;"
+                "tgt=$(readlink \"$exe\" 2>/dev/null);"
+                "[ -z \"$tgt\" ] && continue;"
+                "pid=$(basename $(dirname \"$exe\"));"
+                "pname=$(cat /proc/$pid/comm 2>/dev/null | tr -d '\"\\\\\\r\\n' || echo 'proc');"
+                "rsn=\"\";"
+                "case \"$tgt\" in "
+                "/tmp/*|/dev/shm/*|/var/tmp/*) rsn=\"Ejecucion desde directorio temporal\";;"
+                "*\\(deleted\\)*) rsn=\"Binario eliminado en memoria (deleted)\";;"
+                "esac;"
+                "if [ -n \"$rsn\" ]; then "
+                "susp_p=\"${susp_p}{\\\"pid\\\":$pid,\\\"name\\\":\\\"$pname\\\",\\\"path\\\":\\\"$tgt\\\",\\\"reason\\\":\\\"$rsn\\\"},\";"
+                "susp_p_cnt=$((susp_p_cnt + 1));"
+                "fi;"
+                "done;"
+                "susp_p=$(echo \"$susp_p\" | sed 's/,$//');"
+                "persist=\"\";"
+                "crons=$(crontab -l 2>/dev/null | grep -v '^#' | grep -E '[a-zA-Z0-9]' | head -n 5 | tr ' ' '_' | tr '\\n' ' ');"
+                "for c in $crons; do "
+                "c_clean=$(echo \"$c\" | tr '_' ' ' | tr -d '\"\\\\\\r\\n' | cut -c 1-50);"
+                "persist=\"${persist}{\\\"type\\\":\\\"Crontab\\\",\\\"name\\\":\\\"cron\\\",\\\"path\\\":\\\"$c_clean\\\",\\\"location\\\":\\\"user_crontab\\\"},\";"
+                "done;"
+                "u_units=$(systemctl --user list-unit-files --state=enabled 2>/dev/null | grep -E '\\.(service|timer)' | awk '{print $1}' | head -n 5);"
+                "for un in $u_units; do "
+                "[ -z \"$un\" ] && continue;"
+                "persist=\"${persist}{\\\"type\\\":\\\"Systemd User\\\",\\\"name\\\":\\\"$un\\\",\\\"path\\\":\\\"$un\\\",\\\"location\\\":\\\"~/.config/systemd\\\"},\";"
+                "done;"
+                "persist=$(echo \"$persist\" | sed 's/,$//');"
+                "c2_p=\"4444|1337|6667|8888|9001|31337\";"
+                "susp_conns=\"\"; c2_found=false;"
+                "conns=$(ss -tunp state established 2>/dev/null | awk 'NR>1 {print $4\"#\"$5\"#\"$6}' | head -n 10);"
+                "for c in $conns; do "
+                "[ -z \"$c\" ] && continue;"
+                "l_addr=$(echo \"$c\" | cut -d'#' -f1);"
+                "r_addr=$(echo \"$c\" | cut -d'#' -f2);"
+                "proc_f=$(echo \"$c\" | cut -d'#' -f3 | tr -d '\"\\\\\\r\\n');"
+                "r_ip=$(echo \"$r_addr\" | cut -d: -f1);"
+                "r_port=$(echo \"$r_addr\" | awk -F: '{print $NF}');"
+                "l_port=$(echo \"$l_addr\" | awk -F: '{print $NF}');"
+                "is_c2=false;"
+                "if echo \"$r_port\" | grep -qE \"^($c2_p)$\"; then is_c2=true; c2_found=true; fi;"
+                "susp_conns=\"${susp_conns}{\\\"remote_ip\\\":\\\"$r_ip\\\",\\\"remote_port\\\":${r_port:-0},\\\"local_port\\\":${l_port:-0},\\\"process\\\":\\\"$proc_f\\\",\\\"suspicious\\\":$is_c2},\";"
+                "done;"
+                "susp_conns=$(echo \"$susp_conns\" | sed 's/,$//');"
+                "listen_p=$(ss -tulpn 2>/dev/null | grep LISTEN | awk '{print $5}' | awk -F: '{print $NF}' | sort -u | head -n 10 | awk '{printf(\"{\\\"port\\\":%s},\", $1)}' | sed 's/,$//');"
+                "hosts_bad=false;"
+                "if grep -qE '(?i)(google|microsoft|virustotal|kaspersky|symantec)' /etc/hosts 2>/dev/null; then hosts_bad=true; fi;"
+                "temp_art=\"\"; temp_art_cnt=0;"
+                "arts=$(find /tmp /dev/shm -maxdepth 2 -type f -executable -mtime -7 2>/dev/null | head -n 5);"
+                "for a in $arts; do "
+                "[ -z \"$a\" ] && continue;"
+                "aname=$(basename \"$a\" | tr -d '\"\\\\\\r\\n');"
+                "asize=$(ls -sk \"$a\" 2>/dev/null | awk '{print $1}');"
+                "adate=$(date -r \"$a\" '+%Y-%m-%d' 2>/dev/null || echo 'reciente');"
+                "temp_art=\"${temp_art}{\\\"name\\\":\\\"$aname\\\",\\\"path\\\":\\\"$a\\\",\\\"size_kb\\\":${asize:-0},\\\"date\\\":\\\"$adate\\\"},\";"
+                "temp_art_cnt=$((temp_art_cnt + 1));"
+                "done;"
+                "temp_art=$(echo \"$temp_art\" | sed 's/,$//');"
+                "t_score=0;"
+                "if [ \"$av_act\" = \"false\" ]; then t_score=$((t_score + 25)); fi;"
+                "if [ $susp_p_cnt -gt 0 ]; then t_score=$((t_score + 30 * susp_p_cnt)); fi;"
+                "if [ \"$hosts_bad\" = \"true\" ]; then t_score=$((t_score + 25)); fi;"
+                "if [ $temp_art_cnt -gt 0 ]; then t_score=$((t_score + 15)); fi;"
+                "if [ \"$c2_found\" = \"true\" ]; then t_score=$((t_score + 35)); fi;"
+                "t_lvl=\"BAJO\";"
+                "if [ $t_score -ge 50 ]; then t_lvl=\"CRITICO\"; elif [ $t_score -ge 20 ]; then t_lvl=\"MEDIO\"; fi;"
+                "malware_audit=\"{\\\"defenses\\\":$defenses,\\\"suspicious_processes\\\":[${susp_p}],\\\"persistence\\\":[${persist}],\\\"network_c2\\\":{\\\"established_connections\\\":[${susp_conns}],\\\"listening_ports\\\":[${listen_p}],\\\"hosts_file_hijack\\\":$hosts_bad},\\\"recent_artifacts\\\":[${temp_art}],\\\"threat_score\\\":$t_score,\\\"threat_level\\\":\\\"$t_lvl\\\"}\";"
+                "top_p=$(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | head -n 6 | tail -n +2 | tr -d '\"\\\\\\r\\n' | tr '\\n' ',' | sed 's/,$//');"
+                "t=\"{\\\"antivirus_enabled\\\":\\\"$av_name\\\",\\\"antivirus_active\\\":$av_act,\\\"threat_level\\\":\\\"$t_lvl\\\",\\\"top_cpu_procs\\\":\\\"$top_p\\\",\\\"malware_audit\\\":$malware_audit}\";"
             )
         elif cat == "LOGS":
             telemetry_sh = (
@@ -148,8 +222,9 @@ class LinuxPayloadGenerator:
             f"{hw_sh}"
             f"osi=\"{{}}\";"
             f"hw_audit=\"{{}}\";"
+            f"malware_audit=\"{{}}\";"
             f"{telemetry_sh}"
-            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"hardware\\\":$hw,\\\"hardware_audit\\\":$hw_audit,\\\"osi_network\\\":$osi,\\\"telemetry\\\":$t}}\";"
+            f"p=\"{{\\\"os_type\\\":\\\"linux\\\",\\\"category\\\":\\\"{cat}\\\",\\\"hostname\\\":\\\"$hn\\\",\\\"hardware\\\":$hw,\\\"hardware_audit\\\":$hw_audit,\\\"malware_audit\\\":$malware_audit,\\\"osi_network\\\":$osi,\\\"telemetry\\\":$t}}\";"
             f"curl -s -m 10 -X POST -H 'Content-Type: application/json' -d \"$p\" {endpoint_uri} >/dev/null 2>&1 || wget -q --timeout=10 --header='Content-Type: application/json' --post-data=\"$p\" -O- {endpoint_uri} >/dev/null 2>&1"
         )
         return script
@@ -378,6 +453,28 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                             "status": "Discharging",
                         },
                     },
+                    "malware_audit": {
+                        "defenses": {
+                            "antivirus_name": "ClamAV",
+                            "antivirus_active": True,
+                            "firewall_enabled": True,
+                            "security_module": "AppArmor",
+                        },
+                        "suspicious_processes": [],
+                        "persistence": [
+                            {"type": "Systemd User", "name": "app.service", "path": "app.service", "location": "~/.config/systemd"}
+                        ],
+                        "network_c2": {
+                            "listening_ports": [
+                                {"port": 22}
+                            ],
+                            "established_connections": [],
+                            "hosts_file_hijack": False,
+                        },
+                        "recent_artifacts": [],
+                        "threat_score": 0,
+                        "threat_level": "BAJO",
+                    },
                     "telemetry": {
                         "cpu_percent": 12.4,
                         "ram_percent": 38.0,
@@ -386,6 +483,8 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                         "mac": "34:cf:f6:12:34:56",
                         "ping_gateway": True,
                         "ping_internet": True,
+                        "antivirus_enabled": "ClamAV",
+                        "threat_level": "BAJO",
                     },
                 }
                 rep_id = (
@@ -396,6 +495,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                         telemetry=report_data["telemetry"],
                         hardware=report_data["hardware"],
                         hardware_audit=report_data["hardware_audit"],
+                        malware_audit=report_data["malware_audit"],
                         osi_network=report_data["osi_network"],
                     )
                     if self._web_server
@@ -408,6 +508,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     "category": self._category,
                     "hardware": report_data["hardware"],
                     "hardware_audit": report_data["hardware_audit"],
+                    "malware_audit": report_data["malware_audit"],
                     "osi_network": report_data["osi_network"],
                     "telemetry": report_data["telemetry"],
                     "overall_status": "OK",
@@ -444,6 +545,7 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
 
         osi_data = getattr(report, "osi_network", {}) or getattr(report, "telemetry", {}).get("osi_network", {})
         hw_audit = getattr(report, "hardware_audit", {}) or getattr(report, "telemetry", {}).get("hardware_audit", {})
+        malware_audit = getattr(report, "malware_audit", {}) or getattr(report, "telemetry", {}).get("malware_audit", {})
         t_data = getattr(report, "telemetry", {})
         overall_severity = Severity.OK
 
@@ -500,6 +602,45 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                 f"CPU: {c_load}%{c_core_str}"[:14],
                 f"RAM: {m_used}/{m_tot}GB ({m_pct}%)"[:14],
                 f"DSK: {len(vols)} vol {'TMP:'+str(c_temp)+'C' if c_temp else ''}"[:14],
+            ]
+        # Dedicated Malware category processing
+        elif (self._category == "MALWARE" or "MALWARE" in self._category) and malware_audit:
+            def_info = malware_audit.get("defenses", {})
+            av_name = def_info.get("antivirus_name") or t_data.get("antivirus_enabled") or "Ninguno"
+            av_act = def_info.get("antivirus_active") if "antivirus_active" in def_info else (av_name != "Ninguno")
+            av_sev = Severity.OK if av_act else Severity.CRITICAL
+            if av_sev == Severity.CRITICAL:
+                overall_severity = Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="Antivirus", value=f"{str(av_name)[:12]} ({'OK' if av_act else 'OFF'})", status=av_sev))
+
+            th_lvl = malware_audit.get("threat_level", "BAJO")
+            th_score = malware_audit.get("threat_score", 0)
+            th_sev = Severity.CRITICAL if th_lvl == "CRITICO" else (Severity.WARNING if th_lvl == "MEDIO" else Severity.OK)
+            if th_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = th_sev
+            metrics.append(DiagnosticMetric(name="Nivel Amenaza", value=f"{th_lvl} ({th_score}pts)", status=th_sev))
+
+            susp_p = malware_audit.get("suspicious_processes", [])
+            p_sev = Severity.CRITICAL if len(susp_p) > 0 else Severity.OK
+            if p_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = p_sev
+            metrics.append(DiagnosticMetric(name="Proc Sospechosos", value=str(len(susp_p)), status=p_sev))
+
+            persist = malware_audit.get("persistence", [])
+            metrics.append(DiagnosticMetric(name="Persistencias", value=str(len(persist)), status=Severity.INFO if len(persist) < 5 else Severity.WARNING))
+
+            net_c2 = malware_audit.get("network_c2", {})
+            susp_conns = [c for c in net_c2.get("established_connections", []) if isinstance(c, dict) and c.get("suspicious")]
+            c2_sev = Severity.CRITICAL if len(susp_conns) > 0 else Severity.OK
+            if c2_sev != Severity.OK:
+                overall_severity = Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="Conexiones C2", value=str(len(susp_conns)), status=c2_sev))
+
+            details = [
+                f"Host: {getattr(report, 'hostname', 'Linux')[:14]}",
+                f"AV: {'OK' if av_act else 'DESACTIVADO'}"[:14],
+                f"P:{len(susp_p)} Pers:{len(persist)} C2:{len(susp_conns)}"[:14],
+                f"Riesgo: {th_lvl}"[:14],
             ]
         else:
             # General / Network / Malware metrics

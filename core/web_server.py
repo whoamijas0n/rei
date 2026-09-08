@@ -45,6 +45,7 @@ class StoredReport:
         self.metrics = data.get("metrics", [])
         self.hardware = data.get("hardware") or self.telemetry.get("hardware", {})
         self.hardware_audit = data.get("hardware_audit") or self.telemetry.get("hardware_audit", {})
+        self.malware_audit = data.get("malware_audit") or self.telemetry.get("malware_audit", {})
         self.osi_network = data.get("osi_network") or self.telemetry.get("osi_network") or self.telemetry.get("osi", {})
         self.ai_analysis: Optional[Dict[str, Any]] = None
         self.overall_status = "OK"
@@ -59,6 +60,7 @@ class StoredReport:
             "overall_status": self.overall_status,
             "hardware": self.hardware,
             "hardware_audit": self.hardware_audit,
+            "malware_audit": self.malware_audit,
             "osi_network": self.osi_network,
             "telemetry": self.telemetry,
             "metrics": self.metrics,
@@ -380,6 +382,115 @@ class REIWebServer:
             </div>
             """
 
+        # 1.6 Malware & Live Threat Audit
+        malware_audit = getattr(report, "malware_audit", None) or (report.telemetry.get("malware_audit") if isinstance(report.telemetry, dict) else {})
+        malware_audit_html = ""
+        if malware_audit and isinstance(malware_audit, dict) and any(k in malware_audit for k in ("defenses", "suspicious_processes", "persistence", "network_c2", "recent_artifacts", "threat_score", "threat_level")):
+            th_lvl = str(malware_audit.get("threat_level") or "BAJO").upper()
+            th_score = malware_audit.get("threat_score", 0)
+            th_pill = '<span class="status-pill pill-crit">CRÍTICO</span>' if th_lvl == "CRITICO" else ('<span class="status-pill pill-warn">MEDIO</span>' if th_lvl == "MEDIO" else '<span class="status-pill pill-ok">BAJO</span>')
+
+            # Defenses
+            defs = malware_audit.get("defenses", {}) if isinstance(malware_audit.get("defenses"), dict) else {}
+            av_n = html.escape(str(defs.get("antivirus_name") or "Ninguno"))
+            av_act = defs.get("antivirus_active", False)
+            av_pill = '<span class="status-pill pill-ok">Activo</span>' if av_act else '<span class="status-pill pill-crit">Desactivado</span>'
+            fw = defs.get("firewall_enabled")
+            fw_pill = ('<span class="status-pill pill-ok">Habilitado</span>' if fw else '<span class="status-pill pill-crit">Deshabilitado</span>') if fw is not None else '<span class="status-pill pill-warn">No reportado</span>'
+            sec_mod = defs.get("security_module")
+            sec_mod_row = f"<tr><td>Módulo de Seguridad:</td><td><strong>{html.escape(str(sec_mod))}</strong></td></tr>" if sec_mod else ""
+
+            # Suspicious Processes
+            susp_procs = malware_audit.get("suspicious_processes", []) if isinstance(malware_audit.get("suspicious_processes"), list) else []
+            if susp_procs:
+                proc_items = []
+                for p in susp_procs:
+                    if isinstance(p, dict):
+                        p_pid = p.get("pid", "?")
+                        p_n = html.escape(str(p.get("name") or "proceso"))
+                        p_path = html.escape(str(p.get("path") or ""))
+                        p_rsn = html.escape(str(p.get("reason") or "Anomalía"))
+                        proc_items.append(f"<li><span class='status-pill pill-crit'>PID {p_pid}</span> <strong>{p_n}</strong> - <code>{p_path}</code><br><small style='color:#f87171'>Motivo: {p_rsn}</small></li>")
+                procs_html = f"<tr><td>Procesos Anómalos:</td><td><ul style='margin:0;padding-left:1rem'>{''.join(proc_items)}</ul></td></tr>"
+            else:
+                procs_html = "<tr><td>Procesos en Memoria:</td><td><span class='status-pill pill-ok'>Correcto</span> Sin procesos en directorios temporales ni anomalías detectadas.</td></tr>"
+
+            # Persistence
+            persist = malware_audit.get("persistence", []) if isinstance(malware_audit.get("persistence"), list) else []
+            if persist:
+                persist_items = []
+                for pr in persist:
+                    if isinstance(pr, dict):
+                        pr_t = html.escape(str(pr.get("type") or "Persistencia"))
+                        pr_n = html.escape(str(pr.get("name") or ""))
+                        pr_p = html.escape(str(pr.get("path") or ""))
+                        persist_items.append(f"<li><strong>[{pr_t}]</strong> {pr_n}: <code>{pr_p}</code></li>")
+                persist_html = f"<tr><td>Mecanismos de Inicio:</td><td><ul style='margin:0;padding-left:1rem'>{''.join(persist_items)}</ul></td></tr>"
+            else:
+                persist_html = "<tr><td>Mecanismos de Inicio:</td><td><span class='status-pill pill-ok'>Limpio</span> Sin entradas de persistencia registradas.</td></tr>"
+
+            # Network C2 & Sockets
+            net_c2 = malware_audit.get("network_c2", {}) if isinstance(malware_audit.get("network_c2"), dict) else {}
+            conns = net_c2.get("established_connections", []) if isinstance(net_c2.get("established_connections"), list) else []
+            c2_items = []
+            for c in conns:
+                if isinstance(c, dict):
+                    rip = html.escape(str(c.get("remote_ip") or ""))
+                    rport = c.get("remote_port", 0)
+                    proc = html.escape(str(c.get("process") or ""))
+                    is_susp = c.get("suspicious", False)
+                    if is_susp:
+                        c2_items.append(f"<li><span class='status-pill pill-crit'>SOSPECHOSO</span> <code>{rip}:{rport}</code> (Proc: {proc})</li>")
+                    else:
+                        c2_items.append(f"<li><code>{rip}:{rport}</code> (Proc: {proc})</li>")
+            c2_html = f"<tr><td>Conexiones Establecidas:</td><td><ul style='margin:0;padding-left:1rem'>{''.join(c2_items)}</ul></td></tr>" if c2_items else "<tr><td>Conexiones Establecidas:</td><td>Sin conexiones externas salientes activas.</td></tr>"
+
+            hosts_hijack = net_c2.get("hosts_file_hijack", False)
+            hosts_pill = '<span class="status-pill pill-crit">ALTERADO / HIJACK</span> Redirección de antivirus o dominios críticos detectada' if hosts_hijack else '<span class="status-pill pill-ok">Íntegro</span>'
+
+            # Recent Temp Artifacts
+            recent_art = malware_audit.get("recent_artifacts", []) if isinstance(malware_audit.get("recent_artifacts"), list) else []
+            if recent_art:
+                art_items = []
+                for a in recent_art:
+                    if isinstance(a, dict):
+                        a_n = html.escape(str(a.get("name") or ""))
+                        a_p = html.escape(str(a.get("path") or ""))
+                        a_sz = a.get("size_kb", 0)
+                        a_dt = html.escape(str(a.get("date") or ""))
+                        art_items.append(f"<li><code>{a_n}</code> ({a_sz} KB, {a_dt}) - <small>{a_p}</small></li>")
+                art_html = f"<tr><td>Binarios en Temp (<7 días):</td><td><ul style='margin:0;padding-left:1rem'>{''.join(art_items)}</ul></td></tr>"
+            else:
+                art_html = "<tr><td>Binarios en Temp (<7 días):</td><td><span class='status-pill pill-ok'>Ninguno</span> No se hallaron ejecutables recientes en carpetas temporales.</td></tr>"
+
+            malware_audit_html = f"""
+            <div class="card malware-card">
+                <div class="card-header">🛡️ AUDITORÍA DE SEGURIDAD Y ANÁLISIS DE AMENAZAS</div>
+                <table>
+                    <tbody>
+                        <tr class="layer-header"><td colspan="2">EVALUACIÓN HEURÍSTICA Y DEFENSAS</td></tr>
+                        <tr><td>Nivel de Amenaza Estimado:</td><td>{th_pill} (Puntaje Heurístico: <strong>{th_score} pts</strong>)</td></tr>
+                        <tr><td>Software Antivirus:</td><td><strong>{av_n}</strong> ({av_pill})</td></tr>
+                        <tr><td>Cortafuegos (Firewall):</td><td>{fw_pill}</td></tr>
+                        {sec_mod_row}
+
+                        <tr class="layer-header"><td colspan="2">PROCESOS SOSPECHOSOS Y MEMORIA</td></tr>
+                        {procs_html}
+
+                        <tr class="layer-header"><td colspan="2">PERSISTENCIA Y ARRANQUE AUTOMÁTICO</td></tr>
+                        {persist_html}
+
+                        <tr class="layer-header"><td colspan="2">RED, SOCKETS Y ARCHIVO HOSTS</td></tr>
+                        <tr><td>Integridad de Archivo Hosts:</td><td>{hosts_pill}</td></tr>
+                        {c2_html}
+
+                        <tr class="layer-header"><td colspan="2">ARTEFACTOS Y STAGING EN CARPETAS TEMPORALES</td></tr>
+                        {art_html}
+                    </tbody>
+                </table>
+            </div>
+            """
+
         # 2. OSI Stack Network Diagnostics
         osi = report.osi_network or (report.telemetry.get("osi_network") or report.telemetry.get("osi", {}) if isinstance(report.telemetry, dict) else {})
         osi_html = ""
@@ -530,7 +641,7 @@ class REIWebServer:
         telemetry_rows = ""
         if isinstance(report.telemetry, dict):
             for k, v in report.telemetry.items():
-                if k in ("hardware", "hardware_audit", "osi_network", "osi"):
+                if k in ("hardware", "hardware_audit", "malware_audit", "osi_network", "osi"):
                     continue
                 k_clean = html.escape(str(k).replace("_", " ").title())
                 if isinstance(v, (dict, list)):
@@ -593,6 +704,7 @@ class REIWebServer:
         .ai-card {{ border-color: #8b5cf6; }}
         .osi-card {{ border-color: #0284c7; }}
         .hw-card {{ border-color: #06b6d4; }}
+        .malware-card {{ border-color: #ef4444; }}
         .card-header {{ font-weight: 700; margin-bottom: 0.5rem; font-size: 0.95rem; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
         td {{ padding: 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }}
@@ -623,6 +735,8 @@ class REIWebServer:
     {hw_html}
 
     {hw_audit_html}
+
+    {malware_audit_html}
 
     {osi_html}
 
@@ -663,6 +777,7 @@ class REIWebServer:
         ai_analysis: Optional[Dict[str, Any]] = None,
         hardware: Optional[Dict[str, Any]] = None,
         hardware_audit: Optional[Dict[str, Any]] = None,
+        malware_audit: Optional[Dict[str, Any]] = None,
         osi_network: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Stores a report constructed locally by REI and returns its report_id."""
@@ -676,6 +791,7 @@ class REIWebServer:
                 "telemetry": telemetry,
                 "hardware": hardware or (telemetry.get("hardware", {}) if isinstance(telemetry, dict) else {}),
                 "hardware_audit": hardware_audit or (telemetry.get("hardware_audit", {}) if isinstance(telemetry, dict) else {}),
+                "malware_audit": malware_audit or (telemetry.get("malware_audit", {}) if isinstance(telemetry, dict) else {}),
                 "osi_network": osi_network or (telemetry.get("osi_network") or telemetry.get("osi", {}) if isinstance(telemetry, dict) else {}),
             },
         )
@@ -685,6 +801,8 @@ class REIWebServer:
             stored.hardware = hardware
         if hardware_audit:
             stored.hardware_audit = hardware_audit
+        if malware_audit:
+            stored.malware_audit = malware_audit
         if osi_network:
             stored.osi_network = osi_network
 

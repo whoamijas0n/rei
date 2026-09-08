@@ -243,14 +243,21 @@ DIRECTIVAS CRÍTICAS DE ANÁLISIS:
    - Procesador y Térmica: Correlaciona carga de CPU y temperatura. Si supera los 80°C, alerta sobre estrangulamiento térmico (thermal throttling).
    - Memoria RAM: Evalúa saturación (> 90%) y slots/módulos para posibles cuellos de botella o necesidad de ampliación.
    - Energía / Batería: Evalúa nivel de carga y desgaste en equipos portátiles.
-3. Proporciona comandos técnicos de remediación accionables y específicos para el sistema operativo detectado (PowerShell / WMI para Windows, bash / ip / smartctl / systemctl para Linux).
+3. Audita la Seguridad, Amenazas y Posible Malware (DFIR Triage):
+   - Defensas del Endpoint: Si el antivirus está inactivo o ausente, o el cortafuegos deshabilitado, cataloga como riesgo CRÍTICO.
+   - Procesos Sospechosos y Memoria: Evalúa procesos ejecutándose desde directorios temporales (%TEMP%, AppData, /tmp, /dev/shm), suplantación de nombres (masquerading como svchost/lsass fuera de System32), o binarios eliminados en memoria (deleted).
+   - Persistencia: Evalúa claves Run/RunOnce, Carpeta de Inicio (Startup), Crontabs de usuario y servicios systemd locales.
+   - Conexiones y Sockets C2: Detecta conexiones salientes hacia puertos comunes de Command & Control o reverse shells (4444, 1337, 6667, 8888, 9001, 31337). Si existen, marcar inmediatamente como CRÍTICO.
+   - Integridad del Sistema: Si el archivo hosts presenta redirecciones de dominios de seguridad o actualización, marcar de inmediato como CRÍTICO.
+   - Artefactos Recientes: Alerta sobre binarios o scripts sospechosos depositados en carpetas temporales durante los últimos 7 días.
+4. Proporciona comandos técnicos de remediación accionables y específicos para el sistema operativo detectado (PowerShell / WMI para Windows, bash / ip / smartctl / systemctl para Linux).
 
 Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
 {{
-  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del equipo, hardware y red, indicando causas principales y severidad.",
+  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del equipo, hardware, seguridad/amenazas y red, indicando causas principales y severidad.",
   "overall_status": "OK" | "WARN" | "CRIT",
   "root_causes": [
-    "Causa raíz 1 identificada (indicando subsistema de hardware o capa OSI afectada)",
+    "Causa raíz 1 identificada (indicando subsistema de hardware, seguridad o capa OSI afectada)",
     "Causa raíz 2 identificada"
   ],
   "action_plan": [
@@ -290,6 +297,8 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
         hw = hw if isinstance(hw, dict) else {}
         hw_audit = data.get("hardware_audit") or telemetry.get("hardware_audit", {})
         hw_audit = hw_audit if isinstance(hw_audit, dict) else {}
+        malware_audit = data.get("malware_audit") or telemetry.get("malware_audit", {})
+        malware_audit = malware_audit if isinstance(malware_audit, dict) else {}
         os_type = str(data.get("os_type", "")).upper()
         category = str(data.get("category", "")).upper()
 
@@ -454,15 +463,71 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
                 action_plan.append("Resolver primero la conectividad de Capa 3 antes del servicio de nombres")
             status = "CRIT"
 
-        # 5. Check Malware / Antivirus
-        defender_active = telemetry.get("antivirus_enabled")
-        if defender_active is False:
-            root_causes.append("[Seguridad] Protección antivirus desactivada en el host")
-            action_plan.append("Habilitar Windows Defender o software antivirus corporativo")
+        # 5. Check Malware / Threat Analysis
+        is_malware_scan = bool("MALWARE" in category or "VIRUS" in category or malware_audit)
+        defs = malware_audit.get("defenses", {}) if isinstance(malware_audit.get("defenses"), dict) else {}
+        av_name = defs.get("antivirus_name") or telemetry.get("antivirus_enabled")
+        av_act = defs.get("antivirus_active") if "antivirus_active" in defs else telemetry.get("antivirus_active")
+
+        if is_malware_scan:
+            if av_act is False or (av_name is not None and str(av_name).strip() in ("Ninguno", "None", "")):
+                root_causes.append("[Seguridad] Protección antivirus desactivada o ausente en el endpoint")
+                av_cmd = "Set-MpPreference -DisableRealtimeMonitoring $false" if os_type == "WINDOWS" else "sudo systemctl start clamav-daemon"
+                action_plan.append(f"Activar de inmediato la protección en tiempo real: {av_cmd}")
+                status = "CRIT"
+        else:
+            if av_act is False or telemetry.get("antivirus_enabled") is False:
+                root_causes.append("[Seguridad] Protección antivirus desactivada en el host")
+                action_plan.append("Habilitar Windows Defender o software antivirus corporativo")
+                status = "CRIT"
+
+        fw_enabled = defs.get("firewall_enabled")
+        if fw_enabled is False:
+            root_causes.append("[Seguridad] Cortafuegos (Firewall) deshabilitado en el endpoint")
+            fw_cmd = "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True" if os_type == "WINDOWS" else "sudo ufw enable"
+            action_plan.append(f"Habilitar cortafuegos local: {fw_cmd}")
+            if status != "CRIT":
+                status = "WARN"
+
+        susp_procs = malware_audit.get("suspicious_processes", []) if isinstance(malware_audit.get("suspicious_processes"), list) else []
+        for sp in susp_procs:
+            if isinstance(sp, dict):
+                p_name = sp.get("name") or "proceso"
+                p_pid = sp.get("pid") or "?"
+                p_rsn = sp.get("reason") or "Ubicación anómala"
+                root_causes.append(f"[Malware/Procesos] Proceso sospechoso en ejecución: {p_name} (PID {p_pid}) - {p_rsn}")
+                kill_cmd = f"Stop-Process -Id {p_pid} -Force" if os_type == "WINDOWS" else f"kill -9 {p_pid}"
+                action_plan.append(f"Aislar y terminar proceso anómalo {p_name} (PID {p_pid}): {kill_cmd}")
+                status = "CRIT"
+
+        net_c2 = malware_audit.get("network_c2", {}) if isinstance(malware_audit.get("network_c2"), dict) else {}
+        susp_conns = [c for c in net_c2.get("established_connections", []) if isinstance(c, dict) and c.get("suspicious")]
+        for sc in susp_conns:
+            rip = sc.get("remote_ip")
+            rport = sc.get("remote_port")
+            p_own = sc.get("process") or "desconocido"
+            root_causes.append(f"[Malware/C2] Conexión establecida a socket C2 sospechoso: {rip}:{rport} (Proceso: {p_own})")
+            action_plan.append(f"Bloquear tráfico hacia {rip}:{rport} en el firewall perimetral y desconectar equipo de la red")
             status = "CRIT"
 
+        if net_c2.get("hosts_file_hijack") is True:
+            root_causes.append("[Malware/Hosts] Archivo hosts alterado: Redirección maliciosa de dominios de antivirus o repositorios")
+            h_cmd = "notepad C:\\Windows\\System32\\drivers\\etc\\hosts" if os_type == "WINDOWS" else "sudo nano /etc/hosts"
+            action_plan.append(f"Restaurar archivo hosts original y depurar entradas ilegítimas: {h_cmd}")
+            status = "CRIT"
+
+        recent_arts = malware_audit.get("recent_artifacts", []) if isinstance(malware_audit.get("recent_artifacts"), list) else []
+        if recent_arts:
+            root_causes.append(f"[Malware/Staging] Detectados {len(recent_arts)} ejecutables/scripts recientes creados en carpetas temporales (<7 días)")
+            action_plan.append("Inspeccionar y eliminar binarios staging sospechosos en directorios temporales")
+            if status != "CRIT":
+                status = "WARN"
+
         if not root_causes:
-            if "HARDWARE" in category or "CPU" in category:
+            if "MALWARE" in category or "VIRUS" in category:
+                root_causes.append("Auditoría de seguridad nominal. No se detectaron indicios de malware, procesos anómalos ni sockets C2.")
+                action_plan.append("Mantener definiciones antivirus actualizadas y realizar análisis periódicos.")
+            elif "HARDWARE" in category or "CPU" in category:
                 root_causes.append("Subsistemas de hardware nominales (CPU, RAM, Discos y Firmware).")
                 action_plan.append("Mantener monitoreo preventivo y ventilación adecuada.")
             else:

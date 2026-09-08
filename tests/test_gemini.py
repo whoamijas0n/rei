@@ -276,6 +276,68 @@ class TestGeminiAnalyzer(unittest.TestCase):
         self.assertIn("91.5", causes_str)
         self.assertIn("Térmica", causes_str)
 
+    def test_build_analysis_prompt_includes_malware_directives(self):
+        """Verify the prompt explicitly instructs DFIR threat triage and malware checks."""
+        prompt = self.analyzer._build_analysis_prompt({"os_type": "WINDOWS", "category": "MALWARE"})
+        self.assertIn("DFIR Triage", prompt)
+        self.assertIn("Posible Malware", prompt)
+        self.assertIn("Command & Control", prompt)
+
+    def test_local_fallback_malware_antivirus_disabled(self):
+        """Verify fallback detects inactive or missing antivirus as CRITICAL."""
+        data = {
+            "os_type": "WINDOWS",
+            "category": "ANALISIS MALWARE",
+            "malware_audit": {
+                "defenses": {"antivirus_name": "Ninguno", "antivirus_active": False, "firewall_enabled": False}
+            }
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("antivirus", causes_str.lower())
+        self.assertIn("firewall", causes_str.lower())
+
+    def test_local_fallback_malware_suspicious_processes(self):
+        """Verify fallback detects processes running from temp or masquerading as CRITICAL."""
+        data = {
+            "os_type": "LINUX",
+            "category": "ANALISIS MALWARE",
+            "malware_audit": {
+                "defenses": {"antivirus_name": "ClamAV", "antivirus_active": True, "firewall_enabled": True},
+                "suspicious_processes": [
+                    {"pid": 9821, "name": "xmrig", "path": "/tmp/xmrig", "reason": "Ejecución desde /tmp"}
+                ]
+            }
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("xmrig", causes_str)
+        self.assertIn("9821", causes_str)
+
+    def test_local_fallback_malware_c2_connection_and_hosts_hijack(self):
+        """Verify fallback flags suspicious C2 socket and hijacked hosts file as CRITICAL."""
+        data = {
+            "os_type": "WINDOWS",
+            "category": "ANALISIS MALWARE",
+            "malware_audit": {
+                "defenses": {"antivirus_name": "Defender", "antivirus_active": True, "firewall_enabled": True},
+                "network_c2": {
+                    "established_connections": [
+                        {"remote_ip": "185.220.101.5", "remote_port": 4444, "process": "powershell.exe", "suspicious": True}
+                    ],
+                    "hosts_file_hijack": True
+                }
+            }
+        }
+        res = self.analyzer.analyze_diagnostic(data)
+        self.assertEqual(res["overall_status"], "CRIT")
+        causes_str = " ".join(res["root_causes"])
+        self.assertIn("185.220.101.5", causes_str)
+        self.assertIn("C2", causes_str)
+        self.assertIn("hosts", causes_str.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

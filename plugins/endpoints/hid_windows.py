@@ -153,10 +153,102 @@ class WindowsPayloadGenerator:
             """
         elif cat == "MALWARE":
             telemetry_ps = """
-            $av=(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Select-Object -First 1 -ExpandProperty displayName);
-            $procs=(Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object {"$($_.ProcessName)($([math]::Round($_.CPU,1))s)"}) -join ', ';
-            $ports=(Get-NetTCPConnection -State Listen | Select-Object -First 6 | ForEach-Object {"$($_.LocalPort)"}) -join ', ';
-            $t=@{antivirus_enabled=$av;top_cpu_procs=$procs;listening_ports=$ports};
+            $av_prod=Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue | Select-Object -First 1;
+            $av_name=if($av_prod){$av_prod.displayName}else{"Ninguno"};
+            $av_act=$false;
+            if($av_prod){
+                try{
+                    $st_h=[Convert]::ToString($av_prod.productState, 16).PadLeft(6, '0');
+                    if($st_h.Substring(1, 2) -in @("10", "11")){$av_act=$true}
+                }catch{$av_act=$true}
+            }
+            $fw_on=try{(New-Object -ComObject HNetCfg.FwPolicy2).FirewallEnabled(1)}catch{$null};
+
+            $all_p=Get-Process -ErrorAction SilentlyContinue | Where-Object {$_.Path};
+            $susp_p=@();
+            foreach($pr in $all_p){
+                $pp=$pr.Path;
+                $pn=$pr.ProcessName;
+                $susp=$false;
+                $rsn="";
+                if($pp -match '(?i)\\\\AppData\\\\Local\\\\Temp' -or $pp -match '(?i)\\\\Users\\\\Public'){
+                    $susp=$true;$rsn="Ejecución desde carpeta temporal/pública";
+                }elseif($pn -in @("svchost","lsass","explorer","services") -and ($pp -notmatch '(?i)^C:\\\\Windows\\\\System32' -and $pp -notmatch '(?i)^C:\\\\Windows\\\\explorer.exe')){
+                    $susp=$true;$rsn="Suplantación de proceso (Masquerading)";
+                }
+                if($susp){
+                    $susp_p+=@{pid=$pr.Id;name=$pn;path=$pp;reason=$rsn;cpu=if($pr.CPU){[math]::Round($pr.CPU,1)}else{0}}
+                }
+            }
+
+            $persist=@();
+            foreach($rp in @("HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")){
+                if(Test-Path $rp){
+                    $props=Get-ItemProperty $rp -ErrorAction SilentlyContinue;
+                    if($props){
+                        $props.PSObject.Properties | Where-Object {$_.Name -notmatch '^PS' -and $_.Value} | ForEach-Object {
+                            $persist+=@{type="Registro Run";name=$_.Name;path=($_.Value).ToString();location=$rp}
+                        }
+                    }
+                }
+            }
+            $su_dir=[Environment]::GetFolderPath('Startup');
+            if(Test-Path $su_dir){
+                Get-ChildItem $su_dir -ErrorAction SilentlyContinue | ForEach-Object {
+                    $persist+=@{type="Carpeta Inicio";name=$_.Name;path=$_.FullName;location="Startup"}
+                }
+            }
+
+            $conns=Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Where-Object {$_.RemoteAddress -notmatch '^(127\\.|10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|::1|0\\.0\\.0\\.0)'} | Select-Object -First 10;
+            $susp_conns=@();
+            $c2_p=@(4444, 1337, 6667, 8888, 9001, 31337);
+            foreach($c in $conns){
+                $is_c2=($c.RemotePort -in $c2_p);
+                $p_own=try{(Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue).ProcessName}catch{"Desc"};
+                $susp_conns+=@{remote_ip=$c.RemoteAddress;remote_port=$c.RemotePort;local_port=$c.LocalPort;process=$p_own;suspicious=$is_c2}
+            }
+            $listen_p=Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object {
+                $p_own=try{(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}catch{"Desc"};
+                @{port=$_.LocalPort;ip=$_.LocalAddress;process=$p_own}
+            };
+
+            $hosts_path="$env:windir\\System32\\drivers\\etc\\hosts";
+            $hosts_bad=$false;
+            if(Test-Path $hosts_path){
+                $ht=Get-Content $hosts_path -ErrorAction SilentlyContinue;
+                if($ht -match '(?i)(microsoft|windowsupdate|virustotal|kaspersky|symantec)'){
+                    $hosts_bad=$true;
+                }
+            }
+
+            $temp_art=@();
+            $t_dir=$env:TEMP;
+            if(Test-Path $t_dir){
+                Get-ChildItem -Path $t_dir -Include *.exe,*.dll,*.bat,*.vbs,*.ps1 -Recurse -Depth 2 -ErrorAction SilentlyContinue | Where-Object {$_.LastWriteTime -gt (Get-Date).AddDays(-7)} | Select-Object -First 5 | ForEach-Object {
+                    $temp_art+=@{name=$_.Name;path=$_.FullName;size_kb=[math]::Round($_.Length/1KB,1);date=$_.LastWriteTime.ToString('yyyy-MM-dd')}
+                }
+            }
+
+            $t_score=0;
+            if(-not $av_act){$t_score += 35};
+            if($susp_p.Count -gt 0){$t_score += (30 * $susp_p.Count)};
+            if($hosts_bad){$t_score += 25};
+            if($temp_art.Count -gt 0){$t_score += 15};
+            if($susp_conns | Where-Object {$_.suspicious}){$t_score += 35};
+            $t_lvl=if($t_score -ge 50){"CRITICO"}elseif($t_score -ge 20){"MEDIO"}else{"BAJO"};
+
+            $malware_audit=@{
+                defenses=@{antivirus_name=$av_name;antivirus_active=$av_act;firewall_enabled=$fw_on};
+                suspicious_processes=$susp_p;
+                persistence=$persist;
+                network_c2=@{established_connections=$susp_conns;listening_ports=$listen_p;hosts_file_hijack=$hosts_bad};
+                recent_artifacts=$temp_art;
+                threat_score=$t_score;
+                threat_level=$t_lvl;
+            };
+
+            $top_p=(Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object {"$($_.ProcessName):$([math]::Round($_.CPU,1))s"}) -join ', ';
+            $t=@{antivirus_enabled=$av_name;antivirus_active=$av_act;threat_level=$t_lvl;top_cpu_procs=$top_p;listening_ports=($listen_p | ForEach-Object {$_.port}) -join ', ';malware_audit=$malware_audit};
             """
         elif cat == "LOGS":
             telemetry_ps = """
@@ -206,9 +298,9 @@ class WindowsPayloadGenerator:
 
         script = (
             f"$ErrorActionPreference='SilentlyContinue';"
-            f"$hw=$null;$osi=$null;$hw_audit=$null;"
+            f"$hw=$null;$osi=$null;$hw_audit=$null;$malware_audit=$null;"
             f"{telemetry_ps.strip()};"
-            f"$p=@{{os_type='windows';category='{cat}';hostname=$env:COMPUTERNAME;hardware=$hw;hardware_audit=$hw_audit;osi_network=$osi;telemetry=$t}};"
+            f"$p=@{{os_type='windows';category='{cat}';hostname=$env:COMPUTERNAME;hardware=$hw;hardware_audit=$hw_audit;malware_audit=$malware_audit;osi_network=$osi;telemetry=$t}};"
             f"$j=ConvertTo-Json -Compress -Depth 5 $p;"
             f"$b=[System.Text.Encoding]::UTF8.GetBytes($j);"
             f"try{{Invoke-RestMethod -UseBasicParsing -Uri '{endpoint_uri}' -Method Post -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec 10}}catch{{"
@@ -450,6 +542,28 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                         ],
                         "battery": None,
                     },
+                    "malware_audit": {
+                        "defenses": {
+                            "antivirus_name": "Microsoft Defender Antivirus",
+                            "antivirus_active": True,
+                            "firewall_enabled": True,
+                        },
+                        "suspicious_processes": [],
+                        "persistence": [
+                            {"type": "Registro Run", "name": "OneDrive", "path": "C:\\Users\\User\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe /background", "location": "HKCU"}
+                        ],
+                        "network_c2": {
+                            "listening_ports": [
+                                {"port": 135, "ip": "0.0.0.0", "process": "svchost"},
+                                {"port": 445, "ip": "0.0.0.0", "process": "System"},
+                            ],
+                            "established_connections": [],
+                            "hosts_file_hijack": False,
+                        },
+                        "recent_artifacts": [],
+                        "threat_score": 0,
+                        "threat_level": "BAJO",
+                    },
                     "telemetry": {
                         "cpu_percent": 18.5,
                         "ram_percent": 45.2,
@@ -458,7 +572,8 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                         "mac": "00:1A:2B:3C:4D:5E",
                         "ping_gateway": True,
                         "ping_internet": True,
-                        "antivirus_enabled": "Windows Defender",
+                        "antivirus_enabled": "Microsoft Defender Antivirus",
+                        "threat_level": "BAJO",
                     },
                 }
                 rep_id = (
@@ -469,6 +584,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                         telemetry=report_data["telemetry"],
                         hardware=report_data["hardware"],
                         hardware_audit=report_data["hardware_audit"],
+                        malware_audit=report_data["malware_audit"],
                         osi_network=report_data["osi_network"],
                     )
                     if self._web_server
@@ -481,6 +597,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                     "category": self._category,
                     "hardware": report_data["hardware"],
                     "hardware_audit": report_data["hardware_audit"],
+                    "malware_audit": report_data["malware_audit"],
                     "osi_network": report_data["osi_network"],
                     "telemetry": report_data["telemetry"],
                     "overall_status": "OK",
@@ -517,6 +634,7 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
 
         osi_data = getattr(report, "osi_network", {}) or getattr(report, "telemetry", {}).get("osi_network", {})
         hw_audit = getattr(report, "hardware_audit", {}) or getattr(report, "telemetry", {}).get("hardware_audit", {})
+        malware_audit = getattr(report, "malware_audit", {}) or getattr(report, "telemetry", {}).get("malware_audit", {})
         t_data = getattr(report, "telemetry", {})
         overall_severity = Severity.OK
 
@@ -571,8 +689,47 @@ class WindowsHIDPlugin(IDiagnosticPlugin):
                 f"RAM: {m_used}/{m_tot}GB ({m_pct}%)"[:14],
                 f"SMR: {'ALERTA' if smart_failed else 'OK'} DSK:{len(vols)}"[:14],
             ]
+        # Dedicated Malware category processing
+        elif (self._category == "MALWARE" or "MALWARE" in self._category) and malware_audit:
+            def_info = malware_audit.get("defenses", {})
+            av_name = def_info.get("antivirus_name") or t_data.get("antivirus_enabled") or "Ninguno"
+            av_act = def_info.get("antivirus_active") if "antivirus_active" in def_info else (av_name != "Ninguno")
+            av_sev = Severity.OK if av_act else Severity.CRITICAL
+            if av_sev == Severity.CRITICAL:
+                overall_severity = Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="Antivirus", value=f"{str(av_name)[:12]} ({'OK' if av_act else 'OFF'})", status=av_sev))
+
+            th_lvl = malware_audit.get("threat_level", "BAJO")
+            th_score = malware_audit.get("threat_score", 0)
+            th_sev = Severity.CRITICAL if th_lvl == "CRITICO" else (Severity.WARNING if th_lvl == "MEDIO" else Severity.OK)
+            if th_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = th_sev
+            metrics.append(DiagnosticMetric(name="Nivel Amenaza", value=f"{th_lvl} ({th_score}pts)", status=th_sev))
+
+            susp_p = malware_audit.get("suspicious_processes", [])
+            p_sev = Severity.CRITICAL if len(susp_p) > 0 else Severity.OK
+            if p_sev != Severity.OK and overall_severity != Severity.CRITICAL:
+                overall_severity = p_sev
+            metrics.append(DiagnosticMetric(name="Proc Sospechosos", value=str(len(susp_p)), status=p_sev))
+
+            persist = malware_audit.get("persistence", [])
+            metrics.append(DiagnosticMetric(name="Persistencias", value=str(len(persist)), status=Severity.INFO if len(persist) < 5 else Severity.WARNING))
+
+            net_c2 = malware_audit.get("network_c2", {})
+            susp_conns = [c for c in net_c2.get("established_connections", []) if isinstance(c, dict) and c.get("suspicious")]
+            c2_sev = Severity.CRITICAL if len(susp_conns) > 0 else Severity.OK
+            if c2_sev != Severity.OK:
+                overall_severity = Severity.CRITICAL
+            metrics.append(DiagnosticMetric(name="Conexiones C2", value=str(len(susp_conns)), status=c2_sev))
+
+            details = [
+                f"Host: {getattr(report, 'hostname', 'Windows')[:14]}",
+                f"AV: {'OK' if av_act else 'DESACTIVADO'}"[:14],
+                f"P:{len(susp_p)} Pers:{len(persist)} C2:{len(susp_conns)}"[:14],
+                f"Riesgo: {th_lvl}"[:14],
+            ]
         else:
-            # General / Network / Malware metrics
+            # General / Network / Logs metrics
             cpu = t_data.get("cpu_percent")
             if cpu is not None:
                 c_val = f"{cpu}%"
