@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permissions": [
+    { "action": "shell", "resource": "ssh rei-pi *", "effect": "allow" },
+    { "action": "shell", "resource": "ssh *", "effect": "allow" },
+    { "action": "shell", "resource": "scp *", "effect": "allow" },
+    { "action": "shell", "resource": "tools/deploy_pi.sh *", "effect": "allow" },
+    { "action": "shell", "resource": "./tools/deploy_pi.sh *", "effect": "allow" }
+  ]
+}
