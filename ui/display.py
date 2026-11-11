@@ -1071,14 +1071,28 @@ class ScreenManager:
                 logger.info(f"Initialized SH1106 OLED via I2C (port={i2c_port}, addr={hex(i2c_address)}).")
                 return
             except Exception as i2c_ex:
-                logger.warning(f"I2C initialization failed ({i2c_ex}).")
+                logger.error(
+                    f"I2C initialization failed ({i2c_ex}). "
+                    "Panel OLED NO disponible: REI sigue ejecutándose, pero la "
+                    "pantalla física queda en blanco (la UI se dibuja en un "
+                    "framebuffer virtual). Revisa /dev/spidev0.0 y que el firmware "
+                    "haya arrancado con dtparam=spi=on."
+                )
 
-        except (ImportError, Exception) as ex:
+        except ImportError as ex:
             self._oled_device = None
-            logger.warning(
-                f"Physical SH1106 OLED not detected ({ex}). "
-                "Operating in virtual frame-buffer mode."
+            logger.error(
+                f"luma/Pillow no disponibles ({ex}). "
+                "REI arranca sin panel OLED (framebuffer virtual)."
             )
+        except Exception as ex:
+            self._oled_device = None
+            logger.error(f"Error inesperado al inicializar el panel OLED: {ex}")
+
+    @property
+    def display_ready(self) -> bool:
+        """True si el panel OLED físico está inicializado y listo para renderizar."""
+        return self._oled_device is not None
 
     @property
     def current_view(self) -> Optional[BaseView]:

@@ -85,6 +85,12 @@ class REIApp:
             height=self.settings.get("display", {}).get("height", 64),
             rotate=self.settings.get("display", {}).get("rotate", 2),
         )
+        if not getattr(self.screen_manager, "display_ready", True):
+            logger.error(
+                "El panel OLED NO está disponible: la UI se renderiza en un framebuffer "
+                "virtual y la pantalla física quedará en blanco. Revisa /dev/spidev0.0 "
+                "(lsmod spidev, dtparam=spi=on en config.txt y reinicio)."
+            )
         self.diag_manager = DiagnosticManager(max_workers=2)
 
         # 3. Initialize Autonomous Network, USB & AI Services
