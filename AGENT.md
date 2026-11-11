@@ -4,6 +4,11 @@
 > **Estado del Sistema:** Producción / Hardware Embebido / Python 3.11+  
 > **Arquitectura:** Asíncrona, Orientada a Objetos (POO), Plugin-Driven, Monolito Modular Desacoplado.
 
+> 📌 Este documento es la **especificación de diseño** (BOM, geometría OLED, contratos de datos).
+> Para comandos, comandos de verificación, quirks verificados y la estructura **real** del
+> repositorio, ver **`AGENTS.md`**. Si un dato de este documento contradice al código,
+> el código manda: verifícalo antes de escribir.
+
 ---
 
 ## 1. MISIÓN Y CONCEPTO DEL SISTEMA
@@ -26,11 +31,37 @@ Todo desarrollo debe apegarse estrictamente a las restricciones del hardware fí
 | :--- | :--- | :--- |
 | **SBC (Cerebro)** | **Raspberry Pi Zero 2 W** | CPU Broadcom BCM2710A1 Quad-Core 64-bit @ 1.0GHz. **RAM: 512MB LPDDR2**. Wi-Fi 802.11 b/g/n, BLE 4.2. |
 | **Expansión I/O** | **Waveshare ETH/USB HUB HAT** | Controlador Ethernet RTL8152B (10/100M RJ45) + Hub USB 2.0 (3x USB Tipo-A). Expande el micro-USB nativo sin saturar el bus OTG. |
-| **Pantalla OLED** | **1.3" I2C/SPI OLED HAT** | Controlador **SH1106** (128x64 px, 1-bit monocromático). Bus SPI primario (DC=GPIO24, RST=GPIO25, rotate=2) con fallback a I2C (0x3C). |
+| **Pantalla OLED** | **1.3" I2C/SPI OLED HAT** | Controlador **SH1106** (128x64 px, 1-bit monocromático). Bus SPI primario (DC=GPIO24, RST=GPIO25, rotate=2) con fallback a I2C (0x3C). Cableado Waveshare: CS=CE0/GPIO8, DC=GPIO24, RST=GPIO25, MOSI=GPIO10, SCLK=GPIO11. |
 | **Controles Físicos** | **Joystick 5-Vías + 3 Botones** | Joystick: `UP`, `DOWN`, `LEFT`, `RIGHT`, `PRESS`. Botones: `KEY1`, `KEY2`, `KEY3`. Manejados por interrupciones GPIO (`gpiozero`). |
 | **Batería & PMIC** | **PiSugar 3 UPS HAT** | Li-Po 1200mAh. Comunicación I2C (voltaje, %, corriente, temperatura). Botón de apagado seguro y RTC integrado. |
 | **Consola Serial** | **Cable USB a RJ45 Cisco** | Chips FTDI FT232R / CP2102 asignado a `/dev/ttyUSB0` (9600 a 115200 bps). |
 | **Almacenamiento** | **MicroSD 32GB Industrial** | Partición raíz `/` en **ReadOnly (OverlayFS)**. Partición persistente `/data` (ext4 journaled). `/tmp` y `/run` en **tmpfs (RAM)**. |
+
+### 2.1. Requisito de arranque: SPI0, I2C1 y USB OTG son *boot-time*
+
+El firmware de la Raspberry Pi solo interpreta `config.txt` **durante el arranque**.
+Los periféricos que REI necesita se habilitan con parámetros de arranque, no en
+caliente:
+
+| Parámetro | Nodo del device tree | Dispositivo | Consumidor |
+| :--- | :--- | :--- | :--- |
+| `dtparam=spi=on` | `soc/spi@7e204000` (SPI0) | `/dev/spidev0.0` | OLED SH1106 + splash |
+| `dtparam=i2c_arm=on` | `soc/i2c@7e804000` (I2C1) | `/dev/i2c-1` | PiSugar 3 UPS (0x57) |
+| `dtoverlay=dwc2,dr_mode=peripheral` | `soc/usb@7e980000` | `/dev/hidg0` | Inyección HID / endpoints |
+
+**Consecuencia:** si `install.sh` se ejecuta con la Pi ya arrancada, esos
+parámetros no surten efecto hasta el siguiente reinicio, y sin ellos el panel
+queda muerto (lama falla con *"SPI device not found"*) mientras el servicio sigue
+`active (running)`. Por eso `install.sh` avisa de **REINICIO REQUERIDO**.
+
+Las líneas deben escribirse en la **región sin filtro** de `config.txt` (antes
+del primer encabezado `[sección]`). Si se añaden al final, caen dentro de la
+última sección (`[cm4]`, `[cm5]`, `[pi5]`, `[all]`) y quedan condicionadas a una
+familia de placas concreta, ignorándose en silencio en la Zero 2 W.
+
+> **SPI1 debe permanecer deshabilitado.** GPIO19/20/21/26 son los pines de SPI1
+> y están ocupados por el joystick y los botones. El HAT OLED usa SPI0
+> (CE0=GPIO8, MOSI=GPIO10, SCLK=GPIO11, DC=GPIO24, RST=GPIO25).
 
 ---
 
@@ -68,47 +99,61 @@ pyserial>=3.5
 cryptography>=42.0.5
 fastapi>=0.110.0
 uvicorn>=0.28.0
-qrcode>=7.4.2
+qrcode[pil]>=7.4.2
 pydantic>=2.6.4
 requests>=2.31.0
 google-genai>=0.1.1
+smbus2>=0.4.3
+evdev>=1.7.0
 ```
+
+> **Estado actual:** `netmiko`, `scrapli`, `pypsrp`, `pysnmp-lextudio` y `pyserial` están declarados pero **aún no se usan** en el código. Los plugins de red (`CiscoSerialPlugin`, `CiscoSSHPlugin`, `SNMPScanPlugin`) de `core/plugins.py` son stubs que devuelven literales; las reglas de "prohibido" de la sección 3.1 aplican cuando se implementen.
 
 ---
 
 ## 4. ESTRUCTURA MODULAR DEL REPOSITORIO
 ```text
 /rei
-│── main.py                  # Punto de entrada: Bootloader, ciclo de vida, hilos UI/Worker, orquestación de menús.
+│── main.py                  # Punto de entrada: Bootloader, ciclo de vida, hilos UI/Worker, árbol de menús (_build_menu_hierarchy).
+│── splash.py                # Pantalla de carga temprana (servicio systemd independiente).
 │── install.sh               # Script de autoinstalación, aprovisionamiento de SO, servicios systemd y rollback.
 │── requirements.txt         # Especificación de dependencias Python fijadas.
+│── AGENTS.md                # Guía operativa para agentes (comandos, quirks verificados).
+│── AGENT.md                 # Este documento: especificación de diseño (BOM, geometría OLED, contratos).
 │── config/
-│   ├── settings.json        # Configuración operacional (GPIO, timeouts, API Keys de Gemini, brillo OLED, IPs).
-│   └── credentials.json     # Bóveda cifrada (AES-GCM-256) para credenciales de red y tokens.
+│   └── settings.example.json  # Plantilla de configuración operacional. settings.json está en .gitignore.
 │── /core
 │   ├── __init__.py
-│   ├── manager.py           # Orquestador del sistema: ThreadPoolExecutor, TaskQueue, ResultQueue, carga dinámica.
+│   ├── manager.py           # Orquestador del sistema: ThreadPoolExecutor, cola de resultados, carga dinámica.
 │   ├── interfaces.py        # Modelos de dominio (DiagnosticResult, DiagnosticMetric, IDiagnosticPlugin).
+│   ├── plugins.py           # TODOS los plugins de sistema y red (IP, Wi-Fi, batería, Cisco, SNMP, RNDIS, Vault, energía, updates).
 │   ├── ducky.py             # Motor Rubber Ducky: Inyector HID (/dev/hidg0), layouts ES/US, gestor de secuencias de teclas.
-│   ├── gemini_analyzer.py   # Cliente de Inteligencia Artificial: Integración con Gemini Free API para diagnósticos y soluciones.
+│   ├── gemini_analyzer.py   # Cliente de Inteligencia Artificial: Integración con Gemini Free API + fallback local.
 │   ├── usb_modes.py         # Administrador de perfiles USB Gadget (ConfigFS / dwc2): Modo Normal vs Teclado HID.
-│   ├── web_server.py        # Micro-servidor FastAPI local para recolección de reportes de endpoints y visor QR móvil.
-│   └── parser.py            # Utilidades de parsing eficiente en memoria: generadores (yield), strip de secuencias ANSI.
+│   ├── web_server.py        # Micro-servidor FastAPI local: recolección de reportes, payloads, visor QR móvil.
+│   ├── wifi.py              # Gestión Wi-Fi por nmcli / wpa_cli (scan + connect).
+│   ├── pisugar.py           # Telemetría de batería del PiSugar 3 (I2C / sysfs / socket / simulado).
+│   └── parser.py            # Utilidades de parsing eficiente en memoria de salidas shell y hardware.
 │── /ui
 │   ├── __init__.py
-│   ├── display.py           # Motor de renderizado SH1106 (HeroCardDeckView, DetailCardView, UpdateProgressView, QRCodeView).
-│   ├── input_handler.py     # Manejador GPIO para Joystick y Botones con debouncing de 200ms.
-│   └── keyboard_view.py     # Teclado virtual OLED para introducción de texto/claves en pantalla.
+│   ├── display.py           # Motor de renderizado SH1106 (ScreenManager, HeroCardDeckView, DetailCardView, UpdateProgressView, QRCodeView, IconRenderer).
+│   ├── input_handler.py     # GPIOInputHandler (joystick + 3 botones) y USBKeyboardListener (evdev + stdin).
+│   └── keyboard_view.py     # Teclado virtual OLED (VirtualKeyboardInputView) para introducción de texto/claves.
 │── /plugins
 │   ├── __init__.py
-│   ├── base_plugin.py       # Clase abstracta BasePlugin.
-│   ├── network/             # Plugins para infraestructura de red (Cisco Serial, SSH, SNMP).
-│   │   ├── cisco_ios.py
-│   │   └── snmp_scanner.py
-│   └── endpoints/           # Plugins para análisis de estaciones de trabajo y servidores.
-│       ├── hid_windows.py   # Payloads HID & recolección de datos para Windows (PowerShell).
-│       └── hid_linux.py     # Payloads HID & recolección de datos para Linux (Bash).
+│   └── endpoints/           # ÚNICAMENTE plugins de endpoint por HID.
+│       ├── hid_windows.py   # Payloads HID + recolección de datos para Windows (PowerShell).
+│       └── hid_linux.py     # Payloads HID + recolección de datos para Linux (Bash).
+│── /tests
+│   ├── test_ducky.py        # Tablas de scancodes HID, dead keys ES/ISO, dry-run.
+│   ├── test_endpoints.py    # Payloads PowerShell/Bash y normalización de categorías.
+│   ├── test_gemini.py       # Fallback local del analizador y parsing de respuestas.
+│   ├── test_ui.py           # Vistas, bloqueo de progreso, render de QR (requiere Pillow).
+│   ├── test_usb_modes.py    # Generación del script de gadget ConfigFS.
+│   └── test_web_server.py   # Ciclo de vida de reportes, URLs dinámicas, endpoint /health.
 ```
+
+> **Nota:** `plugins/base_plugin.py`, `plugins/network/` y `config/credentials.json` **no existen**. La clase base es `IDiagnosticPlugin` en `core/interfaces.py`, y `VaultPlugin` es un stub sin bóveda real.
 
 ---
 
@@ -124,7 +169,7 @@ google-genai>=0.1.1
         │           └── [TECLADO INGLES]  (Layout 'us')
         │                 └── [TIPO DE PROBLEMA] (Hero Cards)
         │                       ├── [RED / CONEXION]      ──> Inyección Payload Red (Ping, DNS, IP, Adapter)
-        │                       ├── [HARDWARE / CPU]     ──> Inyección Payload HW (Temp, RAM, SMART, Throttling)
+        │                       ├── [ANALISIS HARDWARE]  ──> Inyección Payload HW (Temp, RAM, SMART, Throttling)
         │                       ├── [ANALISIS MALWARE]   ──> Inyección Payload Malware (Procesos, Startup, Defender)
         │                       ├── [OTROS PROBLEMAS]    ──> Inyección Payload Logs (EventLog, Disk Space, Crash)
         │                       └── [ANALISIS COMPLETO]  ──> Inyección Payload Suite Completa
@@ -150,14 +195,17 @@ google-genai>=0.1.1
 ```
 
 ### 5.2. Mecanismo de Inyección y Exfiltración de Datos del Host
-1. **Inyección HID (`/dev/hidg0`):**
-   * **Windows:** Emula `GUI + r` -> ejecuta comando PowerShell en segundo plano (`powershell -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "..."`).
-   * **Linux:** Emula `Ctrl + Alt + t` (o terminal handler) -> ejecuta one-liner bash en segundo plano.
+1. **Inyección HID (`/dev/hidg0`) — micro-stager, no script completo:**
+   * **Windows:** `GUI + r` -> `powershell -w h -NoProfile -NonInteractive -ep bypass -EncodedCommand <base64 UTF-16LE>`, donde el base64 decodifica a `irm -useb {server}/w/{CATEGORIA}|iex`.
+   * **Linux:** `Ctrl + Alt + t` -> `(curl -s -m 5 {server}/l/{CATEGORIA}||wget -qO- {server}/l/{CATEGORIA})|sh`.
+   * El objetivo **descarga el script real desde el propio servidor de REI** (`GET /w/{CATEGORIA}` para Windows, `GET /l/{CATEGORIA}` para Linux). Así el texto inyectado cabe en el buffer del diálogo Ejecutar de Windows (<260 caracteres).
+   * Categorías canónicas (`normalize_category`): `RED`, `HARDWARE`, `MALWARE`, `LOGS`, `COMPLETO`. Cualquier otra se colapsa a `COMPLETO`.
 2. **Canal de Recepción en REI (`core/web_server.py`):**
-   * El script inyectado recolecta la información y la envía mediante un `HTTP POST` con JSON al servidor FastAPI local de REI (`http://10.0.0.1:8000/api/v1/endpoint/report` o IP de red local), o la deja en un buffer compartido si se utiliza almacenamiento virtual.
-   * La recepción de datos activa el evento `COMPLETED` en el `DiagnosticManager`.
+   * El script descargado recolecta la información y la envía mediante un `HTTP POST` con JSON a `POST /api/v1/endpoint/report` (`http://10.0.0.1:8000/api/v1/endpoint/report` o la IP local).
+   * El servidor incrementa un contador (`_report_counter`). Antes de inyectar, el plugin captura el *watermark* (`get_report_watermark()`) y después espera con `wait_for_report(watermark=...)`, de modo que un reporte llegado durante la inyección no se confunda con la ejecución actual.
+   * Los reportes se guardan **solo en memoria** (`self._reports`); no se escribe en disco.
 3. **Bloqueo Estricto de UI:**
-   * Mientras la tarea está en curso (`is_running=True`), la vista `UpdateProgressView` / `ExecutionProgressView` consume los eventos de entrada retornando `ViewActionType.NONE`. Se impide volver atrás (`pop_view`) o saltar entre menús para evitar estados inconsistentes.
+   * Mientras la tarea está en curso (`is_running=True`), la vista `UpdateProgressView` consume los eventos de entrada retornando `ViewActionType.NONE`. Se impide volver atrás (`pop_view`) o saltar entre menús para evitar estados inconsistentes.
    * Si ocurre un timeout o error de hardware, la vista pasa a estado de fallo (`is_finished=True, is_success=False`) y desbloquea `KEY3/PRESS` para salir.
 
 ### 5.3. Análisis Asistido con Inteligencia Artificial (`core/gemini_analyzer.py`)
@@ -186,8 +234,8 @@ Todo diagnóstico de red o endpoint debe encapsularse en las siguientes estructu
 
 ```python
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import List, Optional, Dict, Any
+from enum import Enum, auto
+from typing import List, Optional, Dict, Any, Union
 import time
 
 class Severity(Enum):
@@ -196,37 +244,49 @@ class Severity(Enum):
     WARNING = "WARN" # Advertencia / Umbral superado [!]
     CRITICAL = "CRIT"# Falla crítica / Hardware en riesgo [x]
 
+class DiagnosticStatus(Enum):
+    IDLE = auto(); PENDING = auto(); RUNNING = auto()
+    SUCCESS = auto(); FAILED = auto(); WARNING = auto()
+
 @dataclass
 class DiagnosticMetric:
     name: str                        # Ej: "Latencia Puerta Enlace", "Temp CPU", "Amenazas Detectadas"
     value: str                       # Ej: "12ms (OK)", "88 C (ALERTA)", "0 detectadas"
-    status: Severity                 # Severidad individual
+    status: Severity = Severity.OK   # Severidad individual
     details: Optional[str] = None    # Explicación contextual
 
 @dataclass
 class DiagnosticResult:
     plugin_name: str                 # Identificador único del plugin
-    target_identifier: str           # "Windows Host (ES)", "Linux Host", "192.168.1.1"
-    execution_time_ms: int           # Tiempo total de recolección
-    overall_status: Severity         # Severidad global consolidada
+    target_identifier: str = ""      # "Windows Host (ES)", "Linux Host", "192.168.1.1"
+    execution_time_ms: int = 0       # Tiempo total de recolección
+    status: DiagnosticStatus = DiagnosticStatus.IDLE
+    overall_status: Severity = Severity.OK  # Severidad global consolidada
     summary: str = ""                # Resumen de una línea para tarjetas Hero
-    metrics: List[DiagnosticMetric] = field(default_factory=list)
+    details: List[str] = field(default_factory=list)  # Líneas para DetailCardView
+    metrics: Union[List[DiagnosticMetric], Dict[str, Any]] = field(default_factory=list)
     raw_output: Optional[str] = None # Captura íntegra para descarga Web/QR
     ai_analysis: Optional[Dict[str, Any]] = None # Resumen, causas y soluciones generadas por IA
     metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+    elapsed_seconds: float = 0.0     # Calculado por DiagnosticManager al cerrar la tarea
 ```
+
+> El tipo real está en `core/interfaces.py`; consúltelo antes de modificarlo. `details` es
+> lo que se pinta en `DetailCardView` y `metrics` lo usan como `dict` los plugins de
+> `core/plugins.py`.
 
 ---
 
 ## 8. ARQUITECTURA DE CONCURRENCIA Y THREADING
-1. **UI Event Loop (`ui/display.py`):**
+1. **UI Event Loop (`main.py::run`):**
    * Ejecuta a **30 FPS continuos** sin bloqueos.
-   * Renderiza el framebuffer monocromático y consulta resultados con `result_queue.get_nowait()`.
+   * Consume eventos de entrada, vacía la cola de resultados con `DiagnosticManager.poll_result()` y renderiza el framebuffer monocromático.
    * **PROHIBIDO:** Ejecutar sockets, sleeps prolongados, llamadas HTTP o escritura en `/dev/hidg0` dentro del hilo principal de la UI.
 2. **Diagnostic Worker Pool (`core/manager.py`):**
    * Gestionado mediante `ThreadPoolExecutor(max_workers=2)`.
-   * Procesa la cola de tareas asíncronas y emite eventos: `STATUS_INJECTING_HID`, `STATUS_AWAITING_PAYLOAD`, `STATUS_ANALYZING_AI`, `COMPLETED`, `TIMEOUT_ERROR`.
+   * `execute_async(plugin_id, on_complete=..., on_progress=..., **kwargs)` encola la tarea; el resultado se entrega por `poll_result()` (cola `queue.Queue`) y, si se pasó `on_progress`, se inyecta `progress_callback` en los `kwargs` del plugin.
+   * Los resultados se enrutan a las vistas **por igualdad de `plugin.name`** (`plugin.name == result.plugin_name`), por lo que el nombre de un plugin debe ser estable y único.
 3. **Memoria y Recursos (<512MB RAM):**
    * No almacenar grandes volcados de logs en cadenas no estructuradas.
    * Utilizar generadores y buffers eficientes para evitar picos de recolección de basura.
@@ -270,7 +330,10 @@ Toda pantalla cumple con la geometría de renderizado definida para el display O
    * Prohibido capturar `except Exception: pass` genérico en silencio.
    * Manejar de forma aislada excepciones de I/O, timeouts HID, errores HTTP de Gemini API y fallos de sockets.
 3. **Aislamiento para Pruebas (Dry-Run & Mocking):**
-   * Comandos de hardware o apagado (`poweroff`, `reboot`, configuración de kernel dwc2) deben soportar variables de entorno `REI_DRY_RUN=1` y `REI_MOCK_POWER=1` para validación segura en entornos de desarrollo x86_64.
+   * Comandos de hardware o apagado (`poweroff`, `reboot`, configuración de kernel dwc2, `apt-get`, `git pull`, inyección HID, scan/connect Wi-Fi) deben soportar variables de entorno para validación segura en entornos de desarrollo x86_64:
+     * `REI_DRY_RUN=1` — interruptor maestro (cubre HID, gadget USB, energía, updates y Wi-Fi).
+     * `REI_MOCK_POWER=1` — solo energía. `REI_MOCK_WIFI=1` — solo Wi-Fi. `REI_MOCK_UPDATES=1` — solo updates.
 4. **Sincronización con `install.sh` y `requirements.txt`:**
-   * Toda nueva librería debe registrarse en `requirements.txt`.
+   * Toda nueva librería debe registrarse en `requirements.txt` **y reinstalarse en `.venv`** (los servicios systemd usan el python del venv, no el del sistema).
    * Toda nueva regla de sistema operativo o servicio debe integrarse tanto en la rutina de instalación (`do_install`) como en la de reversión (`do_uninstall`) de `install.sh`.
+5. **Configuración de Gemini:** `main.py` siempre pasa `api_key=gemini_cfg.get("api_key")` de forma explícita, lo que **anula** el fallback a `GEMINI_API_KEY` / `.env` de `GeminiDiagnosticAnalyzer`. La clave debe estar en `config/settings.json` → `gemini.api_key`.

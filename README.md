@@ -62,14 +62,38 @@ sudo ./install.sh --install
 sudo ./install.sh --uninstall
 ```
 
+> **⚠ Reinicia después de instalar.** El firmware de la Raspberry Pi solo lee
+> `config.txt` durante el arranque. `install.sh` habilita ahí SPI (`/dev/spidev0.0`,
+> para el OLED y el splash), I2C (`/dev/i2c-1`, para el PiSugar) y el USB OTG en
+> modo peripheral (`/dev/hidg0`, para la inyección HID). Sin un reinicio esos
+> dispositivos no existen y la pantalla queda en blanco.
+>
+> ```bash
+> sudo reboot
+> ```
+>
+> `install.sh` te avisa de esto al terminar.
+
 ## Ejecución Manual
 
+```bash
 # Ejecución en entorno de desarrollo / pruebas (sin disparar apagado real)
 REI_DRY_RUN=1 python3 main.py
 ```
+
+Antes de la primera ejecución hay que crear la configuración real (no está versionada):
+
+```bash
+cp config/settings.example.json config/settings.json
+```
+
+La clave de Gemini (`gemini.api_key`) debe ir en `config/settings.json`; la variable de
+entorno `GEMINI_API_KEY` es ignorada por `main.py`.
 
 ## Pruebas
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+> `tests/test_ui.py` requiere `Pillow` instalado; el resto de la suite no.
