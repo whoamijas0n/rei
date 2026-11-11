@@ -123,6 +123,50 @@ print_status() {
 }
 
 # ------------------------------------------------------------------------------
+# EDICIÓN DE config.txt (REGIÓN SIN FILTRO)
+# ------------------------------------------------------------------------------
+# El firmware de la Raspberry Pi solo lee config.txt durante el arranque, y las
+# secciones [cm4]/[cm5]/[pi5]/[all] condicionan la aplicación de dtparam y
+# dtoverlay a una familia de placas concreta. Añadir líneas al final del archivo
+# con ">>" puede dejarlas dentro de una sección ajena (p. ej. [pi5]) y hacer que
+# se ignoren silenciosamente en una Zero 2 W.
+#
+# config_txt_edit <archivo> <set|remove> [línea...]
+#   set    -> elimina esas líneas de cualquier sección y las reinserta en la
+#             región sin filtro (antes del primer encabezado de sección).
+#   remove -> elimina esas líneas de cualquier sección y no reinserta nada.
+config_txt_edit() {
+    local file="$1"; shift
+    local mode="$1"; shift
+    python3 - "$file" "$mode" "$@" <<'PYEOF'
+import re
+import sys
+
+path, mode, wanted = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+with open(path) as fh:
+    text = fh.read()
+
+if wanted:
+    pattern = r"(?m)^[ \t]*(?:%s)[ \t]*\r?\n" % "|".join(re.escape(w) for w in wanted)
+    text = re.sub(pattern, "", text)
+    if mode == "set":
+        block = "".join(w + "\n" for w in wanted)
+        header = re.search(r"(?m)^[ \t]*\[[A-Za-z0-9_]+\][ \t]*\r?\n", text)
+        if header:
+            before = text[:header.start()].rstrip("\n")
+            text = before + "\n\n" + block + "\n" + text[header.start():]
+        else:
+            text = text.rstrip("\n") + "\n\n" + block
+    # Colapsa líneas en blanco sobrantes (config.txt no las usa y se acumulan).
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+with open(path, "w") as fh:
+    fh.write(text)
+PYEOF
+}
+
+# ------------------------------------------------------------------------------
 # VERIFICACIÓN DE PRIVILEGIOS
 # ------------------------------------------------------------------------------
 check_root() {
@@ -143,6 +187,10 @@ do_install() {
     center_text "${CLR_BOLD}${CLR_GREEN}INICIANDO PROCESO DE AUTOINSTALACIÓN DE REI${CLR_RESET}"
     center_divider "─" 50
     echo ""
+
+    # Se pone a 1 si se han tocado los parámetros de arranque del firmware:
+    # el DT solo se reconstruye al reiniciar, no en caliente.
+    NEED_REBOOT=0
 
     # 1. Validación de Entorno
     print_status "step" "Paso 1/5: Verificando directorios y arquitectura..."
@@ -224,18 +272,17 @@ do_install() {
     fi
 
     # Configuración de Raspberry Pi config.txt si existe
+    # Las líneas se escriben en la región sin filtro: el firmware solo lee
+    # config.txt al arrancar, así que un reinicio es obligatorio para que
+    # SPI (/dev/spidev0.0), I2C (/dev/i2c-1) y USB OTG (/dev/hidg0) existan.
     for boot_cfg in "/boot/firmware/config.txt" "/boot/config.txt"; do
         if [ -f "$boot_cfg" ]; then
-            if ! grep -q "^dtparam=i2c_arm=on" "$boot_cfg"; then
-                echo "dtparam=i2c_arm=on" >> "$boot_cfg"
-            fi
-            if ! grep -q "^dtparam=spi=on" "$boot_cfg"; then
-                echo "dtparam=spi=on" >> "$boot_cfg"
-            fi
-            if ! grep -q "^dtoverlay=dwc2" "$boot_cfg"; then
-                echo "dtoverlay=dwc2,dr_mode=peripheral" >> "$boot_cfg"
-            fi
+            config_txt_edit "$boot_cfg" set \
+                "dtparam=spi=on" \
+                "dtparam=i2c_arm=on" \
+                "dtoverlay=dwc2,dr_mode=peripheral"
             print_status "info" "Interfaces I2C/SPI y USB OTG (dwc2,dr_mode=peripheral) habilitadas en ${boot_cfg}"
+            NEED_REBOOT=1
             break
         fi
     done
@@ -560,6 +607,21 @@ EOF
         print_status "info" "Servicios habilitados para el próximo arranque (autoinicio configurado)."
     fi
 
+    if [ "${NEED_REBOOT:-0}" = "1" ]; then
+        echo ""
+        center_divider "━" 68
+        center_text "${CLR_BOLD}${CLR_YELLOW}⚠ REINICIO REQUERIDO${CLR_RESET}"
+        center_divider "━" 68
+        echo ""
+        center_text "${CLR_WHITE}El firmware de la Raspberry Pi solo lee config.txt al arrancar.${CLR_RESET}"
+        center_text "${CLR_WHITE}Sin reiniciar no existirán:${CLR_RESET}"
+        center_text "${CLR_CYAN}/dev/spidev0.0${CLR_RESET}  (OLED SH1106 y splash de arranque)"
+        center_text "${CLR_CYAN}/dev/i2c-1${CLR_RESET}      (PiSugar 3 UPS)"
+        center_text "${CLR_CYAN}/dev/hidg0${CLR_RESET}      (inyección HID USB)"
+        echo ""
+        center_text "${CLR_BOLD}${CLR_YELLOW}Ejecuta: sudo reboot${CLR_RESET}"
+    fi
+
     echo ""
     center_divider "━" 68
     center_text "${CLR_BOLD}${CLR_GREEN}✔ INSTALACIÓN DE REI COMPLETADA EXITOSAMENTE${CLR_RESET}"
@@ -649,6 +711,17 @@ do_uninstall() {
         sed -i '/denyinterfaces usb\* rndis\* ecm\*/d' /etc/dhcpcd.conf 2>/dev/null || true
         print_status "info" "Directiva denyinterfaces removida de /etc/dhcpcd.conf."
     fi
+
+    # Rollback simétrico de los parámetros de arranque del firmware.
+    for boot_cfg in "/boot/firmware/config.txt" "/boot/config.txt"; do
+        if [ -f "$boot_cfg" ]; then
+            config_txt_edit "$boot_cfg" remove \
+                "dtparam=spi=on" \
+                "dtparam=i2c_arm=on" \
+                "dtoverlay=dwc2,dr_mode=peripheral"
+            print_status "info" "Parámetros SPI/I2C/USB OTG eliminados de ${boot_cfg}."
+        fi
+    done
 
     if [ -d "${PROJECT_DIR}/.venv" ]; then
         rm -rf "${PROJECT_DIR}/.venv"
