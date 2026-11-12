@@ -26,5 +26,8 @@
         "gadget_script": "/usr/local/bin/usb_gadget.sh",
         "gadget_service": "usb_gadget.service",
         "default_mode": "MODO_NORMAL"
+    },
+    "input": {
+        "keyboard_layout": "auto"
     }
 }

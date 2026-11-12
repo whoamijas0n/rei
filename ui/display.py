@@ -16,6 +16,7 @@ import urllib.parse
 
 from PIL import Image, ImageDraw, ImageFont
 
+from core.parser import sanitize_oled_text, wrap_oled_lines
 from .input_handler import InputEvent
 
 logger = logging.getLogger("REI.UI.Display")
@@ -386,6 +387,25 @@ class IconRenderer:
         IconRenderer._draw_WIFI_FAIL(draw, cx, cy)
 
     @staticmethod
+    def _draw_WIFI_SAVED(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Wi-Fi with saved '+' badge (20x20)."""
+        draw.arc((cx - 10, cy - 8, cx + 10, cy + 12), 200, 340, fill="white")
+        draw.arc((cx - 6, cy - 4, cx + 6, cy + 8), 200, 340, fill="white")
+        draw.ellipse((cx - 2, cy + 3, cx + 2, cy + 7), fill="white")
+        draw.line((cx + 5, cy - 6, cx + 9, cy - 6), fill="white")
+        draw.line((cx + 7, cy - 8, cx + 7, cy - 4), fill="white")
+
+    @staticmethod
+    def _draw_SAVED(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_SAVED icon."""
+        IconRenderer._draw_WIFI_SAVED(draw, cx, cy)
+
+    @staticmethod
+    def _draw_GUARDADA(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
+        """Alias for WIFI_SAVED icon."""
+        IconRenderer._draw_WIFI_SAVED(draw, cx, cy)
+
+    @staticmethod
     def _draw_LOCK(draw: ImageDraw.ImageDraw, cx: int, cy: int) -> None:
         """Padlock icon for secured networks (20x20)."""
         draw.arc((cx - 4, cy - 8, cx + 4, cy), 180, 360, fill="white")
@@ -549,10 +569,11 @@ class BaseView(ABC):
         screen_width: int = 128,
         fill: str = "white"
     ) -> None:
-        """Renders horizontally centered text at specified Y coordinate."""
-        text_w = self.get_text_width(draw, text)
+        """Renders horizontally centered ASCII-safe text at specified Y coordinate."""
+        clean_text = sanitize_oled_text(text)
+        text_w = self.get_text_width(draw, clean_text)
         text_x = max(2, (screen_width - text_w) // 2)
-        draw.text((text_x, y), text, font=self.font, fill=fill)
+        draw.text((text_x, y), clean_text, font=self.font, fill=fill)
 
     def draw_perimeter_border(self, draw: ImageDraw.ImageDraw) -> None:
         """
@@ -617,25 +638,30 @@ class HeroCardDeckView(BaseView):
         self.active_index = max(0, min(self.active_index, total - 1))
         active_card = self.cards[self.active_index]
 
-        # 2. Puntos de carrusel en la esquina superior derecha
-        start_x = 122 - (total * 5)
-        for i in range(total):
-            x = start_x + (i * 5)
-            if i == self.active_index:
-                draw.rectangle((x, 4, x + 2, 6), fill="white")
-            else:
-                draw.point((x + 1, 5), fill="white")
+        # 2. Puntos de carrusel en la esquina superior derecha (o contador compacto si >18)
+        if total <= 18:
+            start_x = 122 - (total * 5)
+            for i in range(total):
+                x = start_x + (i * 5)
+                if i == self.active_index:
+                    draw.rectangle((x, 4, x + 2, 6), fill="white")
+                else:
+                    draw.point((x + 1, 5), fill="white")
+        else:
+            counter_txt = f"{self.active_index + 1}/{total}"
+            counter_w = self.get_text_width(draw, counter_txt)
+            draw.text((max(4, 124 - counter_w), 3), counter_txt, font=self.font, fill="white")
 
         # 3. Dibujar Icono Centrado (cx=64, cy=24)
         IconRenderer.draw_icon(draw, active_card.icon_name, cx=64, cy=24)
 
         # 4. Dibujar Título Centrado en Y=44 (Strict AGENT.md Spec)
-        title_text = active_card.title.strip().upper()
+        title_text = sanitize_oled_text(active_card.title).strip().upper()
         self.draw_centered_text(draw, title_text, y=44, screen_width=width)
 
     def handle_input(self, event: InputEvent) -> ViewAction:
         if not self.cards:
-            if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.BACK):
+            if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.BACK, InputEvent.ESCAPE):
                 return ViewAction(ViewActionType.POP_VIEW)
             return ViewAction(ViewActionType.NONE)
 
@@ -650,8 +676,8 @@ class HeroCardDeckView(BaseView):
             self.active_index = (self.active_index - 1 + total_cards) % total_cards
             return ViewAction(ViewActionType.NONE)
 
-        # Selection: Joystick Press or Physical Key 1
-        elif event in (InputEvent.PRESS, InputEvent.KEY1):
+        # Selection: Joystick Press, Physical Key 1, or Keyboard Enter
+        elif event in (InputEvent.PRESS, InputEvent.KEY1, InputEvent.ENTER):
             current_card = self.cards[self.active_index]
             if current_card.on_select:
                 current_card.on_select()
@@ -665,8 +691,8 @@ class HeroCardDeckView(BaseView):
                 )
             return ViewAction(ViewActionType.NONE)
 
-        # Back Navigation: Physical Key 3 / BACK
-        elif event in (InputEvent.KEY3, InputEvent.BACK):
+        # Back Navigation: Physical Key 3 / BACK / Keyboard Escape
+        elif event in (InputEvent.KEY3, InputEvent.BACK, InputEvent.ESCAPE):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -675,6 +701,7 @@ class HeroCardDeckView(BaseView):
 class DetailCardView(BaseView):
     """
     Vista de detalle / métrica final (Mantiene el borde).
+    Normaliza a ASCII seguro, ajusta palabras a 19 caracteres y muestra indicador de scroll.
     """
 
     def __init__(
@@ -692,6 +719,16 @@ class DetailCardView(BaseView):
         self.is_loading: bool = False
         self.scroll_offset: int = 0
         self._spinner_tick: int = 0
+        self._wrapped_cache_key: Optional[Tuple[str, ...]] = None
+        self._wrapped_cache_lines: List[str] = []
+
+    def _get_wrapped_lines(self) -> List[str]:
+        """Returns cached word-wrapped, ASCII-sanitized OLED lines."""
+        key = tuple(str(x) for x in self.lines)
+        if key != self._wrapped_cache_key:
+            self._wrapped_cache_key = key
+            self._wrapped_cache_lines = wrap_oled_lines(list(key), max_chars=19)
+        return self._wrapped_cache_lines
 
     def set_content(self, lines: List[str], status: str = "OK", is_loading: bool = False) -> None:
         """Updates detail lines and status badge."""
@@ -699,10 +736,12 @@ class DetailCardView(BaseView):
         self.status_text = status
         self.is_loading = is_loading
         self.scroll_offset = 0
+        self._wrapped_cache_key = None
 
     def append_line(self, line: str) -> None:
         """Appends a line to the detail buffer."""
         self.lines.append(line)
+        self._wrapped_cache_key = None
 
     def update(self) -> None:
         """Increments spinner animation ticker."""
@@ -714,22 +753,37 @@ class DetailCardView(BaseView):
         self.draw_perimeter_border(draw)
 
         # 2. Cabecera centrada
-        header_text = self.title.strip().upper()
+        header_text = sanitize_oled_text(self.title).strip().upper()
         self.draw_centered_text(draw, header_text, y=6, screen_width=width)
         draw.line((4, 18, 123, 18), fill="white")
 
-        # 3. Contenido limpio (Y=24, espaciado 12px)
+        # 3. Contenido limpio ajustado a palabras (Y=24, espaciado 12px)
         y = 24
-        visible_lines = self.lines[self.scroll_offset : self.scroll_offset + 3]
+        wrapped = self._get_wrapped_lines()
+        max_scroll = max(0, len(wrapped) - 3)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
+        visible_lines = wrapped[self.scroll_offset : self.scroll_offset + 3]
+
         if not visible_lines:
-            draw.text((8, y), "Sin datos / Presione OK", font=self.font, fill="white")
+            draw.text((6, y), "Sin datos / OK", font=self.font, fill="white")
         else:
             for line in visible_lines:
-                draw.text((8, y), line[:20], font=self.font, fill="white")
+                draw.text((6, y), line[:19], font=self.font, fill="white")
                 y += 12
 
+        # 4. Indicador discreto de scroll cuando hay mas de 3 lineas
+        if len(wrapped) > 3:
+            track_top = 22
+            track_bottom = 58
+            track_h = track_bottom - track_top
+            thumb_h = max(6, int(track_h * (3.0 / len(wrapped))))
+            thumb_range = max(1, track_h - thumb_h)
+            thumb_y = track_top + int(thumb_range * (self.scroll_offset / max(1, max_scroll)))
+            draw.line((124, track_top, 124, track_bottom), fill="black")
+            draw.rectangle((123, thumb_y, 124, thumb_y + thumb_h), fill="white")
+
     def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
-        max_scroll = max(0, len(self.lines) - 3)
+        max_scroll = max(0, len(self._get_wrapped_lines()) - 3)
 
         if event == InputEvent.UP:
             self.scroll_offset = max(0, self.scroll_offset - 1)
@@ -745,14 +799,14 @@ class DetailCardView(BaseView):
                 self.on_refresh()
             return ViewAction(ViewActionType.NONE)
 
-        # KEY1 / Joystick PRESS -> Pop to root if configured, else pop view
-        elif event in (InputEvent.KEY1, InputEvent.PRESS):
+        # KEY1 / Joystick PRESS / Keyboard Enter -> Pop to root if configured, else pop view
+        elif event in (InputEvent.KEY1, InputEvent.PRESS, InputEvent.ENTER):
             if self.pop_to_root_on_key1:
                 return ViewAction(ViewActionType.POP_TO_ROOT)
             return ViewAction(ViewActionType.POP_VIEW)
 
-        # Return on Key3, Back -> Pop view
-        elif event in (InputEvent.KEY3, InputEvent.BACK):
+        # Return on Key3, Back, Keyboard Escape -> Pop view
+        elif event in (InputEvent.KEY3, InputEvent.BACK, InputEvent.ESCAPE):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -828,7 +882,7 @@ class UpdateProgressView(BaseView):
                 draw.rectangle((glider_x, 24, min(113, glider_x + 12), 28), fill="white")
 
             # 4A. Etiqueta de fase actual
-            stage_txt = self.stage_message[:18]
+            stage_txt = sanitize_oled_text(self.stage_message)[:18]
             draw.text((10, 34), stage_txt, font=self.font, fill="white")
 
             # 5A. Porcentaje y tiempo transcurrido
@@ -839,17 +893,18 @@ class UpdateProgressView(BaseView):
         else:
             # 3B. Estado finalizado (Éxito o Fallo)
             if self.is_success:
-                draw.text((8, 20), "[✓] COMPLETADO", font=self.font, fill="white")
+                draw.text((8, 20), "[OK] COMPLETADO", font=self.font, fill="white")
             else:
-                draw.text((8, 20), "[✗] FALLO / ERROR", font=self.font, fill="white")
+                draw.text((8, 20), "[X] FALLO / ERROR", font=self.font, fill="white")
 
             # 4B. Línea de resumen
-            first_line = (self.result_details[0] if self.result_details else self.result_summary)[:19]
+            first_raw = self.result_details[0] if self.result_details else self.result_summary
+            first_line = sanitize_oled_text(first_raw)[:19]
             draw.text((8, 33), first_line, font=self.font, fill="white")
 
             # 5B. Línea de detalle o indicación de salida
             if len(self.result_details) > 1:
-                second_line = self.result_details[1][:19]
+                second_line = sanitize_oled_text(self.result_details[1])[:19]
                 draw.text((8, 45), second_line, font=self.font, fill="white")
             else:
                 draw.text((8, 45), "OK / KEY3: Salir", font=self.font, fill="white")
@@ -859,8 +914,15 @@ class UpdateProgressView(BaseView):
             # BLOQUEO ESTRICTO: No se permite salir ni interrumpir mientras corre
             return ViewAction(ViewActionType.NONE)
 
-        # Cuando concluye, permitir salir con KEY3, KEY1, PRESS, BACK
-        if event in (InputEvent.KEY3, InputEvent.KEY1, InputEvent.PRESS, InputEvent.BACK):
+        # Cuando concluye, permitir salir con KEY3, KEY1, PRESS, BACK, ENTER o ESCAPE
+        if event in (
+            InputEvent.KEY3,
+            InputEvent.KEY1,
+            InputEvent.PRESS,
+            InputEvent.BACK,
+            InputEvent.ENTER,
+            InputEvent.ESCAPE,
+        ):
             return ViewAction(ViewActionType.POP_VIEW)
 
         return ViewAction(ViewActionType.NONE)
@@ -979,8 +1041,9 @@ class QRCodeView(BaseView):
         return ViewAction(ViewActionType.NONE)
 
 
-# Re-export VirtualKeyboardInputView from dedicated modular component
+# Re-export WiFiPasswordView & legacy VirtualKeyboardInputView
 from .keyboard_view import VirtualKeyboardInputView, KeyboardLayer
+from .wifi_password_view import WiFiPasswordView
 
 # Backward compatibility alias
 KeyboardInputView = VirtualKeyboardInputView

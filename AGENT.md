@@ -131,14 +131,16 @@ evdev>=1.7.0
 │   ├── gemini_analyzer.py   # Cliente de Inteligencia Artificial: Integración con Gemini Free API + fallback local.
 │   ├── usb_modes.py         # Administrador de perfiles USB Gadget (ConfigFS / dwc2): Modo Normal vs Teclado HID.
 │   ├── web_server.py        # Micro-servidor FastAPI local: recolección de reportes, payloads, visor QR móvil.
-│   ├── wifi.py              # Gestión Wi-Fi por nmcli / wpa_cli (scan + connect).
+│   ├── wifi.py              # Gestión Wi-Fi por nmcli / wpa_cli (scan, perfiles guardados, connect, disconnect, forget, clasificación de errores).
 │   ├── pisugar.py           # Telemetría de batería del PiSugar 3 (I2C / sysfs / socket / simulado).
-│   └── parser.py            # Utilidades de parsing eficiente en memoria de salidas shell y hardware.
+│   └── parser.py            # Utilidades de parsing eficiente en memoria y normalización/ajuste de texto OLED.
 │── /ui
 │   ├── __init__.py
 │   ├── display.py           # Motor de renderizado SH1106 (ScreenManager, HeroCardDeckView, DetailCardView, UpdateProgressView, QRCodeView, IconRenderer).
-│   ├── input_handler.py     # GPIOInputHandler (joystick + 3 botones) y USBKeyboardListener (evdev + stdin).
-│   └── keyboard_view.py     # Teclado virtual OLED (VirtualKeyboardInputView) para introducción de texto/claves.
+│   ├── input_handler.py     # GPIOInputHandler (joystick + 3 botones) y USBKeyboardListener (evdev multi-layout + hotplug + stdin).
+│   ├── keyboard_layouts.py  # Tablas de scancodes evdev (LATAM/ES/US), teclas muertas y clasificador de teclados reales.
+│   ├── wifi_password_view.py# Vista OLED 128x64 minimalista para entrada de contraseña Wi-Fi por teclado USB (mostrar/ocultar).
+│   └── keyboard_view.py     # Teclado virtual OLED legado (VirtualKeyboardInputView, mantenido por compatibilidad).
 │── /plugins
 │   ├── __init__.py
 │   └── endpoints/           # ÚNICAMENTE plugins de endpoint por HID.
@@ -148,9 +150,13 @@ evdev>=1.7.0
 │   ├── test_ducky.py        # Tablas de scancodes HID, dead keys ES/ISO, dry-run.
 │   ├── test_endpoints.py    # Payloads PowerShell/Bash y normalización de categorías.
 │   ├── test_gemini.py       # Fallback local del analizador y parsing de respuestas.
+│   ├── test_input_handler.py# Hotplug evdev, supresión de autorepeat, cola thread-safe y stdin.
+│   ├── test_keyboard_layouts.py # Mapas LATAM/ES/US, AltGr, dead keys y filtrado de vc4-hdmi.
 │   ├── test_ui.py           # Vistas, bloqueo de progreso, render de QR (requiere Pillow).
-│   ├── test_usb_modes.py    # Generación del script de gadget ConfigFS.
-│   └── test_web_server.py   # Ciclo de vida de reportes, URLs dinámicas, endpoint /health.
+│   ├── test_usb_modes.py    # Generación del script de gadget ConfigFS y escritura config.txt sin filtro.
+│   ├── test_web_server.py   # Ciclo de vida de reportes, URLs dinámicas, endpoint /health.
+│   ├── test_wifi.py         # Escaneo/conexión nmcli y wpa_cli, redes guardadas, validación y flujos Wi-Fi.
+│   └── test_wifi_password_view.py # Vista WiFiPasswordView, ocultar/ver clave y recorte por píxeles.
 ```
 
 > **Nota:** `plugins/base_plugin.py`, `plugins/network/` y `config/credentials.json` **no existen**. La clase base es `IDiagnosticPlugin` en `core/interfaces.py`, y `VaultPlugin` es un stub sin bóveda real.

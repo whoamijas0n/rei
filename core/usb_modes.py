@@ -9,6 +9,7 @@ Supports safe simulation in development (REI_DRY_RUN=1).
 from enum import Enum
 import logging
 import os
+import re
 import subprocess
 from typing import Optional, Tuple
 
@@ -329,6 +330,44 @@ fi
 chmod 666 /dev/hidg0 2>/dev/null || true
 """
 
+    @staticmethod
+    def update_boot_config_dwc2(content: str, dwc2_line: str) -> str:
+        """
+        Inserts dwc2_line into the unfiltered region of Raspberry Pi config.txt
+        (before the first [section] header) and removes prior dtoverlay=dwc2 lines.
+        """
+        cleaned = re.sub(r"(?m)^[ \t]*dtoverlay=dwc2[^\r\n]*\r?\n?", "", content)
+        header = re.search(r"(?m)^[ \t]*\[[A-Za-z0-9_]+\][ \t]*\r?\n", cleaned)
+        if header:
+            before = cleaned[:header.start()].rstrip("\n")
+            if before:
+                updated = f"{before}\n\n{dwc2_line}\n\n{cleaned[header.start():]}"
+            else:
+                updated = f"{dwc2_line}\n\n{cleaned[header.start():]}"
+        else:
+            stripped = cleaned.rstrip("\n")
+            updated = f"{stripped}\n\n{dwc2_line}\n" if stripped else f"{dwc2_line}\n"
+        return re.sub(r"\n{3,}", "\n\n", updated)
+
+    def _write_boot_dwc2(self, cfg_path: str, dwc2_line: str) -> None:
+        """Updates dtoverlay=dwc2 safely in the unfiltered region of config.txt."""
+        if not os.path.exists(cfg_path):
+            return
+        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as fh:
+            current = fh.read()
+        updated = self.update_boot_config_dwc2(current, dwc2_line)
+        if os.geteuid() == 0:
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write(updated)
+        else:
+            subprocess.run(
+                ["sudo", "tee", cfg_path],
+                input=updated,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                check=False,
+            )
+
     def set_mode(self, target_mode: USBMode) -> Tuple[bool, str]:
         """
         Transitions the system to the requested USB mode.
@@ -363,12 +402,9 @@ chmod 666 /dev/hidg0 2>/dev/null || true
                 subprocess.run(f"sudo sh -c 'cat > {service_path} << \"EOF\"\n{service_content}EOF'", shell=True, check=False)
                 subprocess.run("sudo systemctl daemon-reload", shell=True, check=False)
 
-            # 2. Clean previous dwc2 configuration
-            subprocess.run(f"sudo sed -i '/dtoverlay=dwc2/d' {cfg}", shell=True, check=False)
-
             if target_mode == USBMode.NORMAL:
                 # Configure Host mode (Pure Host for external antenna / keyboard)
-                subprocess.run(f"sudo sh -c 'echo \"dtoverlay=dwc2,dr_mode=host\" >> {cfg}'", shell=True, check=False)
+                self._write_boot_dwc2(cfg, "dtoverlay=dwc2,dr_mode=host")
                 subprocess.run("sudo systemctl disable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
                 subprocess.run("sudo systemctl stop usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
@@ -391,7 +427,7 @@ chmod 666 /dev/hidg0 2>/dev/null || true
                 gadget_ip, _, _, _ = self.detect_gadget_subnet()
 
                 # Configure Peripheral / Gadget mode
-                subprocess.run(f"sudo sh -c 'echo \"dtoverlay=dwc2,dr_mode=peripheral\" >> {cfg}'", shell=True, check=False)
+                self._write_boot_dwc2(cfg, "dtoverlay=dwc2,dr_mode=peripheral")
                 subprocess.run("sudo systemctl enable usb_gadget.service", shell=True, stderr=subprocess.DEVNULL, check=False)
 
                 # Generate script tailored to target_mode (Windows vs Linux)

@@ -8,15 +8,17 @@ Architecture: 100% OOP, Decoupled Producer/Consumer, Fixed 30 FPS UI Event Loop.
 import json
 import logging
 import os
+import queue
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from core.ducky import DuckyInjector
 from core.gemini_analyzer import GeminiDiagnosticAnalyzer
 from core.interfaces import DiagnosticMetric, DiagnosticResult, DiagnosticStatus, Severity
 from core.manager import DiagnosticManager
+from core.parser import shorten_oled_label, wrap_oled_lines
 from core.plugins import (
     AppUpdatePlugin,
     BatteryStatusPlugin,
@@ -31,12 +33,16 @@ from core.plugins import (
     SystemUpdatePlugin,
     VaultPlugin,
     WiFiConnectPlugin,
+    WiFiDisconnectPlugin,
+    WiFiForgetPlugin,
+    WiFiSavedListPlugin,
     WiFiScanPlugin,
     WindowsRNDISPlugin,
     execute_system_reboot,
 )
 from core.usb_modes import USBMode, USBModeManager
 from core.web_server import REIWebServer
+from core.wifi import WiFiManager
 from plugins.endpoints.hid_linux import LinuxHIDPlugin
 from plugins.endpoints.hid_windows import WindowsHIDPlugin
 from ui.display import (
@@ -50,6 +56,7 @@ from ui.display import (
     ViewAction,
     ViewActionType,
     VirtualKeyboardInputView,
+    WiFiPasswordView,
 )
 from ui.input_handler import GPIOInputHandler, InputEvent
 
@@ -79,7 +86,10 @@ class REIApp:
         self.settings = self._load_settings()
 
         # 2. Initialize Core Subsystems
-        self.input_handler = GPIOInputHandler()
+        input_cfg = self.settings.get("input", {})
+        self.input_handler = GPIOInputHandler(
+            keyboard_layout=input_cfg.get("keyboard_layout")
+        )
         self.screen_manager = ScreenManager(
             width=self.settings.get("display", {}).get("width", 128),
             height=self.settings.get("display", {}).get("height", 64),
@@ -111,6 +121,9 @@ class REIApp:
             model=gemini_cfg.get("model"),
             timeout_seconds=gemini_cfg.get("timeout_seconds"),
         )
+
+        self.wifi_manager = WiFiManager()
+        self._ui_callbacks: queue.Queue = queue.Queue()
 
         # 4. Register Diagnostic Plugins
         self._register_plugins()
@@ -147,8 +160,11 @@ class REIApp:
         """Instantiates and registers all decoupled diagnostic plugins."""
         plugins = [
             IPAddressPlugin(),
-            WiFiScanPlugin(),
-            WiFiConnectPlugin(),
+            WiFiScanPlugin(wifi_mgr=self.wifi_manager),
+            WiFiConnectPlugin(wifi_mgr=self.wifi_manager),
+            WiFiSavedListPlugin(wifi_mgr=self.wifi_manager),
+            WiFiDisconnectPlugin(wifi_mgr=self.wifi_manager),
+            WiFiForgetPlugin(wifi_mgr=self.wifi_manager),
             BatteryStatusPlugin(),
             SystemStatusPlugin(),
             CiscoSerialPlugin(),
@@ -410,110 +426,670 @@ class REIApp:
     # WI-FI & NETWORK FLOWS
     # =========================================================================
 
-    def _start_wifi_scan(self) -> None:
-        """Initiates Wi-Fi scan and displays progress."""
-        progress_view = UpdateProgressView(title="ESCANER WI-FI")
-        progress_view.stage_message = "Buscando redes..."
+    def _schedule_ui(self, callback: Callable[[], None]) -> None:
+        """Queues a UI transition to execute safely on the 30 FPS main thread."""
+        self._ui_callbacks.put(callback)
+
+    def _finish_wifi_progress(
+        self,
+        progress_view: UpdateProgressView,
+        result: DiagnosticResult,
+        on_done_ui: Callable[[DiagnosticResult], None],
+    ) -> None:
+        """Pops blocking progress view if still active and invokes UI handler."""
+        if self.screen_manager.current_view is progress_view:
+            self.screen_manager.pop_view()
+        on_done_ui(result)
+
+    def _run_wifi_async_task(
+        self,
+        progress_title: str,
+        stage_message: str,
+        plugin_id: str,
+        on_done_ui: Callable[[DiagnosticResult], None],
+        **plugin_kwargs: Any,
+    ) -> None:
+        """Runs a Wi-Fi plugin asynchronously and dispatches completion onto the UI thread."""
+        progress_view = UpdateProgressView(title=progress_title)
+        progress_view.stage_message = stage_message
         progress_view.progress = 0.5
         self.screen_manager.push_view(progress_view)
 
-        def on_scan_done(result: DiagnosticResult):
-            self.screen_manager.pop_view()
-            self._display_scanned_wifi_networks(result)
-
-        self.diag_manager.execute_async(
-            plugin_id="diag_wifi_scan",
-            on_complete=on_scan_done,
+        started = self.diag_manager.execute_async(
+            plugin_id=plugin_id,
+            on_complete=lambda res: self._schedule_ui(
+                lambda r=res: self._finish_wifi_progress(progress_view, r, on_done_ui)
+            ),
+            **plugin_kwargs,
         )
+        if not started:
+            if self.screen_manager.current_view is progress_view:
+                self.screen_manager.pop_view()
+            self.screen_manager.push_view(
+                DetailCardView("OCUPADO", ["Operacion en curso", "Espere un momento"])
+            )
+
+    @staticmethod
+    def _format_wifi_card_title(ssid: str, in_use: bool = False, is_saved: bool = False) -> str:
+        if in_use:
+            return f"* {shorten_oled_label(ssid, 16)}"
+        if is_saved:
+            return f"[G] {shorten_oled_label(ssid, 14)}"
+        return shorten_oled_label(ssid, 18)
+
+    def _start_wifi_scan(self) -> None:
+        """Initiates Wi-Fi scan and displays progress."""
+        self._run_wifi_async_task(
+            progress_title="ESCANER WI-FI",
+            stage_message="Buscando redes...",
+            plugin_id="diag_wifi_scan",
+            on_done_ui=self._display_scanned_wifi_networks,
+        )
+
+    def _start_saved_wifi_list(self) -> None:
+        """Loads saved Wi-Fi profiles and opens the saved networks deck."""
+        self._run_wifi_async_task(
+            progress_title="REDES GUARDADAS",
+            stage_message="Cargando perfiles...",
+            plugin_id="diag_wifi_saved",
+            on_done_ui=self._display_saved_wifi_profiles,
+            include_scan=True,
+        )
+
+    def _is_usb_gadget_blocking_host(self) -> bool:
+        """Checks without blocking whether USB OTG is active in Gadget/Peripheral mode."""
+        if os.getenv("REI_DRY_RUN") == "1":
+            return False
+        try:
+            if os.path.exists("/dev/hidg0") and os.path.isdir("/sys/class/udc"):
+                return len(os.listdir("/sys/class/udc")) > 0
+        except OSError:
+            pass
+        return False
+
+    def _open_wifi_password_prompt(
+        self,
+        ssid: str,
+        force_update: bool = False,
+        security_hint: Optional[str] = None,
+        replace_top: bool = False,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
+        """Opens WiFiPasswordView to enter or update a Wi-Fi password via USB keyboard."""
+        if replace_top and self.screen_manager.current_view is not None:
+            self.screen_manager.pop_view()
+
+        if hasattr(self.input_handler, "request_keyboard_rescan"):
+            self.input_handler.request_keyboard_rescan()
+
+        prefix = "NUEVA: " if force_update else "CLAVE: "
+        kb_status = getattr(self.input_handler, "has_typing_input", None)
+        pw_view = WiFiPasswordView(
+            ssid=ssid,
+            title=f"{prefix}{shorten_oled_label(ssid, 11)}",
+            security=security_hint or "WPA2-PSK",
+            masked=True,
+            keyboard_status=kb_status if callable(kb_status) else None,
+            layout_provider=lambda: getattr(self.input_handler, "keyboard_layout", "latam"),
+            usb_gadget_active=self._is_usb_gadget_blocking_host(),
+            on_submit=lambda s, pw: self._connect_to_wifi(
+                ssid=s,
+                password=pw,
+                force_update=force_update,
+                security_hint=security_hint,
+                source_deck=source_deck,
+            ),
+        )
+        self.screen_manager.push_view(pw_view)
+
+    def _append_active_wifi_cards(
+        self,
+        deck: HeroCardDeckView,
+        ssid: str,
+        signal_pct: int = 0,
+        security: str = "",
+        frequency: str = "",
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
+        """Appends status and disconnect cards for an active Wi-Fi connection."""
+        ip_addr = self.wifi_manager.get_ip() or "Asignada"
+        info_lines = [
+            f"Red: {shorten_oled_label(ssid, 14)}",
+            f"IP:  {shorten_oled_label(ip_addr, 14)}",
+        ]
+        if signal_pct:
+            band = f" {frequency}" if frequency else ""
+            info_lines.append(f"Senal: {signal_pct}%{band}")
+        else:
+            info_lines.append("Estado: Activa")
+        if security:
+            info_lines.append(f"Seg: {shorten_oled_label(security, 14)}")
+
+        deck.add_card(
+            HeroCard(
+                title="ESTADO RED",
+                icon_name="WIFI_OK",
+                submenu=DetailCardView("RED ACTIVA", wrap_oled_lines(info_lines, max_chars=19)),
+            )
+        )
+        deck.add_card(
+            HeroCard(
+                title="DESCONECTAR",
+                icon_name="WIFI_FAIL",
+                on_select=lambda: self._disconnect_wifi(ssid=ssid, action_menu=deck, source_deck=source_deck),
+            )
+        )
+
+    def _build_active_wifi_menu(
+        self,
+        ssid: str,
+        signal_pct: int = 0,
+        security: str = "",
+        frequency: str = "",
+        profile_id: Optional[str] = None,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> HeroCardDeckView:
+        """Builds status and management actions for the currently connected Wi-Fi network."""
+        deck = HeroCardDeckView(shorten_oled_label(ssid, 16))
+        self._append_active_wifi_cards(
+            deck, ssid=ssid, signal_pct=signal_pct, security=security,
+            frequency=frequency, source_deck=source_deck,
+        )
+        deck.add_card(
+            HeroCard(
+                title="OLVIDAR RED",
+                icon_name="POWEROFF",
+                on_select=lambda: self._forget_wifi(
+                    ssid=ssid, profile_id=profile_id, action_menu=deck, source_deck=source_deck,
+                ),
+            )
+        )
+        return deck
+
+    def _build_saved_profile_menu(
+        self,
+        prof: Dict[str, Any],
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> HeroCardDeckView:
+        """Builds action menu for a saved Wi-Fi profile."""
+        ssid = prof.get("ssid", "Red Wi-Fi")
+        profile_id = prof.get("profile_id")
+        security = prof.get("security", "")
+        in_use = bool(prof.get("in_use"))
+        signal_pct = int(prof.get("signal_pct") or 0)
+
+        deck = HeroCardDeckView(shorten_oled_label(ssid, 16))
+        if in_use:
+            self._append_active_wifi_cards(
+                deck, ssid=ssid, signal_pct=signal_pct, security=security, source_deck=source_deck,
+            )
+        else:
+            deck.add_card(
+                HeroCard(
+                    title="CONECTAR",
+                    icon_name="WIFI_SAVED",
+                    on_select=lambda: self._connect_to_wifi(
+                        ssid=ssid,
+                        password=None,
+                        profile_id=profile_id,
+                        use_saved=True,
+                        security_hint=security,
+                        replace_top_menu=deck,
+                        source_deck=source_deck,
+                    ),
+                )
+            )
+
+        deck.add_card(
+            HeroCard(
+                title="CAMBIAR CLAVE",
+                icon_name="KEYBOARD",
+                on_select=lambda: self._open_wifi_password_prompt(
+                    ssid=ssid,
+                    force_update=True,
+                    security_hint=security,
+                    replace_top=True,
+                    source_deck=source_deck,
+                ),
+            )
+        )
+        deck.add_card(
+            HeroCard(
+                title="OLVIDAR RED",
+                icon_name="POWEROFF",
+                on_select=lambda: self._forget_wifi(
+                    ssid=ssid, profile_id=profile_id, action_menu=deck, source_deck=source_deck,
+                ),
+            )
+        )
+        return deck
+
+    def _make_scanned_card_handler(
+        self,
+        net: Dict[str, Any],
+        deck_wifi_nets: HeroCardDeckView,
+    ) -> Callable[[], None]:
+        """Creates the selection handler for a scanned Wi-Fi HeroCard."""
+        ssid = net.get("ssid", "Red Wi-Fi")
+        is_secured = bool(net.get("is_secured", True))
+        is_enterprise = bool(net.get("is_enterprise", False))
+        in_use = bool(net.get("in_use", False))
+        is_saved = bool(net.get("is_saved", False))
+        profile_id = net.get("saved_profile_id")
+        security = net.get("security", "")
+
+        def handler() -> None:
+            if in_use:
+                menu = self._build_active_wifi_menu(
+                    ssid=ssid,
+                    signal_pct=int(net.get("signal_pct") or 0),
+                    security=security,
+                    frequency=net.get("frequency", ""),
+                    profile_id=profile_id,
+                    source_deck=deck_wifi_nets,
+                )
+                self.screen_manager.push_view(menu)
+            elif is_saved:
+                self._connect_to_wifi(
+                    ssid=ssid,
+                    password=None,
+                    profile_id=profile_id,
+                    use_saved=True,
+                    security_hint=security,
+                    source_deck=deck_wifi_nets,
+                )
+            elif is_enterprise:
+                self.screen_manager.push_view(
+                    DetailCardView(
+                        "RED 802.1X",
+                        wrap_oled_lines(["Requiere 802.1X", f"Red: {shorten_oled_label(ssid, 14)}", "No soportado aqui"]),
+                    )
+                )
+            elif is_secured:
+                self._open_wifi_password_prompt(
+                    ssid=ssid,
+                    force_update=False,
+                    security_hint=security,
+                    source_deck=deck_wifi_nets,
+                )
+            else:
+                self._connect_to_wifi(
+                    ssid=ssid,
+                    password=None,
+                    security_hint=security,
+                    source_deck=deck_wifi_nets,
+                )
+
+        return handler
 
     def _display_scanned_wifi_networks(self, result: DiagnosticResult) -> None:
         """Constructs a Hero Card Deck of discovered Wi-Fi networks."""
         networks = result.metrics.get("networks", []) if isinstance(result.metrics, dict) else []
         deck_wifi_nets = HeroCardDeckView("REDES WI-FI")
+        deck_wifi_nets._rei_deck_kind = "scan"
 
-        if not networks:
-            no_net_card = HeroCard(
-                title="SIN REDES",
-                icon_name="WIFI_FAIL",
-                submenu=DetailCardView("SIN REDES", ["No se encontraron", "redes Wi-Fi."]),
+        if result.status == DiagnosticStatus.FAILED and not networks:
+            deck_wifi_nets.add_card(
+                HeroCard(
+                    title="ERROR ESCANEO",
+                    icon_name="WIFI_FAIL",
+                    submenu=DetailCardView("ERROR WI-FI", result.details or [result.summary]),
+                )
             )
-            deck_wifi_nets.add_card(no_net_card)
+        elif not networks:
+            deck_wifi_nets.add_card(
+                HeroCard(
+                    title="SIN REDES",
+                    icon_name="WIFI_FAIL",
+                    submenu=DetailCardView("SIN REDES", ["No se encontraron", "redes Wi-Fi."]),
+                )
+            )
         else:
             for net in networks:
                 ssid = net.get("ssid", "Red Wi-Fi")
-                is_secured = net.get("is_secured", True)
-                icon = "LOCK" if is_secured else "WIFI"
+                in_use = bool(net.get("in_use", False))
+                is_saved = bool(net.get("is_saved", False))
+                is_secured = bool(net.get("is_secured", True))
 
-                def make_select_handler(target_ssid: str, secured: bool):
-                    def handler():
-                        if secured:
-                            kb_view = VirtualKeyboardInputView(
-                                ssid=target_ssid,
-                                on_submit=self._connect_to_wifi,
-                            )
-                            self.screen_manager.push_view(kb_view)
-                        else:
-                            self._connect_to_wifi(ssid=target_ssid, password=None)
-                    return handler
+                if in_use:
+                    icon = "WIFI_OK"
+                elif is_saved:
+                    icon = "WIFI_SAVED"
+                elif is_secured:
+                    icon = "LOCK"
+                else:
+                    icon = "WIFI"
 
                 deck_wifi_nets.add_card(
                     HeroCard(
-                        title=f"{ssid.strip().upper()[:16]}",
+                        title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=is_saved),
                         icon_name=icon,
-                        on_select=make_select_handler(ssid, is_secured),
+                        on_select=self._make_scanned_card_handler(net, deck_wifi_nets),
+                        metadata={"ssid": ssid, "net": dict(net)},
                     )
                 )
 
         self.screen_manager.push_view(deck_wifi_nets)
 
-    def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
+    def _display_saved_wifi_profiles(self, result: DiagnosticResult) -> None:
+        """Constructs a Hero Card Deck of previously saved Wi-Fi profiles."""
+        profiles = result.metrics.get("profiles", []) if isinstance(result.metrics, dict) else []
+        deck_saved = HeroCardDeckView("REDES GUARDADAS")
+        deck_saved._rei_deck_kind = "saved"
+
+        if not profiles:
+            deck_saved.add_card(
+                HeroCard(
+                    title="SIN GUARDADAS",
+                    icon_name="INFO",
+                    submenu=DetailCardView("REDES GUARDADAS", ["No hay redes", "guardadas aun."]),
+                )
+            )
+        else:
+            for prof in profiles:
+                ssid = prof.get("ssid", "Red Wi-Fi")
+                in_use = bool(prof.get("in_use", False))
+                in_range = bool(prof.get("in_range", False))
+
+                if in_use:
+                    icon = "WIFI_OK"
+                elif in_range:
+                    icon = "WIFI_SAVED"
+                else:
+                    icon = "INFO"
+
+                def make_saved_handler(p: Dict[str, Any]):
+                    def handler():
+                        self.screen_manager.push_view(self._build_saved_profile_menu(p, source_deck=deck_saved))
+                    return handler
+
+                deck_saved.add_card(
+                    HeroCard(
+                        title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=False),
+                        icon_name=icon,
+                        on_select=make_saved_handler(prof),
+                        metadata={"ssid": ssid, "net": dict(prof)},
+                    )
+                )
+
+        self.screen_manager.push_view(deck_saved)
+
+    def _update_source_deck_state(
+        self,
+        source_deck: Optional[HeroCardDeckView],
+        connected_ssid: Optional[str] = None,
+        disconnected_ssid: Optional[str] = None,
+        forgotten_ssid: Optional[str] = None,
+    ) -> None:
+        """Keeps cards in the previous scan/saved deck synchronized after state changes."""
+        if not source_deck or not source_deck.cards:
+            return
+
+        deck_kind = getattr(source_deck, "_rei_deck_kind", "scan")
+
+        if forgotten_ssid and deck_kind == "saved":
+            remaining = [c for c in source_deck.cards if c.metadata.get("ssid") != forgotten_ssid]
+            if not remaining:
+                source_deck.cards = [
+                    HeroCard(
+                        title="SIN GUARDADAS",
+                        icon_name="INFO",
+                        submenu=DetailCardView("REDES GUARDADAS", ["Lista vacia."]),
+                    )
+                ]
+                source_deck.active_index = 0
+                return
+            source_deck.cards = remaining
+            source_deck.active_index = min(source_deck.active_index, len(remaining) - 1)
+
+        for card in source_deck.cards:
+            meta = card.metadata
+            net = meta.get("net")
+            ssid = meta.get("ssid")
+            if not isinstance(net, dict) or not ssid:
+                continue
+
+            if forgotten_ssid and ssid == forgotten_ssid:
+                net["in_use"] = False
+                net["is_saved"] = False
+                net["saved_profile_id"] = None
+            elif connected_ssid:
+                if ssid == connected_ssid:
+                    net["in_use"] = True
+                    net["is_saved"] = True
+                elif net.get("in_use"):
+                    net["in_use"] = False
+                    net["is_saved"] = True
+            elif disconnected_ssid and (ssid == disconnected_ssid or net.get("in_use")):
+                net["in_use"] = False
+
+            in_use = bool(net.get("in_use"))
+            is_saved = bool(net.get("is_saved"))
+            is_secured = bool(net.get("is_secured", True))
+
+            if deck_kind == "saved":
+                card.title = self._format_wifi_card_title(ssid, in_use=in_use, is_saved=False)
+                if in_use:
+                    card.icon_name = "WIFI_OK"
+                elif net.get("in_range"):
+                    card.icon_name = "WIFI_SAVED"
+                else:
+                    card.icon_name = "INFO"
+                card.on_select = lambda p=net: self.screen_manager.push_view(
+                    self._build_saved_profile_menu(p, source_deck=source_deck)
+                )
+            else:
+                card.title = self._format_wifi_card_title(ssid, in_use=in_use, is_saved=is_saved)
+                if in_use:
+                    card.icon_name = "WIFI_OK"
+                elif is_saved:
+                    card.icon_name = "WIFI_SAVED"
+                elif is_secured:
+                    card.icon_name = "LOCK"
+                else:
+                    card.icon_name = "WIFI"
+                card.on_select = self._make_scanned_card_handler(net, source_deck)
+
+    def _connect_to_wifi(
+        self,
+        ssid: str,
+        password: Optional[str],
+        profile_id: Optional[str] = None,
+        use_saved: bool = False,
+        force_update: bool = False,
+        security_hint: Optional[str] = None,
+        replace_top_menu: Optional[HeroCardDeckView] = None,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
         """Launches Wi-Fi connection worker and shows progress."""
-        if isinstance(self.screen_manager.current_view, (VirtualKeyboardInputView, KeyboardInputView)):
+        curr = self.screen_manager.current_view
+        if isinstance(curr, (WiFiPasswordView, VirtualKeyboardInputView, KeyboardInputView)) or getattr(
+            curr, "accepts_text_input", False
+        ):
+            self.screen_manager.pop_view()
+        elif replace_top_menu is not None and curr is replace_top_menu:
             self.screen_manager.pop_view()
 
-        conn_view = UpdateProgressView(title="CONECTANDO...")
-        conn_view.stage_message = f"Enlazando {ssid[:10]}..."
-        conn_view.progress = 0.5
-        self.screen_manager.push_view(conn_view)
-
-        def on_connect_done(result: DiagnosticResult):
-            self.screen_manager.pop_view()
-            self._display_wifi_result_hero_card(result, ssid)
-
-        self.diag_manager.execute_async(
+        self._run_wifi_async_task(
+            progress_title="CONECTANDO...",
+            stage_message=f"Enlazando {shorten_oled_label(ssid, 9)}...",
             plugin_id="sys_wifi_connect",
+            on_done_ui=lambda res: self._display_wifi_result_hero_card(
+                res,
+                ssid,
+                used_saved=use_saved,
+                force_update=force_update,
+                security_hint=security_hint,
+                source_deck=source_deck,
+            ),
             ssid=ssid,
             password=password,
-            on_complete=on_connect_done,
+            profile_id=profile_id,
+            use_saved=use_saved,
+            force_update=force_update,
+            security_hint=security_hint,
         )
 
-    def _display_wifi_result_hero_card(self, result: DiagnosticResult, ssid: str) -> None:
-        """Displays Wi-Fi connection outcome strictly formatted as Hero Cards."""
+    def _run_wifi_profile_action(
+        self,
+        plugin_id: str,
+        progress_title: str,
+        stage_message: str,
+        ok_title: str,
+        ok_icon: str,
+        detail_title: str,
+        ssid: str,
+        action_menu: Optional[HeroCardDeckView],
+        source_deck: Optional[HeroCardDeckView],
+        disconnected_ssid: Optional[str] = None,
+        forgotten_ssid: Optional[str] = None,
+        **plugin_kwargs: Any,
+    ) -> None:
+        """Executes a Wi-Fi profile state mutation (disconnect/forget) and updates UI stack."""
+        def on_done(result: DiagnosticResult) -> None:
+            is_ok = (result.status == DiagnosticStatus.SUCCESS)
+            if is_ok:
+                self._update_source_deck_state(
+                    source_deck,
+                    disconnected_ssid=disconnected_ssid,
+                    forgotten_ssid=forgotten_ssid,
+                )
+                if action_menu is not None and self.screen_manager.current_view is action_menu:
+                    self.screen_manager.pop_view()
+
+            deck = HeroCardDeckView("ESTADO WI-FI")
+            deck.add_card(
+                HeroCard(
+                    title=ok_title if is_ok else "ERROR",
+                    icon_name=ok_icon if is_ok else "WIFI_FAIL",
+                    submenu=DetailCardView(detail_title, result.details or [result.summary]),
+                )
+            )
+            self.screen_manager.push_view(deck)
+
+        self._run_wifi_async_task(
+            progress_title=progress_title,
+            stage_message=stage_message,
+            plugin_id=plugin_id,
+            on_done_ui=on_done,
+            ssid=ssid,
+            **plugin_kwargs,
+        )
+
+    def _disconnect_wifi(
+        self,
+        ssid: str,
+        action_menu: Optional[HeroCardDeckView] = None,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
+        """Disconnects active Wi-Fi cleanly and updates navigation stack."""
+        self._run_wifi_profile_action(
+            plugin_id="sys_wifi_disconnect",
+            progress_title="DESCONECTANDO",
+            stage_message=f"Cerrando {shorten_oled_label(ssid, 10)}...",
+            ok_title="DESCONECTADO",
+            ok_icon="WIFI",
+            detail_title="DESCONECTAR",
+            ssid=ssid,
+            action_menu=action_menu,
+            source_deck=source_deck,
+            disconnected_ssid=ssid,
+        )
+
+    def _forget_wifi(
+        self,
+        ssid: str,
+        profile_id: Optional[str] = None,
+        action_menu: Optional[HeroCardDeckView] = None,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
+        """Deletes a saved Wi-Fi profile and updates navigation stack."""
+        self._run_wifi_profile_action(
+            plugin_id="sys_wifi_forget",
+            progress_title="OLVIDANDO RED",
+            stage_message=f"Borrando {shorten_oled_label(ssid, 9)}...",
+            ok_title="RED OLVIDADA",
+            ok_icon="INFO",
+            detail_title="OLVIDAR RED",
+            ssid=ssid,
+            action_menu=action_menu,
+            source_deck=source_deck,
+            forgotten_ssid=ssid,
+            profile_id=profile_id,
+        )
+
+    def _display_wifi_result_hero_card(
+        self,
+        result: DiagnosticResult,
+        ssid: str,
+        used_saved: bool = False,
+        force_update: bool = False,
+        security_hint: Optional[str] = None,
+        source_deck: Optional[HeroCardDeckView] = None,
+    ) -> None:
+        """Displays Wi-Fi connection outcome as concise, actionable Hero Cards."""
         is_success = (result.status == DiagnosticStatus.SUCCESS)
+        metrics = result.metrics if isinstance(result.metrics, dict) else {}
 
         if is_success:
-            hero_title = "CONECTADO"
-            icon_name = "WIFI_OK"
-            detail_title = "RESUMEN RED"
-        else:
-            hero_title = "ERROR CONEXION"
-            icon_name = "WIFI_FAIL"
-            detail_title = "ERROR CONEXION"
+            self._update_source_deck_state(source_deck, connected_ssid=ssid)
+            already_conn = bool(metrics.get("already_connected"))
+            hero_title = "YA CONECTADA" if already_conn else "CONECTADO"
+            detail_view = DetailCardView(
+                title="RESUMEN RED",
+                initial_lines=result.details if result.details else [result.summary],
+                pop_to_root_on_key1=True,
+            )
+            deck_result = HeroCardDeckView("ESTADO WI-FI")
+            deck_result.add_card(HeroCard(title=hero_title, icon_name="WIFI_OK", submenu=detail_view))
+            self.screen_manager.push_view(deck_result)
+            return
+
+        error_code = str(metrics.get("error_code", "UNKNOWN"))
+        needs_password = bool(metrics.get("needs_password", False))
+
+        title_map = {
+            "AUTH_FAILED": "CLAVE INVALIDA" if used_saved else "CLAVE INCORRECTA",
+            "SECRETS_REQUIRED": "CLAVE REQUERIDA",
+            "NO_NETWORK_FOUND": "SIN ALCANCE",
+            "TIMEOUT": "TIEMPO AGOTADO",
+            "DHCP_FAILED": "ERROR DHCP",
+            "WIFI_DISABLED": "WI-FI APAGADO",
+            "INTERFACE_UNAVAILABLE": "INTERFAZ CAIDA",
+            "ENTERPRISE_UNSUPPORTED": "REQ. 802.1X",
+        }
+        hero_title = title_map.get(error_code, "ERROR CONEXION")
 
         detail_view = DetailCardView(
-            title=detail_title,
+            title="DETALLE ERROR",
             initial_lines=result.details if result.details else [result.summary],
-            pop_to_root_on_key1=True,
+            pop_to_root_on_key1=False,
         )
-
         deck_result = HeroCardDeckView("ESTADO WI-FI")
-        deck_result.add_card(
-            HeroCard(
-                title=hero_title,
-                icon_name=icon_name,
-                submenu=detail_view,
+
+        if error_code in ("AUTH_FAILED", "SECRETS_REQUIRED") or needs_password:
+            retry_label = "NUEVA CLAVE" if used_saved else "REINTENTAR CLAVE"
+            retry_card = HeroCard(
+                title=retry_label,
+                icon_name="KEYBOARD",
+                on_select=lambda: self._open_wifi_password_prompt(
+                    ssid=ssid,
+                    force_update=True,
+                    security_hint=security_hint,
+                    replace_top=True,
+                    source_deck=source_deck,
+                ),
             )
-        )
+            error_card = HeroCard(title=hero_title, icon_name="WIFI_FAIL", submenu=detail_view)
+            if used_saved:
+                deck_result.add_card(retry_card)
+                deck_result.add_card(error_card)
+            else:
+                deck_result.add_card(error_card)
+                deck_result.add_card(retry_card)
+        else:
+            deck_result.add_card(HeroCard(title=hero_title, icon_name="WIFI_FAIL", submenu=detail_view))
+
         self.screen_manager.push_view(deck_result)
 
     # =========================================================================
@@ -548,6 +1124,13 @@ class REIApp:
                 title="ESCANEAR WI-FI",
                 icon_name="WIFI",
                 on_select=self._start_wifi_scan,
+            )
+        )
+        deck_net_conn.add_card(
+            HeroCard(
+                title="REDES GUARDADAS",
+                icon_name="WIFI_SAVED",
+                on_select=self._start_saved_wifi_list,
             )
         )
 
@@ -782,7 +1365,17 @@ class REIApp:
         self.screen_manager.set_root_view(root_deck)
 
     def _process_background_results(self) -> None:
-        """Polls completed diagnostic tasks without blocking the UI loop."""
+        """Polls completed diagnostic tasks and UI callbacks without blocking the UI loop."""
+        while True:
+            try:
+                ui_cb = self._ui_callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                ui_cb()
+            except Exception as ex:
+                logger.exception(f"Error executing UI callback: {ex}")
+
         while True:
             result = self.diag_manager.poll_result()
             if not result:
@@ -830,7 +1423,9 @@ class REIApp:
                 while event is not None:
                     curr_view = self.screen_manager.current_view
                     if curr_view:
-                        if isinstance(curr_view, KeyboardInputView):
+                        if isinstance(curr_view, (WiFiPasswordView, KeyboardInputView)) or getattr(
+                            curr_view, "accepts_text_input", False
+                        ):
                             action = curr_view.handle_input(event, char=self.input_handler.get_last_char())
                         else:
                             action = curr_view.handle_input(event)

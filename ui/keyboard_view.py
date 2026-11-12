@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 
 from PIL import ImageDraw, ImageFont
 
+from core.parser import sanitize_oled_text
 from .display import BaseView, ViewAction, ViewActionType
 from .input_handler import InputEvent
 
@@ -190,7 +191,8 @@ class VirtualKeyboardInputView(BaseView):
         draw.text((97, 3), layer_badge, font=self.font, fill="white")
 
         # Texto ingresado con desplazamiento horizontal
-        display_str = ("*" * len(self.input_text)) if self.is_masked else self.input_text
+        safe_input = sanitize_oled_text(self.input_text)
+        display_str = ("*" * len(safe_input)) if self.is_masked else safe_input
         cursor_char = "_" if self.cursor_visible else " "
         
         # Ancho visible dentro de la caja de texto (x=5..92 -> ~14 caracteres @ 6px/char)

@@ -14,8 +14,9 @@ import time
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
+from .parser import sanitize_oled_text, shorten_oled_label, wrap_oled_lines
 from .pisugar import PiSugar3Client, PiSugarTelemetry
-from .wifi import WiFiManager, WiFiNetwork
+from .wifi import WiFiErrorCode, WiFiManager, WiFiNetwork
 
 
 class IPAddressPlugin(IDiagnosticPlugin):
@@ -76,11 +77,40 @@ class WiFiScanPlugin(IDiagnosticPlugin):
         return "NETWORK"
 
     def run(self, **kwargs) -> DiagnosticResult:
-        networks = self._mgr.scan_networks()
+        scan_error: Optional[str] = None
+        scan_error_code = WiFiErrorCode.NONE
+
+        if hasattr(self._mgr, "scan_networks_detailed"):
+            networks, scan_error, scan_error_code = self._mgr.scan_networks_detailed()
+        else:
+            networks = self._mgr.scan_networks()
+
+        if scan_error_code != WiFiErrorCode.NONE and not networks:
+            err_lines = wrap_oled_lines([scan_error or "Error al escanear", "Revise radio Wi-Fi"], max_chars=19)
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                summary=sanitize_oled_text(scan_error or "Error al escanear"),
+                details=err_lines,
+                metrics={
+                    "count": 0,
+                    "networks": [],
+                    "error_code": scan_error_code.value,
+                    "scan_error": scan_error,
+                },
+            )
+
         details = []
         for net in networks[:8]:
-            sec_badge = "[L]" if net.is_secured else "[O]"
-            details.append(f"{sec_badge} {net.ssid[:12]:<12} {net.signal_pct}%")
+            if net.in_use:
+                badge = "[*]"
+            elif getattr(net, "is_saved", False):
+                badge = "[G]"
+            elif net.is_secured:
+                badge = "[L]"
+            else:
+                badge = "[O]"
+            details.append(f"{badge} {shorten_oled_label(net.ssid, 11):<11} {net.signal_pct}%")
 
         if not details:
             details = ["No se encontraron", "redes Wi-Fi."]
@@ -98,17 +128,22 @@ class WiFiScanPlugin(IDiagnosticPlugin):
                         "signal_pct": n.signal_pct,
                         "security": n.security,
                         "is_secured": n.is_secured,
+                        "is_enterprise": getattr(n, "is_enterprise", False),
                         "frequency": n.frequency,
-                        "in_use": n.in_use
+                        "channel": getattr(n, "channel", 1),
+                        "in_use": n.in_use,
+                        "is_saved": getattr(n, "is_saved", False),
+                        "saved_profile_id": getattr(n, "saved_profile_id", None),
+                        "saved_profile_name": getattr(n, "saved_profile_name", None),
                     }
                     for n in networks
-                ]
-            }
+                ],
+            },
         )
 
 
 class WiFiConnectPlugin(IDiagnosticPlugin):
-    """Connects to a specified Wi-Fi network with password authentication."""
+    """Connects to a specified Wi-Fi network (manual password, open, or saved profile)."""
 
     def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
         self._mgr = wifi_mgr or WiFiManager()
@@ -125,55 +160,218 @@ class WiFiConnectPlugin(IDiagnosticPlugin):
     def category(self) -> str:
         return "NETWORK"
 
-    def run(self, ssid: str = "", password: Optional[str] = None, **kwargs) -> DiagnosticResult:
+    def run(
+        self,
+        ssid: str = "",
+        password: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        use_saved: bool = False,
+        force_update: bool = False,
+        security_hint: Optional[str] = None,
+        **kwargs,
+    ) -> DiagnosticResult:
         if not ssid:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="SSID no especificado",
-                details=["Error de red:", "SSID vacío"],
-                metrics={"success": False, "ssid": ""}
+                summary="SSID vacio",
+                details=["SSID no valido", "Seleccione una red"],
+                metrics={"success": False, "ssid": "", "error_code": WiFiErrorCode.NO_NETWORK_FOUND.value},
             )
 
-        success, message, details_dict = self._mgr.connect_network(ssid=ssid, password=password)
+        if use_saved and password is None and not force_update and hasattr(self._mgr, "connect_saved_network"):
+            success, message, details_dict = self._mgr.connect_saved_network(
+                ssid=ssid,
+                profile_id=profile_id,
+            )
+        else:
+            success, message, details_dict = self._mgr.connect_network(
+                ssid=ssid,
+                password=password,
+                profile_id=profile_id,
+                force_update=force_update,
+                security_hint=security_hint,
+            )
+
+        short_ssid = shorten_oled_label(ssid, 14)
+
         if success:
-            ip_addr = details_dict.get("ip_address", "Asignada")
-            details = [
-                f"SSID: {ssid[:14]}",
-                f"IP:   {ip_addr[:14]}",
+            ip_addr = sanitize_oled_text(details_dict.get("ip_address", "Asignada"))
+            already_conn = bool(details_dict.get("already_connected"))
+            lines = [
+                f"Red: {short_ssid}",
+                f"IP:  {shorten_oled_label(ip_addr, 14)}",
             ]
-            if "gateway" in details_dict and details_dict["gateway"]:
-                details.append(f"GW:   {str(details_dict['gateway'])[:14]}")
-            elif "signal" in details_dict and details_dict["signal"]:
-                details.append(f"Senal:{str(details_dict['signal'])[:14]}")
+            if already_conn:
+                lines.append("Ya estaba activa")
+            elif details_dict.get("signal"):
+                lines.append(f"Senal: {shorten_oled_label(details_dict['signal'], 12)}")
+            elif details_dict.get("gateway"):
+                lines.append(f"GW:  {shorten_oled_label(details_dict['gateway'], 14)}")
             else:
-                details.append("Conexión activa OK")
+                lines.append("Conexion activa OK")
 
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.SUCCESS,
-                summary=f"Conectado a {ssid}",
-                details=details,
-                metrics={"success": True, "ssid": ssid, **details_dict}
+                summary=sanitize_oled_text("Ya conectada" if already_conn else f"Conectado a {ssid}"),
+                details=wrap_oled_lines(lines, max_chars=19),
+                metrics={"success": True, "ssid": ssid, **details_dict},
             )
-        else:
-            reason = details_dict.get("reason", message)
-            details = [
-                f"Red:   {ssid[:14]}",
-                f"Error: {message[:14]}",
-            ]
-            if reason and reason != message:
-                details.append(f"Causa: {reason[:14]}")
-            else:
-                details.append("Verifique clave/señal")
 
+        short_msg = sanitize_oled_text(message or "Error de conexion")
+        reason = sanitize_oled_text(details_dict.get("reason", ""))
+        raw_lines = [short_msg, f"Red: {short_ssid}"]
+        if reason and reason.lower() != short_msg.lower():
+            raw_lines.append(reason)
+
+        details = wrap_oled_lines(raw_lines, max_chars=19)
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.FAILED,
+            summary=shorten_oled_label(short_msg, 19),
+            details=details,
+            metrics={"success": False, "ssid": ssid, "error": short_msg, **details_dict},
+        )
+
+
+class WiFiSavedListPlugin(IDiagnosticPlugin):
+    """Lists saved Wi-Fi connection profiles cross-referenced with active/range status."""
+
+    def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
+        self._mgr = wifi_mgr or WiFiManager()
+
+    @property
+    def id(self) -> str:
+        return "diag_wifi_saved"
+
+    @property
+    def name(self) -> str:
+        return "REDES GUARDADAS"
+
+    @property
+    def category(self) -> str:
+        return "NETWORK"
+
+    def run(self, include_scan: bool = True, **kwargs) -> DiagnosticResult:
+        profiles = self._mgr.list_saved_profiles(include_scan=include_scan)
+        details: List[str] = []
+        for prof in profiles[:8]:
+            badge = "[*]" if prof.in_use else ("[R]" if prof.in_range else "[G]")
+            details.append(f"{badge} {shorten_oled_label(prof.ssid, 15)}")
+        if not details:
+            details = ["Sin redes guardadas"]
+
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.SUCCESS,
+            summary=f"{len(profiles)} Guardadas",
+            details=wrap_oled_lines(details, max_chars=19),
+            metrics={
+                "count": len(profiles),
+                "profiles": [
+                    {
+                        "ssid": p.ssid,
+                        "profile_id": p.profile_id,
+                        "name": p.name,
+                        "security": p.security,
+                        "autoconnect": p.autoconnect,
+                        "in_use": p.in_use,
+                        "in_range": p.in_range,
+                        "signal_pct": p.signal_pct,
+                    }
+                    for p in profiles
+                ],
+            },
+        )
+
+
+class WiFiDisconnectPlugin(IDiagnosticPlugin):
+    """Disconnects the active Wi-Fi connection."""
+
+    def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
+        self._mgr = wifi_mgr or WiFiManager()
+
+    @property
+    def id(self) -> str:
+        return "sys_wifi_disconnect"
+
+    @property
+    def name(self) -> str:
+        return "DESCONECTAR WI-FI"
+
+    @property
+    def category(self) -> str:
+        return "NETWORK"
+
+    def run(self, ssid: Optional[str] = None, **kwargs) -> DiagnosticResult:
+        success, message, details_dict = self._mgr.disconnect_network(ssid=ssid)
+        target = ssid or details_dict.get("ssid") or "wlan0"
+        short_target = shorten_oled_label(target, 14)
+
+        if success:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.SUCCESS,
+                summary="Desconectado",
+                details=wrap_oled_lines(["Desconectado OK", f"Red: {short_target}"], max_chars=19),
+                metrics={"success": True, **details_dict},
+            )
+        short_msg = sanitize_oled_text(message or "Error al desconectar")
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.FAILED,
+            summary=shorten_oled_label(short_msg, 19),
+            details=wrap_oled_lines([short_msg, f"Red: {short_target}"], max_chars=19),
+            metrics={"success": False, "error": short_msg, **details_dict},
+        )
+
+
+class WiFiForgetPlugin(IDiagnosticPlugin):
+    """Removes a saved Wi-Fi connection profile."""
+
+    def __init__(self, wifi_mgr: Optional[WiFiManager] = None):
+        self._mgr = wifi_mgr or WiFiManager()
+
+    @property
+    def id(self) -> str:
+        return "sys_wifi_forget"
+
+    @property
+    def name(self) -> str:
+        return "OLVIDAR RED WI-FI"
+
+    @property
+    def category(self) -> str:
+        return "NETWORK"
+
+    def run(self, ssid: str = "", profile_id: Optional[str] = None, **kwargs) -> DiagnosticResult:
+        if not ssid and not profile_id:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Fallo de conexión",
-                details=details,
-                metrics={"success": False, "ssid": ssid, "error": message, **details_dict}
+                summary="SSID vacio",
+                details=["Perfil no valido"],
+                metrics={"success": False},
             )
+        success, message, details_dict = self._mgr.forget_network(ssid=ssid, profile_id=profile_id)
+        short_target = shorten_oled_label(ssid or profile_id or "", 14)
+        if success:
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.SUCCESS,
+                summary="Red olvidada",
+                details=wrap_oled_lines(["Red olvidada OK", f"Red: {short_target}"], max_chars=19),
+                metrics={"success": True, "ssid": ssid, **details_dict},
+            )
+        short_msg = sanitize_oled_text(message or "Error al olvidar")
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.FAILED,
+            summary=shorten_oled_label(short_msg, 19),
+            details=wrap_oled_lines([short_msg, f"Red: {short_target}"], max_chars=19),
+            metrics={"success": False, "ssid": ssid, "error": short_msg, **details_dict},
+        )
 
 
 class BatteryStatusPlugin(IDiagnosticPlugin):

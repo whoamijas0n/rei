@@ -136,6 +136,59 @@ class TestUIDisplay(unittest.TestCase):
         action = qr_view.handle_input(InputEvent.KEY2)
         self.assertEqual(action.action_type, ViewActionType.POP_VIEW)
 
+    def test_detail_card_word_wrap_sanitization_and_scroll(self):
+        """Verify DetailCardView wraps long Spanish text safely and supports scrolling."""
+        detail = DetailCardView(
+            title="ERROR CONEXIÓN",
+            initial_lines=["Contraseña inválida en la red de oficina principal"],
+        )
+        wrapped = detail._get_wrapped_lines()
+        self.assertGreater(len(wrapped), 2)
+        for line in wrapped:
+            self.assertLessEqual(len(line), 19)
+            self.assertNotIn("ñ", line)
+            self.assertNotIn("á", line)
+
+        buffer = Image.new("1", (128, 64), "black")
+        draw = ImageDraw.Draw(buffer)
+        detail.render(draw, 128, 64)
+        detail.handle_input(InputEvent.DOWN)
+        if len(wrapped) > 3:
+            self.assertEqual(detail.scroll_offset, 1)
+
+    def test_hero_card_deck_large_count_and_wifi_saved_icon(self):
+        """Verify HeroCardDeckView handles >18 cards and WIFI_SAVED icon renders cleanly."""
+        deck = HeroCardDeckView("REDES WI-FI")
+        for idx in range(22):
+            deck.add_card(HeroCard(title=f"NET_{idx}", icon_name="WIFI_SAVED"))
+        buffer = Image.new("1", (128, 64), "black")
+        draw = ImageDraw.Draw(buffer)
+        deck.render(draw, 128, 64)
+        self.assertEqual(deck.active_index, 0)
+
+    def test_usb_keyboard_enter_and_escape_navigation(self):
+        """Verify HeroCardDeckView, DetailCardView and UpdateProgressView accept ENTER/ESCAPE."""
+        sub = DetailCardView("DETALLE", ["Linea 1"])
+        deck = HeroCardDeckView("MENU")
+        deck.add_card(HeroCard(title="ITEM", icon_name="INFO", submenu=sub))
+
+        act_enter = deck.handle_input(InputEvent.ENTER)
+        self.assertEqual(act_enter.action_type, ViewActionType.PUSH_VIEW)
+        self.assertIs(act_enter.target_view, sub)
+
+        act_esc = deck.handle_input(InputEvent.ESCAPE)
+        self.assertEqual(act_esc.action_type, ViewActionType.POP_VIEW)
+
+        self.assertEqual(sub.handle_input(InputEvent.ESCAPE).action_type, ViewActionType.POP_VIEW)
+        self.assertEqual(sub.handle_input(InputEvent.ENTER).action_type, ViewActionType.POP_VIEW)
+
+        prog = UpdateProgressView("PROG")
+        prog.is_running = True
+        self.assertEqual(prog.handle_input(InputEvent.ENTER).action_type, ViewActionType.NONE)
+        self.assertEqual(prog.handle_input(InputEvent.ESCAPE).action_type, ViewActionType.NONE)
+        prog.set_completed(success=True, summary="OK")
+        self.assertEqual(prog.handle_input(InputEvent.ENTER).action_type, ViewActionType.POP_VIEW)
+
 
 if __name__ == "__main__":
     unittest.main()

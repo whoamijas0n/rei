@@ -110,6 +110,24 @@ class TestUSBModeManager(unittest.TestCase):
         ok = self.mgr.setup_network_isolation()
         self.assertTrue(ok)
 
+    def test_update_boot_config_dwc2_places_line_in_unfiltered_region(self):
+        """Verify dtoverlay=dwc2 is placed before [cm4]/[pi5] sections and old entries are removed."""
+        sample = (
+            "dtparam=spi=on\n"
+            "dtparam=i2c_arm=on\n\n"
+            "[cm4]\n"
+            "otg_mode=1\n\n"
+            "[pi5]\n"
+            "dtoverlay=nospi10\n"
+            "dtoverlay=dwc2,dr_mode=peripheral\n"
+        )
+        updated = USBModeManager.update_boot_config_dwc2(sample, "dtoverlay=dwc2,dr_mode=host")
+        idx_dwc2 = updated.find("dtoverlay=dwc2,dr_mode=host")
+        idx_cm4 = updated.find("[cm4]")
+        self.assertGreater(idx_dwc2, -1)
+        self.assertGreater(idx_cm4, idx_dwc2)
+        self.assertEqual(updated.count("dtoverlay=dwc2"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
