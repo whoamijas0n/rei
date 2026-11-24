@@ -17,6 +17,7 @@ import urllib.parse
 from PIL import Image, ImageDraw, ImageFont
 
 from .input_handler import InputEvent
+from .text import to_oled, wrap_lines_px, wrap_text_px
 
 logger = logging.getLogger("REI.UI.Display")
 
@@ -521,6 +522,10 @@ class IconRenderer:
 class BaseView(ABC):
     """Abstract Base Class for all OLED views."""
 
+    # Views that consume InputEvent.CHAR events set this to True so the main
+    # loop forwards the character associated with the event.
+    accepts_text_input: bool = False
+
     def __init__(self, title: str = ""):
         self.title = title
         self._font: Optional[ImageFont.ImageFont] = None
@@ -532,14 +537,31 @@ class BaseView(ABC):
             self._font = ImageFont.load_default()
         return self._font
 
+    def draw_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        xy: Tuple[int, int],
+        text: str,
+        fill: str = "white"
+    ) -> None:
+        """
+        Draws text sanitized for the OLED font (ASCII-only glyphs).
+
+        All view rendering must go through this helper or
+        :meth:`draw_centered_text`; Pillow's default font renders accented or
+        symbolic characters as corrupted boxes.
+        """
+        draw.text(xy, to_oled(text), font=self.font, fill=fill)
+
     def get_text_width(self, draw: ImageDraw.ImageDraw, text: str) -> int:
         """Calculates exact pixel width of a text string."""
+        clean = to_oled(text)
         if hasattr(draw, "textbbox"):
-            bbox = draw.textbbox((0, 0), text, font=self.font)
+            bbox = draw.textbbox((0, 0), clean, font=self.font)
             return bbox[2] - bbox[0]
         elif hasattr(draw, "textlength"):
-            return int(draw.textlength(text, font=self.font))
-        return len(text) * 6
+            return int(draw.textlength(clean, font=self.font))
+        return len(clean) * 6
 
     def draw_centered_text(
         self,
@@ -550,9 +572,10 @@ class BaseView(ABC):
         fill: str = "white"
     ) -> None:
         """Renders horizontally centered text at specified Y coordinate."""
-        text_w = self.get_text_width(draw, text)
+        clean = to_oled(text)
+        text_w = self.get_text_width(draw, clean)
         text_x = max(2, (screen_width - text_w) // 2)
-        draw.text((text_x, y), text, font=self.font, fill=fill)
+        draw.text((text_x, y), clean, font=self.font, fill=fill)
 
     def draw_perimeter_border(self, draw: ImageDraw.ImageDraw) -> None:
         """
@@ -692,6 +715,7 @@ class DetailCardView(BaseView):
         self.is_loading: bool = False
         self.scroll_offset: int = 0
         self._spinner_tick: int = 0
+        self._physical_count: int = 0
 
     def set_content(self, lines: List[str], status: str = "OK", is_loading: bool = False) -> None:
         """Updates detail lines and status badge."""
@@ -718,18 +742,33 @@ class DetailCardView(BaseView):
         self.draw_centered_text(draw, header_text, y=6, screen_width=width)
         draw.line((4, 18, 123, 18), fill="white")
 
-        # 3. Contenido limpio (Y=24, espaciado 12px)
+        # 3. Contenido limpio (Y=24, espaciado 12px), con ajuste de linea por
+        #    pixeles para que ninguna informacion se pierda a mitad de palabra.
         y = 24
-        visible_lines = self.lines[self.scroll_offset : self.scroll_offset + 3]
+        physical = wrap_lines_px(
+            draw, self.font, self.lines, max_width=112,
+        ) if self.lines else []
+
+        self._physical_count = len(physical)
+        self._physical_lines = physical
+        self.scroll_offset = max(0, min(self.scroll_offset, self._physical_count - 3))
+
+        visible_lines = physical[self.scroll_offset : self.scroll_offset + 3]
         if not visible_lines:
-            draw.text((8, y), "Sin datos / Presione OK", font=self.font, fill="white")
+            self.draw_text(draw, (8, y), "Sin datos / Presione OK")
         else:
             for line in visible_lines:
-                draw.text((8, y), line[:20], font=self.font, fill="white")
+                self.draw_text(draw, (8, y), line)
                 y += 12
 
+        # 4. Indicadores de scroll (mas contenido arriba/abajo).
+        if self.scroll_offset > 0:
+            self.draw_text(draw, (117, 24), "^")
+        if self.scroll_offset + 3 < self._physical_count:
+            self.draw_text(draw, (117, 48), "v")
+
     def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
-        max_scroll = max(0, len(self.lines) - 3)
+        max_scroll = max(0, self._physical_count - 3)
 
         if event == InputEvent.UP:
             self.scroll_offset = max(0, self.scroll_offset - 1)
@@ -829,30 +868,30 @@ class UpdateProgressView(BaseView):
 
             # 4A. Etiqueta de fase actual
             stage_txt = self.stage_message[:18]
-            draw.text((10, 34), stage_txt, font=self.font, fill="white")
+            self.draw_text(draw, (10, 34), stage_txt)
 
             # 5A. Porcentaje y tiempo transcurrido
             elapsed = time.monotonic() - self._start_time
             info_txt = f"{int(self.progress * 100)}% ({elapsed:.1f}s)"
-            draw.text((10, 47), info_txt, font=self.font, fill="white")
+            self.draw_text(draw, (10, 47), info_txt)
 
         else:
             # 3B. Estado finalizado (Éxito o Fallo)
             if self.is_success:
-                draw.text((8, 20), "[✓] COMPLETADO", font=self.font, fill="white")
+                self.draw_text(draw, (8, 20), "[OK] COMPLETADO")
             else:
-                draw.text((8, 20), "[✗] FALLO / ERROR", font=self.font, fill="white")
+                self.draw_text(draw, (8, 20), "[X] FALLO / ERROR")
 
             # 4B. Línea de resumen
             first_line = (self.result_details[0] if self.result_details else self.result_summary)[:19]
-            draw.text((8, 33), first_line, font=self.font, fill="white")
+            self.draw_text(draw, (8, 33), first_line)
 
             # 5B. Línea de detalle o indicación de salida
             if len(self.result_details) > 1:
                 second_line = self.result_details[1][:19]
-                draw.text((8, 45), second_line, font=self.font, fill="white")
+                self.draw_text(draw, (8, 45), second_line)
             else:
-                draw.text((8, 45), "OK / KEY3: Salir", font=self.font, fill="white")
+                self.draw_text(draw, (8, 45), "OK / KEY3: Salir")
 
     def handle_input(self, event: InputEvent, **kwargs) -> ViewAction:
         if self.is_running:

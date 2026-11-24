@@ -16,6 +16,9 @@
         "polling_delay_s": 0.015,
         "timeout_seconds": 30
     },
+    "keyboard": {
+        "layout": "auto"
+    },
     "display": {
         "width": 128,
         "height": 64,

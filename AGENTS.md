@@ -37,8 +37,10 @@ There is **no linter, formatter, type-checker or CI workflow** configured (no
 `pyproject.toml`, no `.github/`). Don't invent one; match surrounding style.
 
 `tests/test_ui.py` imports PIL at module level, so the whole module errors out without
-`Pillow` installed — the other 62 tests pass without it. Install `requirements.txt` (or
-at least `Pillow`) before trusting a test run.
+`Pillow` installed — the rest of the suite passes without it (`tests/test_wifi_password_view.py`
+skips instead of erroring). Install `requirements.txt` (or at least `Pillow`) before
+trusting a test run. `ui/__init__.py` uses guarded imports, so `ui.input_handler` is
+importable without Pillow but the rendering classes stay `None`.
 
 ## Where things actually live
 
@@ -58,6 +60,8 @@ at least `Pillow`) before trusting a test run.
 | `ui/display.py` | `ScreenManager`, `HeroCardDeckView`, `DetailCardView`, `UpdateProgressView`, `QRCodeView`, `IconRenderer` |
 | `ui/input_handler.py` | GPIO joystick/buttons + `USBKeyboardListener` (evdev + stdin) |
 | `ui/keyboard_view.py` | Virtual on-screen keyboard (`VirtualKeyboardInputView`) |
+| `ui/keyboard_layouts.py` | USB keyboard layout detection + US/ES/Latam scancode maps |
+| `ui/wifi_password_view.py` | `WiFiPasswordView` — USB-keyboard Wi-Fi password entry |
 | `install.sh` | APT packages, `.venv`, systemd units, USB gadget setup; `do_install` / `do_uninstall` |
 | `splash.py` | Standalone early-boot splash (runs as `rei-splash.service`) |
 
@@ -88,6 +92,9 @@ suggests it — read its `run()`.
 
 - `DiagnosticManager(max_workers=2)` runs plugins in worker threads; results arrive via
   `poll_result()` and are dispatched in `_process_background_results()`.
+- Worker callbacks (`on_complete`, direct `_executor.submit` workers) must **not** touch
+  `ScreenManager`. Wrap view transitions in `REIApp._post_ui(callable)`; the main loop
+  drains the queue with `_drain_ui_actions()` each frame before polling results.
 - `execute_async(..., on_progress=cb)` injects `progress_callback` into the plugin's
   `kwargs`. A plugin that wants progress must declare it explicitly:
   `def run(self, progress_callback: Optional[Callable] = None, **kwargs)`.
@@ -97,6 +104,29 @@ suggests it — read its `run()`.
   result routing.
 - `UpdateProgressView` swallows *all* input while `is_running` is set. That is how
   "blocked" screens are implemented; use it rather than adding ad-hoc guards.
+
+## USB keyboard password flow (Wi-Fi)
+
+Secured Wi-Fi networks open `ui/wifi_password_view.py::WiFiPasswordView` instead of the
+virtual keyboard. The user types on a physical USB keyboard; `ENTER`/`KEY1`/`PRESS`
+submits, `KEY2` toggles password visibility, `KEY3`/`Esc` cancels.
+
+- `ui/keyboard_layouts.py` resolves the layout: `REI_KEYBOARD_LAYOUT` env →
+  `settings["keyboard"]["layout"]` (main.py passes it to `GPIOInputHandler`) →
+  `/etc/default/keyboard` `XKBLAYOUT` → `/etc/vconsole.conf` `KEYMAP` → `us`.
+  Supported layouts: `us`, `es`, `latam` (with AltGr and dead keys).
+- A device is only a keyboard if `is_keyboard_capabilities()` passes (full alphabet +
+  Enter/Space/Backspace/Shift). This rejects fake keyboards like `vc4-hdmi`.
+- Hot-plug: the listener rescans `/dev/input` every 2 s; the view polls
+  `input_handler.has_text_input` each frame through its `keyboard_status` callback.
+- The Zero 2 W has one OTG port: keyboard host mode and HID gadget mode
+  (`/dev/hidg0`) are mutually exclusive. The view shows
+  `MODO HID ACTIVO / USE MODO NORMAL` when the USB manager is not in `MODO_NORMAL`;
+  it never switches modes automatically.
+- `main.py` input loop uses `get_event_with_char()` and only forwards `char=` to views
+  with `accepts_text_input = True` (`VirtualKeyboardInputView`, `WiFiPasswordView`).
+- Passwords are never logged; `WiFiManager._redact()` strips them from errors and
+  `nmcli`/`wpa_cli` run with `stdin=subprocess.DEVNULL`.
 
 ## Endpoint (HID) flow
 

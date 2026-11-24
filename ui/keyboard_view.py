@@ -49,6 +49,8 @@ class VirtualKeyboardInputView(BaseView):
     - KEY3: Cancel and return to previous view without saving.
     """
 
+    accepts_text_input = True
+
     def __init__(
         self,
         ssid: str,

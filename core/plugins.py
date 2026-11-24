@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
 from .pisugar import PiSugar3Client, PiSugarTelemetry
 from .wifi import WiFiManager, WiFiNetwork
+from .wifi_errors import WiFiErrorCode, get_error_info
 
 
 class IPAddressPlugin(IDiagnosticPlugin):
@@ -75,23 +76,51 @@ class WiFiScanPlugin(IDiagnosticPlugin):
     def category(self) -> str:
         return "NETWORK"
 
-    def run(self, **kwargs) -> DiagnosticResult:
-        networks = self._mgr.scan_networks()
+    def run(self, saved_only: bool = False, **kwargs) -> DiagnosticResult:
+        """
+        Scans nearby APs, or (``saved_only``) lists the connection profiles
+        already stored by NetworkManager so previously used networks can be
+        rejoined without retyping the password.
+        """
+        saved = self._mgr.get_saved_networks()
+        if saved_only:
+            networks = [
+                WiFiNetwork(ssid=ssid, signal_pct=0, security="WPA2")
+                for ssid in sorted(saved)
+            ]
+        else:
+            networks = self._mgr.scan_networks()
+            active = self._mgr.get_active_connection()
+            if active:
+                # The scan's IN-USE flag is best effort; the authoritative
+                # active SSID comes from the connection state.
+                for net in networks:
+                    if net.ssid == active.ssid:
+                        net.in_use = True
+
         details = []
         for net in networks[:8]:
-            sec_badge = "[L]" if net.is_secured else "[O]"
-            details.append(f"{sec_badge} {net.ssid[:12]:<12} {net.signal_pct}%")
+            if saved_only:
+                details.append(f"G {net.ssid[:13]:<13} [GUARDADA]")
+            else:
+                sec_badge = "[L]" if net.is_secured else "[O]"
+                details.append(f"{sec_badge} {net.ssid[:12]:<12} {net.signal_pct}%")
 
         if not details:
             details = ["No se encontraron", "redes Wi-Fi."]
 
+        summary = (
+            f"{len(networks)} Redes Guardadas"
+            if saved_only else f"{len(networks)} Redes Detectadas"
+        )
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
-            summary=f"{len(networks)} Redes Detectadas",
+            summary=summary,
             details=details,
             metrics={
                 "count": len(networks),
+                "saved_only": saved_only,
                 "networks": [
                     {
                         "ssid": n.ssid,
@@ -99,7 +128,8 @@ class WiFiScanPlugin(IDiagnosticPlugin):
                         "security": n.security,
                         "is_secured": n.is_secured,
                         "frequency": n.frequency,
-                        "in_use": n.in_use
+                        "in_use": n.in_use,
+                        "saved": n.ssid in saved,
                     }
                     for n in networks
                 ]
@@ -126,54 +156,76 @@ class WiFiConnectPlugin(IDiagnosticPlugin):
         return "NETWORK"
 
     def run(self, ssid: str = "", password: Optional[str] = None, **kwargs) -> DiagnosticResult:
+        """
+        Connects to a Wi-Fi network and curates the outcome for the OLED.
+
+        ``details`` is always at most three short ASCII lines (reason, red and
+        action hint) so ``WiFiResultView`` can render it without truncation,
+        and ``metrics`` carries the structured error for the UI flow.
+        """
         if not ssid:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
                 summary="SSID no especificado",
-                details=["Error de red:", "SSID vacío"],
-                metrics={"success": False, "ssid": ""}
+                details=["Error de red:", "SSID vacio"],
+                metrics={
+                    "success": False, "ssid": "",
+                    "error_code": WiFiErrorCode.UNKNOWN.value,
+                    "needs_password": False, "retryable": False,
+                }
             )
 
         success, message, details_dict = self._mgr.connect_network(ssid=ssid, password=password)
+        metrics = {
+            "success": success,
+            "ssid": ssid,
+            "error_code": details_dict.get("error_code", WiFiErrorCode.UNKNOWN.value),
+            "needs_password": bool(details_dict.get("needs_password", False)),
+            "retryable": bool(details_dict.get("retryable", False)),
+            "already_connected": bool(details_dict.get("already_connected", False)),
+            "saved_profile": bool(details_dict.get("saved_profile", False)),
+            "raw_error": details_dict.get("raw_error", ""),
+        }
+
+        short_ssid = self._ascii(ssid)[:15]
+
         if success:
             ip_addr = details_dict.get("ip_address", "Asignada")
+            already = bool(details_dict.get("already_connected", False))
+            reason = "YA CONECTADO" if already else f"IP: {self._ascii(str(ip_addr))[:15]}"
             details = [
-                f"SSID: {ssid[:14]}",
-                f"IP:   {ip_addr[:14]}",
+                reason,
+                f"RED: {short_ssid}",
+                "K3=SALIR",
             ]
-            if "gateway" in details_dict and details_dict["gateway"]:
-                details.append(f"GW:   {str(details_dict['gateway'])[:14]}")
-            elif "signal" in details_dict and details_dict["signal"]:
-                details.append(f"Senal:{str(details_dict['signal'])[:14]}")
-            else:
-                details.append("Conexión activa OK")
-
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.SUCCESS,
-                summary=f"Conectado a {ssid}",
+                summary=message,
                 details=details,
-                metrics={"success": True, "ssid": ssid, **details_dict}
+                metrics={**metrics, **details_dict},
             )
-        else:
-            reason = details_dict.get("reason", message)
-            details = [
-                f"Red:   {ssid[:14]}",
-                f"Error: {message[:14]}",
-            ]
-            if reason and reason != message:
-                details.append(f"Causa: {reason[:14]}")
-            else:
-                details.append("Verifique clave/señal")
 
-            return DiagnosticResult(
-                plugin_name=self.name,
-                status=DiagnosticStatus.FAILED,
-                summary="Fallo de conexión",
-                details=details,
-                metrics={"success": False, "ssid": ssid, "error": message, **details_dict}
-            )
+        info = get_error_info(details_dict.get("error_code"))
+        hint = info.hint or ("K2=REINTENTAR" if metrics["retryable"] else "K3=SALIR")
+        details = [
+            info.message or "FALLO DE CONEXION",
+            f"RED: {short_ssid}",
+            hint,
+        ]
+        return DiagnosticResult(
+            plugin_name=self.name,
+            status=DiagnosticStatus.FAILED,
+            summary=info.message or message,
+            details=details,
+            metrics={**metrics, **details_dict}
+        )
+
+    @staticmethod
+    def _ascii(text: str) -> str:
+        """Strips non-ASCII characters from user strings (SSIDs, IPs)."""
+        return "".join(ch for ch in str(text) if ch.isascii() and ch.isprintable())
 
 
 class BatteryStatusPlugin(IDiagnosticPlugin):

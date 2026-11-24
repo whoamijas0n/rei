@@ -9,24 +9,35 @@ REI es un dispositivo de campo de bolsillo autónomo para diagnóstico rápido d
 - **Manejo de Hardware:** Soporte para Waveshare 1.3" OLED HAT (SPI/I2C), joystick de 5 vías y 3 botones físicos con `gpiozero`.
 - **Monolito Modular:** Plugins desacoplados con contratos estrictos (`IDiagnosticPlugin`).
 - **Alimentación y Utilidades:** Control seguro de apagado (`poweroff`) y reinicio (`reboot`) del sistema operativo con sincronización de almacenamiento previa.
-- **Teclado Virtual Interactivo (Virtual Keyboard):** Ingreso autónomo de contraseñas Wi-Fi sin necesidad de teclados USB físicos, operado 100% mediante el Joystick y los botones físicos del HAT.
+- **Contraseña Wi-Fi por Teclado USB:** Las redes protegidas se escriben con un teclado USB físico (`WiFiPasswordView`); la contraseña se puede mostrar/ocultar con `KEY2`. El teclado virtual en OLED (`VirtualKeyboardInputView`) se conserva por compatibilidad pero ya no se usa en el flujo Wi-Fi.
 
-## Operación del Teclado Virtual (Wi-Fi Authentication)
+## Conexión Wi-Fi con Teclado USB
 
-Al conectarse a una red protegida por contraseña, se despliega automáticamente el **Teclado Virtual** en la pantalla OLED (128x64 px):
+Al seleccionar una red protegida, la OLED muestra `CONECTE TECLADO USB` / `INGRESE LA CLAVE` y espera un teclado físico:
 
-- **Controles del Joystick:**
-  - **`UP` / `DOWN` / `LEFT` / `RIGHT`:** Navegar por la cuadrícula 4x10 de caracteres y teclas funcionales.
-  - **`PRESS` (Centro):** Escribir el carácter enfocado o accionar la tecla funcional (`ABC`/`abc`, `123`, `SYM`, `SP`, `DEL`, `OK`).
-- **Atajos con Botones Físicos:**
-  - **`KEY1`:** **Confirmar / Enviar** contraseña e iniciar la conexión inmediatamente.
-  - **`KEY2`:** **Borrar** (Backspace) el último carácter ingresado.
-  - **`KEY3`:** **Cancelar y Volver** a la lista de redes escaneadas.
-- **Capas de Caracteres Disponibles:**
-  - **`abc` (Minúsculas):** Caracteres `a-z`, `@`, `.`, `_`, `-`, espacio, borrar, confirmación y cambio de capa.
-  - **`ABC` (Mayúsculas):** Caracteres `A-Z`, `@`, `.`, `_`, `-`, etc.
-  - **`123` (Números y Símbolos Básicos):** Dígitos `0-9`, `! @ # $ % ^ & * ( ) - _ + = [ ] { } ; :`.
-  - **`SYM` (Símbolos Extendidos):** Símbolos `~ \` | \\ / ? < > , . ' " $ % ^ & * + = # ! @ : ; ( ) [ ] { }`.
+- **Requisito de hardware:** la Pi Zero 2 W tiene un único puerto USB OTG. Para que detecte un teclado debe estar en **`UTILIDADES → MODO USB → MODO USB NORMAL`** (modo host) y luego reiniciar. En modo HID (gadget/periférico) el puerto no puede leer teclados; la pantalla lo indica con `MODO HID ACTIVO / USE MODO NORMAL`.
+- **Conexión del teclado:** adaptador OTG al puerto USB de datos; la alimentación va por el puerto PWR.
+- **Escritura:** teclee la contraseña; `Backspace`/`Delete` borra.
+- **`ENTER` / `KEY1` / `PRESS`:** validar y conectar (mínimo 8 caracteres en WPA).
+- **`KEY2`:** mostrar u ocultar la contraseña (empieza siempre enmascarada).
+- **`KEY3` / `Esc`:** cancelar y volver a la lista de redes.
+- El teclado se detecta en caliente (≤2 s) y se descartan falsos teclados (p. ej. `vc4-hdmi`).
+
+### Distribución del teclado
+
+El layout se resuelve en este orden (ver `ui/keyboard_layouts.py`):
+
+1. Variable de entorno `REI_KEYBOARD_LAYOUT` (`us` / `es` / `latam`).
+2. `keyboard.layout` en `config/settings.json` (`"auto"` por defecto).
+3. `XKBLAYOUT` de `/etc/default/keyboard`.
+4. `KEYMAP` de `/etc/vconsole.conf`.
+5. `us` como último recurso.
+
+Soporta US, ES y LatAm, incluyendo `AltGr` y teclas muertas (`´`, `` ` ``, `^`, `¨`, `~`).
+
+### Conflicto USB host/gadget
+
+El modo teclado USB (host) y el modo inyección HID (`/dev/hidg0`) **no pueden coexistir**: comparten el único controlador OTG. Cambie de modo según la tarea y reinicie; la app no lo hace automáticamente.
 
 
 ## Jerarquía de Navegación
@@ -97,3 +108,4 @@ python3 -m unittest discover -s tests -v
 ```
 
 > `tests/test_ui.py` requiere `Pillow` instalado; el resto de la suite no.
+> `tests/test_wifi_password_view.py` se omite automáticamente sin Pillow.

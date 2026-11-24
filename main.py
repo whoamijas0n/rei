@@ -8,10 +8,11 @@ Architecture: 100% OOP, Decoupled Producer/Consumer, Fixed 30 FPS UI Event Loop.
 import json
 import logging
 import os
+import queue
 import signal
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from core.ducky import DuckyInjector
 from core.gemini_analyzer import GeminiDiagnosticAnalyzer
@@ -52,6 +53,8 @@ from ui.display import (
     VirtualKeyboardInputView,
 )
 from ui.input_handler import GPIOInputHandler, InputEvent
+from ui.wifi_password_view import WiFiPasswordView
+from ui.wifi_result_view import WiFiResultView
 
 # Configure high-performance logging
 logging.basicConfig(
@@ -79,7 +82,11 @@ class REIApp:
         self.settings = self._load_settings()
 
         # 2. Initialize Core Subsystems
-        self.input_handler = GPIOInputHandler()
+        self._ui_actions: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        keyboard_cfg = self.settings.get("keyboard", {}) if isinstance(self.settings, dict) else {}
+        self.input_handler = GPIOInputHandler(
+            keyboard_layout=keyboard_cfg.get("layout", "auto"),
+        )
         self.screen_manager = ScreenManager(
             width=self.settings.get("display", {}).get("width", 128),
             height=self.settings.get("display", {}).get("height", 64),
@@ -142,6 +149,28 @@ class REIApp:
                 except Exception as ex:
                     logger.warning(f"Error loading settings from {config_path}: {ex}")
         return {}
+
+    def _post_ui(self, action: Callable[[], None]) -> None:
+        """
+        Schedules a UI action to run on the main 30 FPS thread.
+
+        Worker threads must never mutate ``ScreenManager`` directly; they call
+        this method so view transitions stay serialized with rendering.
+        """
+        if callable(action):
+            self._ui_actions.put(action)
+
+    def _drain_ui_actions(self) -> None:
+        """Runs pending UI actions in FIFO order on the main thread."""
+        while True:
+            try:
+                action = self._ui_actions.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                action()
+            except Exception:
+                logger.exception("Unhandled error while applying a UI action")
 
     def _register_plugins(self) -> None:
         """Instantiates and registers all decoupled diagnostic plugins."""
@@ -251,17 +280,20 @@ class REIApp:
             progress_view.set_progress(msg, pct)
 
         def on_diagnostic_finished(result: DiagnosticResult):
-            # Task finished
-            if result.status != DiagnosticStatus.SUCCESS:
-                progress_view.set_completed(
-                    success=False,
-                    summary=result.summary or "Error de Inyección",
-                    details=result.details if result.details else ["Fallo en recolección"],
-                )
-            else:
-                # Transition to Post-Diagnostic Options Menu
-                self.screen_manager.pop_view()
-                self._display_post_diagnostic_menu(result, os_type, layout, category)
+            def apply() -> None:
+                if result.status != DiagnosticStatus.SUCCESS:
+                    progress_view.set_completed(
+                        success=False,
+                        summary=result.summary or "Error de Inyección",
+                        details=result.details if result.details else ["Fallo en recolección"],
+                    )
+                else:
+                    # Transition to Post-Diagnostic Options Menu
+                    self.screen_manager.pop_view()
+                    self._display_post_diagnostic_menu(result, os_type, layout, category)
+
+            # Worker thread -> main thread hand-off.
+            self._post_ui(apply)
 
         # Configure plugin context and launch asynchronously
         plugin_id = "diag_win_hid" if os_type == "windows" else "diag_linux_hid"
@@ -336,14 +368,12 @@ class REIApp:
                 overall_status=ai_res.get("overall_status", "OK"),
             )
 
-            # Return to UI loop
+            # Return to UI loop on the main thread
             def on_done():
                 self.screen_manager.pop_view()
                 self._display_qr_report(result)
 
-            # Schedule UI transition on next frame
-            time.sleep(0.3)
-            on_done()
+            self._post_ui(on_done)
 
         # Submit AI task to diagnostic manager worker pool
         self.diag_manager._executor.submit(worker_ai)
@@ -410,26 +440,48 @@ class REIApp:
     # WI-FI & NETWORK FLOWS
     # =========================================================================
 
-    def _start_wifi_scan(self) -> None:
-        """Initiates Wi-Fi scan and displays progress."""
-        progress_view = UpdateProgressView(title="ESCANER WI-FI")
-        progress_view.stage_message = "Buscando redes..."
+    def _start_wifi_scan(self, saved_only: bool = False) -> None:
+        """Initiates a Wi-Fi scan (or a saved-profile listing) and shows progress."""
+        screen_title = "REDES GUARDADAS" if saved_only else "ESCANER WI-FI"
+        progress_view = UpdateProgressView(title=screen_title)
+        progress_view.stage_message = (
+            "Consultando perfiles..." if saved_only else "Buscando redes..."
+        )
         progress_view.progress = 0.5
         self.screen_manager.push_view(progress_view)
 
         def on_scan_done(result: DiagnosticResult):
-            self.screen_manager.pop_view()
-            self._display_scanned_wifi_networks(result)
+            def apply() -> None:
+                # Remove the progress screen only if it is still on display;
+                # KEY3 may have already taken the user back to the root menu.
+                if isinstance(self.screen_manager.current_view, UpdateProgressView):
+                    self.screen_manager.pop_view()
+                self._display_scanned_wifi_networks(result)
 
-        self.diag_manager.execute_async(
+            self._post_ui(apply)
+
+        started = self.diag_manager.execute_async(
             plugin_id="diag_wifi_scan",
             on_complete=on_scan_done,
+            saved_only=saved_only,
         )
+        if not started:
+            self.screen_manager.pop_view()
+            self.screen_manager.push_view(
+                WiFiResultView(
+                    title="WI-FI",
+                    icon_name="WIFI_FAIL",
+                    reason="ESCANER EN CURSO",
+                    hint="K3=SALIR",
+                )
+            )
 
     def _display_scanned_wifi_networks(self, result: DiagnosticResult) -> None:
         """Constructs a Hero Card Deck of discovered Wi-Fi networks."""
-        networks = result.metrics.get("networks", []) if isinstance(result.metrics, dict) else []
-        deck_wifi_nets = HeroCardDeckView("REDES WI-FI")
+        metrics = result.metrics if isinstance(result.metrics, dict) else {}
+        networks = metrics.get("networks", [])
+        deck_title = "REDES GUARDADAS" if metrics.get("saved_only") else "REDES WI-FI"
+        deck_wifi_nets = HeroCardDeckView(deck_title)
 
         if not networks:
             no_net_card = HeroCard(
@@ -440,81 +492,162 @@ class REIApp:
             deck_wifi_nets.add_card(no_net_card)
         else:
             for net in networks:
-                ssid = net.get("ssid", "Red Wi-Fi")
-                is_secured = net.get("is_secured", True)
-                icon = "LOCK" if is_secured else "WIFI"
+                ssid = str(net.get("ssid", "Red Wi-Fi"))
+                is_secured = bool(net.get("is_secured", True))
+                is_active = bool(net.get("in_use", False))
+                is_saved = bool(net.get("saved", False))
+                security = net.get("security", "WPA2")
+                icon = "WIFI_OK" if is_active else ("LOCK" if (is_secured or is_saved) else "WIFI")
 
-                def make_select_handler(target_ssid: str, secured: bool):
+                # Marker: a network REI already knows, selectable without
+                # retyping the password.
+                clean_ssid = ssid.strip().upper()
+                title = f"{clean_ssid[:14]} *" if (is_active or is_saved) else clean_ssid[:16]
+
+                def make_select_handler(
+                    target_ssid: str,
+                    secured: bool,
+                    target_security: str,
+                    known: bool,
+                ):
                     def handler():
-                        if secured:
-                            kb_view = VirtualKeyboardInputView(
-                                ssid=target_ssid,
-                                on_submit=self._connect_to_wifi,
-                            )
-                            self.screen_manager.push_view(kb_view)
+                        if secured and not known:
+                            self._prompt_wifi_password(target_ssid, target_security)
                         else:
-                            self._connect_to_wifi(ssid=target_ssid, password=None)
+                            self._connect_to_wifi(
+                                ssid=target_ssid, password=None, auto=known
+                            )
                     return handler
 
                 deck_wifi_nets.add_card(
                     HeroCard(
-                        title=f"{ssid.strip().upper()[:16]}",
+                        title=title,
                         icon_name=icon,
-                        on_select=make_select_handler(ssid, is_secured),
+                        on_select=make_select_handler(
+                            ssid, is_secured, security, is_active or is_saved
+                        ),
                     )
                 )
 
         self.screen_manager.push_view(deck_wifi_nets)
 
-    def _connect_to_wifi(self, ssid: str, password: Optional[str]) -> None:
+    def _prompt_wifi_password(
+        self,
+        ssid: str,
+        security: str = "WPA2-PSK",
+        notice: str = "",
+    ) -> None:
+        """Opens the USB-keyboard password screen for a secured network."""
+        password_view = WiFiPasswordView(
+            ssid=ssid,
+            on_submit=self._connect_to_wifi,
+            security=security,
+            keyboard_status=lambda: self.input_handler.has_text_input,
+            usb_gadget_active=(
+                self.usb_manager.get_current_mode() != USBMode.NORMAL
+            ),
+            notice=notice,
+            layout_name=self.input_handler.keyboard_layout,
+        )
+        self.screen_manager.push_view(password_view)
+
+    def _connect_to_wifi(
+        self,
+        ssid: str,
+        password: Optional[str],
+        auto: bool = False,
+    ) -> None:
         """Launches Wi-Fi connection worker and shows progress."""
-        if isinstance(self.screen_manager.current_view, (VirtualKeyboardInputView, KeyboardInputView)):
+        if isinstance(
+            self.screen_manager.current_view,
+            (WiFiPasswordView, VirtualKeyboardInputView, KeyboardInputView),
+        ):
             self.screen_manager.pop_view()
 
         conn_view = UpdateProgressView(title="CONECTANDO...")
         conn_view.stage_message = f"Enlazando {ssid[:10]}..."
         conn_view.progress = 0.5
+        conn_view.is_running = True
+        conn_view.is_finished = False
         self.screen_manager.push_view(conn_view)
 
         def on_connect_done(result: DiagnosticResult):
-            self.screen_manager.pop_view()
-            self._display_wifi_result_hero_card(result, ssid)
+            def apply() -> None:
+                if isinstance(self.screen_manager.current_view, UpdateProgressView):
+                    self.screen_manager.pop_view()
+                metrics = result.metrics if isinstance(result.metrics, dict) else {}
+                if (
+                    auto
+                    and result.status != DiagnosticStatus.SUCCESS
+                    and metrics.get("needs_password")
+                ):
+                    # Auto-connect to a known network whose stored secret no
+                    # longer works: ask for the new password right away.
+                    self._prompt_wifi_password(ssid, notice="CLAVE CAMBIADA?")
+                    return
+                self._display_wifi_result_hero_card(result, ssid)
 
-        self.diag_manager.execute_async(
+            self._post_ui(apply)
+
+        started = self.diag_manager.execute_async(
             plugin_id="sys_wifi_connect",
             ssid=ssid,
             password=password,
             on_complete=on_connect_done,
         )
+        if not started:
+            self.screen_manager.pop_view()
+            self.screen_manager.push_view(
+                WiFiResultView(
+                    title="WI-FI",
+                    icon_name="WIFI_FAIL",
+                    reason="CONEXION EN CURSO",
+                    hint="K3=SALIR",
+                )
+            )
 
     def _display_wifi_result_hero_card(self, result: DiagnosticResult, ssid: str) -> None:
-        """Displays Wi-Fi connection outcome strictly formatted as Hero Cards."""
+        """Displays the Wi-Fi connection outcome as a dedicated result screen."""
         is_success = (result.status == DiagnosticStatus.SUCCESS)
+        metrics = result.metrics if isinstance(result.metrics, dict) else {}
 
+        icon_name = "WIFI_OK" if is_success else "WIFI_FAIL"
+        lines = result.details if result.details else [result.summary]
+        reason = lines[0] if lines else ""
+
+        on_retry: Optional[Callable[[], None]] = None
         if is_success:
-            hero_title = "CONECTADO"
-            icon_name = "WIFI_OK"
-            detail_title = "RESUMEN RED"
+            hint = "K3=SALIR"
         else:
-            hero_title = "ERROR CONEXION"
-            icon_name = "WIFI_FAIL"
-            detail_title = "ERROR CONEXION"
+            retryable = bool(metrics.get("retryable"))
+            needs_password = bool(metrics.get("needs_password"))
+            if not retryable:
+                hint = "K3=SALIR"
+            elif needs_password:
+                hint = "K2=NUEVA CLAVE"
+                on_retry = lambda: self._retry_wifi_connect(ssid, True)
+            else:
+                hint = "K2=REINTENTAR"
+                on_retry = lambda: self._retry_wifi_connect(ssid, False)
 
-        detail_view = DetailCardView(
-            title=detail_title,
-            initial_lines=result.details if result.details else [result.summary],
-            pop_to_root_on_key1=True,
-        )
-
-        deck_result = HeroCardDeckView("ESTADO WI-FI")
-        deck_result.add_card(
-            HeroCard(
-                title=hero_title,
+        self.screen_manager.push_view(
+            WiFiResultView(
+                title=ssid or result.plugin_name,
                 icon_name=icon_name,
-                submenu=detail_view,
+                reason=reason,
+                hint=hint,
+                on_retry=on_retry,
             )
         )
-        self.screen_manager.push_view(deck_result)
+
+    def _retry_wifi_connect(self, ssid: str, needs_password: bool) -> None:
+        """KEY2 on the result screen: retry the connection or retype the key."""
+        if isinstance(self.screen_manager.current_view, WiFiResultView):
+            self.screen_manager.pop_view()
+        if needs_password:
+            self._prompt_wifi_password(ssid, notice="REINGRESE LA CLAVE")
+        else:
+            self._connect_to_wifi(ssid=ssid, password=None, auto=True)
 
     # =========================================================================
     # HIERARCHICAL MENU BUILDER
@@ -548,6 +681,13 @@ class REIApp:
                 title="ESCANEAR WI-FI",
                 icon_name="WIFI",
                 on_select=self._start_wifi_scan,
+            )
+        )
+        deck_net_conn.add_card(
+            HeroCard(
+                title="REDES GUARDADAS",
+                icon_name="LOCK",
+                on_select=lambda: self._start_wifi_scan(saved_only=True),
             )
         )
 
@@ -826,25 +966,36 @@ class REIApp:
         try:
             while self.running:
                 # 1. Non-blocking Input Consumption (GPIO + USB Keyboard)
-                event = self.input_handler.get_event()
-                while event is not None:
+                item = self.input_handler.get_event_with_char()
+                while item is not None:
+                    event, char = item
                     curr_view = self.screen_manager.current_view
                     if curr_view:
-                        if isinstance(curr_view, KeyboardInputView):
-                            action = curr_view.handle_input(event, char=self.input_handler.get_last_char())
-                        else:
-                            action = curr_view.handle_input(event)
+                        try:
+                            if getattr(curr_view, "accepts_text_input", False):
+                                action = curr_view.handle_input(event, char=char)
+                            else:
+                                action = curr_view.handle_input(event)
 
-                        if action.action_type == ViewActionType.PUSH_VIEW and action.target_view:
-                            self.screen_manager.push_view(action.target_view)
-                        elif action.action_type == ViewActionType.POP_VIEW:
-                            self.screen_manager.pop_view()
-                        elif action.action_type == ViewActionType.POP_TO_ROOT:
-                            self.screen_manager.pop_to_root()
-                        elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
-                            self._trigger_task(action.task_id)
+                            if action.action_type == ViewActionType.PUSH_VIEW and action.target_view:
+                                self.screen_manager.push_view(action.target_view)
+                            elif action.action_type == ViewActionType.POP_VIEW:
+                                self.screen_manager.pop_view()
+                            elif action.action_type == ViewActionType.POP_TO_ROOT:
+                                self.screen_manager.pop_to_root()
+                            elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
+                                self._trigger_task(action.task_id)
+                        except Exception:
+                            logger.exception(
+                                "Error handling input event %s in %s",
+                                event.name,
+                                type(curr_view).__name__,
+                            )
 
-                    event = self.input_handler.get_event()
+                    item = self.input_handler.get_event_with_char()
+
+                # 1b. Apply UI transitions requested by worker threads
+                self._drain_ui_actions()
 
                 # 2. Non-blocking Background Diagnostic Result Processing
                 self._process_background_results()
