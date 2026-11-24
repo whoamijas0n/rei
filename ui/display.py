@@ -655,7 +655,7 @@ class HeroCardDeckView(BaseView):
         # 3. Dibujar Icono Centrado (cx=64, cy=24)
         IconRenderer.draw_icon(draw, active_card.icon_name, cx=64, cy=24)
 
-        # 4. Dibujar Título Centrado en Y=44 (Strict AGENT.md Spec)
+        # 4. Dibujar Título Centrado en Y=44 (Strict AGENTS.md Spec)
         title_text = sanitize_oled_text(active_card.title).strip().upper()
         self.draw_centered_text(draw, title_text, y=44, screen_width=width)
 

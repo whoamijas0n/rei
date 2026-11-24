@@ -132,7 +132,7 @@ class REIApp:
         self._detail_views: Dict[str, DetailCardView] = {}
         self._progress_views: Dict[str, UpdateProgressView] = {}
 
-        # 6. Build Hierarchical Menu Tree (Strict AGENT.md Spec)
+        # 6. Build Hierarchical Menu Tree (Strict AGENTS.md Spec)
         self._build_menu_hierarchy()
 
         # 7. Handle POSIX termination signals

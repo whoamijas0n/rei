@@ -3,7 +3,7 @@ REI - Virtual Keyboard View for 1.3" OLED (128x64 px)
 Interactive on-screen keyboard operated via 5-way joystick and hardware buttons (KEY1, KEY2, KEY3).
 Provides multi-layer character sets (Lowercase, Uppercase, Numbers, Symbols), high-contrast
 inverted active cell highlighting, text box scrolling, and non-blocking navigation.
-Adheres strictly to AGENT.md minimalist layout standards (Zero Useless Screen Legends).
+Adheres strictly to AGENTS.md minimalist layout standards (Zero Useless Screen Legends).
 """
 
 from dataclasses import dataclass

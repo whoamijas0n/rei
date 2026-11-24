@@ -4,14 +4,48 @@ REI is a pocket diagnostic hub for **Raspberry Pi Zero 2 W** with a 1.3" SH1106 
 (128x64, 1-bit), a 5-way joystick and 3 physical buttons. Python, no build step, no
 package manager, no CI.
 
-- `AGENT.md` (singular) is the long-form **design spec** (hardware BOM, OLED geometry,
-  threading rules). It is still referenced by code comments — keep it accurate when the
-  design changes. This file is the working guide.
+- This is the **single** project guide: design constraints (hardware BOM, boot-time
+  requirements, data contract) plus the verified operational facts below. When design and
+  code disagree, read the code and update this file.
 - All user-facing strings, docstrings and most comments are **in Spanish**. Identifiers,
   logger names and API paths are English. Keep new UI strings Spanish.
 - `main` is far behind the active `endpoint` branch (it lacks `core/ducky.py`,
   `core/web_server.py`, `core/usb_modes.py`, `plugins/endpoints/` and the whole test
   suite). Check `git branch` before assuming a file exists on `main`.
+
+## Hardware (BOM) and boot-time requirements
+
+| Component | Model / chipset | Constraint |
+| :--- | :--- | :--- |
+| SBC | Raspberry Pi Zero 2 W | Quad-core BCM2710A1 @ 1 GHz, **512 MB RAM** (424 MB usable). |
+| I/O HAT | Waveshare ETH/USB HUB HAT | RTL8152B 10/100 Ethernet + 3-port USB 2.0 hub on the OTG port. |
+| Display | 1.3" SH1106 OLED | 128x64, 1-bit, SPI0 (I2C `0x3C` fallback), `DC=24`, `RST=25`, `rotate=2`. |
+| Controls | 5-way joystick + 3 buttons | `gpiozero` with interrupts, 80 ms debounce (see pin map). |
+| UPS | PiSugar 3 | 1200 mAh Li-Po, I2C bus 1 at `0x57`, RTC + safe-shutdown button. |
+| Console | USB→RJ45 Cisco cable | FTDI FT232R / CP2102 → `/dev/ttyUSB0`, 9600–115200 bps. |
+| Storage | 32 GB industrial microSD | `/` on **OverlayFS (read-only)**, `/data` ext4 persistent, `/tmp` + `/run` tmpfs. |
+
+SPI0, I2C1 and USB OTG are **boot-time** peripherals: the firmware only reads `config.txt`
+at boot, so these `dtparam`/`dtoverlay` lines need a reboot to exist.
+
+| Boot parameter | Device node | Consumer |
+| :--- | :--- | :--- |
+| `dtparam=spi=on` | `/dev/spidev0.0` | SH1106 OLED + splash |
+| `dtparam=i2c_arm=on` | `/dev/i2c-1` | PiSugar 3 UPS (`0x57`) |
+| `dtoverlay=dwc2,dr_mode=peripheral` | `/dev/hidg0` | HID injection / USB gadget |
+
+The lines must sit in the **unfiltered region** of `config.txt` (before the first
+`[section]` header); appended at the end they land in the last section (`[cm5]`, `[pi5]`, …)
+and are silently ignored on a Zero 2 W. **Keep SPI1 disabled** — GPIO19/20/21/26 are used
+by the joystick/buttons.
+
+### USB modes (`core/usb_modes.py`)
+
+`UTILIDADES → MODO USB` switches between **normal** (host/storage, gadget service off) and
+**keyboard HID** (`dwc2` peripheral + `libcomposite` with `functions/hid.usb0` and an
+RNDIS/ECM network function). The change regenerates `/usr/local/bin/usb_gadget.sh`,
+enables `usb_gadget.service` and may require a reboot or a UDC reload. On the Zero 2 W the
+single OTG port means HID gadget and USB-keyboard host mode are mutually exclusive.
 
 ## Commands
 
@@ -37,8 +71,9 @@ There is **no linter, formatter, type-checker or CI workflow** configured (no
 `pyproject.toml`, no `.github/`). Don't invent one; match surrounding style.
 
 `tests/test_ui.py` imports PIL at module level, so the whole module errors out without
-`Pillow` installed — the other 62 tests pass without it. Install `requirements.txt` (or
-at least `Pillow`) before trusting a test run.
+`Pillow` installed — the other 97 tests pass without it. Install `requirements.txt` (or
+at least `Pillow`) before trusting a test run. The QR tests additionally need
+`qrcode[pil]`; without it they fail with `_qr_image is None`.
 
 ## Where things actually live
 
@@ -70,6 +105,15 @@ at least `Pillow`) before trusting a test run.
 `main.py::_build_menu_hierarchy()` is the single source of truth for the menu tree —
 edit it there, never in `ui/display.py`.
 
+## Data contract (`core/interfaces.py`)
+
+All plugins return a `DiagnosticResult`. Key fields: `plugin_name` (must equal `plugin.name`
+for view routing), `status` (`DiagnosticStatus`), `overall_status` (`Severity`), `summary`,
+`details: List[str]` (rendered by `DetailCardView`),
+`metrics: Union[List[DiagnosticMetric], Dict[str, Any]]`, `raw_output`, `ai_analysis`,
+`metadata`, `timestamp`, `elapsed_seconds`. `Severity` is `OK` / `INFO` / `WARNING` /
+`CRITICAL`. `core/interfaces.py` is the source of truth — read it before changing a model.
+
 ## Stubs vs. real implementations
 
 `core/plugins.py` contains several plugins that are **stubs**: they `time.sleep()` and
@@ -81,6 +125,21 @@ Real I/O happens only in: `core/wifi.py`, `core/web_server.py`, `core/gemini_ana
 `core/ducky.py`, `core/usb_modes.py`, `core/pisugar.py`, and the update plugins
 (`apt-get` / `git pull`). Don't assume a plugin talks to the network because its name
 suggests it — read its `run()`.
+
+## Library policy
+
+Do not substitute libraries when implementing the network stubs:
+
+- Consoles / SSH: `netmiko` (4.3+) or `scrapli`. Never raw `paramiko` without pagination.
+- Windows remoting: `pypsrp`. Never `pywinrm`.
+- SNMP: `pysnmp-lextudio`. Never legacy `pysnmp` 4.4.x.
+- AI: `google-genai`; the current model is `gemini-3.5-flash` (`DEFAULT_MODEL`).
+- HID: the native `/dev/hidg0` writer in `core/ducky.py` — no external HID library.
+- Graphics / QR: `luma.oled` (`sh1106`), `Pillow`, `qrcode[pil]`.
+
+Every new dependency goes in `requirements.txt`, gets installed into `.venv`, and its
+import stays guarded so the app still degrades gracefully (see "Optional hardware
+dependencies").
 
 ## Threading contract
 
@@ -251,3 +310,16 @@ workstation and drives the Pi over SSH.
 - Root filesystem is OverlayFS (read-only); `/data` is the persistent partition.
   `data/reports/` is listed in `.gitignore` but the web server keeps reports **in
   memory only** — nothing writes there today.
+
+## Code rules for agents
+
+- Full type hints on every function (`Optional`, `Union`, `List`, `Dict`, `Callable`,
+  `Tuple`).
+- Never swallow errors with a bare `except Exception: pass`; handle I/O, HID timeouts,
+  Gemini HTTP errors and socket failures separately.
+- Hardware/OS actions (HID injection, gadget config, poweroff/reboot, `apt-get`, `git pull`,
+  Wi-Fi scan/connect) must honour `REI_DRY_RUN` and the narrower `REI_MOCK_*` overrides.
+- Any OS-level rule or service change goes in **both** `do_install` and `do_uninstall`
+  (see "Deploy / install"); any dependency change gets reinstalled into `.venv`.
+- Keep user-facing strings and docstrings in Spanish; identifiers, logger names and API
+  paths in English.
