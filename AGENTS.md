@@ -58,6 +58,8 @@ at least `Pillow`) before trusting a test run.
 | `ui/display.py` | `ScreenManager`, `HeroCardDeckView`, `DetailCardView`, `UpdateProgressView`, `QRCodeView`, `IconRenderer` |
 | `ui/input_handler.py` | GPIO joystick/buttons + `USBKeyboardListener` (evdev + stdin) |
 | `ui/keyboard_view.py` | Virtual on-screen keyboard (`VirtualKeyboardInputView`) |
+| `ui/keyboard_layouts.py` | USB keyboard layout detection + US/ES/Latam scancode maps |
+| `ui/wifi_password_view.py` | `WiFiPasswordView` — USB-keyboard Wi-Fi password entry |
 | `install.sh` | APT packages, `.venv`, systemd units, USB gadget setup; `do_install` / `do_uninstall` |
 | `splash.py` | Standalone early-boot splash (runs as `rei-splash.service`) |
 
@@ -97,6 +99,42 @@ suggests it — read its `run()`.
   result routing.
 - `UpdateProgressView` swallows *all* input while `is_running` is set. That is how
   "blocked" screens are implemented; use it rather than adding ad-hoc guards.
+- Worker callbacks (`on_complete`, direct `_executor.submit` workers) must **not** touch
+  `ScreenManager`. Wrap the transition in `REIApp._schedule_ui(callable)`, which queues it
+  in `self._ui_callbacks` for the 30 FPS loop to drain.
+
+## USB keyboard password flow (Wi-Fi)
+
+Secured Wi-Fi networks open `ui/wifi_password_view.py::WiFiPasswordView` instead of the
+virtual keyboard: the user types on a physical USB keyboard.
+
+- Keys: `ENTER` / `KEY1` / joystick `PRESS` submits, `KEY2` / `Tab` toggles password
+  visibility, `BACKSPACE` deletes, `KEY3` / `ESC` / `BACK` cancels back to the menu.
+- `ui/keyboard_layouts.py::detect_system_layout()` resolves the layout in this order:
+  `settings.json` → `keyboard_layout` (unless `auto`) → `REI_KEYBOARD_LAYOUT` →
+  `/etc/default/keyboard` `XKBLAYOUT` → `/etc/vconsole.conf` `KEYMAP` → `us`.
+  Supported layouts: `us`, `es`, `latam` (AltGr + Shift/CapsLock, dead keys resolved
+  through the composed-character path).
+- `is_real_keyboard_capabilities()` decides whether an evdev node is a real keyboard
+  (full alphabet + Enter/Space/Backspace/Shift) and rejects false positives such as
+  `vc4-hdmi` and consumer-control/mouse nodes.
+- Hot-plug: `USBKeyboardListener` rescans `/dev/input` every 2 s
+  (`SCAN_INTERVAL_CONNECTED_S`) and `request_keyboard_rescan()` forces one when the prompt
+  opens. The view polls availability every frame through its `keyboard_status` callback,
+  wired to `input_handler.has_typing_input`.
+- The Zero 2 W has one OTG port: keyboard host mode and HID gadget mode (`/dev/hidg0`)
+  are mutually exclusive. `main.py` passes `usb_gadget_active` from
+  `_is_usb_gadget_blocking_host()` and the view then prompts `USB en modo HID...`; it
+  never switches modes automatically.
+- The input loop forwards typed characters only to views that accept text —
+  `WiFiPasswordView`, `KeyboardInputView`, or anything with `accepts_text_input = True` —
+  passing `char=self.input_handler.get_last_char()`.
+- Every string drawn on the panel passes through `core/parser.py`
+  (`sanitize_oled_text`, `shorten_oled_label`, `wrap_oled_lines`): the bitmap font has no
+  accented glyphs.
+- Passwords never reach the logs or the OLED: `WiFiManager._sanitize_error()` replaces raw
+  `nmcli`/`wpa_cli` stderr with a catalog message (`WiFiErrorCode`). Note that the password
+  itself is passed as an `nmcli` argument, so it is visible in `ps` while connecting.
 
 ## Endpoint (HID) flow
 
