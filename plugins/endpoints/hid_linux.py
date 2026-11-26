@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from core.ducky import DuckyInjector
+from core.errors import format_oled_error
 from core.interfaces import (
     DiagnosticMetric,
     DiagnosticResult,
@@ -337,8 +338,9 @@ class LinuxHIDPlugin(IDiagnosticPlugin):
                     details = ["Cable desconectado", "Conecte puerto USB a PC", "Use cable de datos"]
                     summary = "USB desconectado"
                 else:
-                    details = [str(inj_ex)[:20], "Verifique conexión USB"]
-                    summary = "Fallo de inyección"
+                    formatted = format_oled_error(inj_ex, context="HID", fallback_title="FALLO DE INYECCION")
+                    details = formatted.lines
+                    summary = formatted.title
 
                 return DiagnosticResult(
                     plugin_name=self.name,

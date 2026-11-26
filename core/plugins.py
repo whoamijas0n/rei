@@ -5,6 +5,7 @@ and system power management.
 All plugins implement IDiagnosticPlugin and run asynchronously in worker threads.
 """
 
+import logging
 import os
 import platform
 import shutil
@@ -13,14 +14,17 @@ import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
-from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
+from .errors import format_oled_error
+from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus, Severity
 from .parser import sanitize_oled_text, shorten_oled_label, wrap_oled_lines
 from .pisugar import PiSugar3Client, PiSugarTelemetry
 from .wifi import WiFiErrorCode, WiFiManager, WiFiNetwork
 
+logger = logging.getLogger("REI.Core.Plugins")
+
 
 class IPAddressPlugin(IDiagnosticPlugin):
-    """Diagnoses and displays active IP addresses on network interfaces."""
+    """Diagnostica y estructura las direcciones IPv4 activas y el estado de interfaces."""
 
     @property
     def id(self) -> str:
@@ -34,27 +38,163 @@ class IPAddressPlugin(IDiagnosticPlugin):
     def category(self) -> str:
         return "NETWORK"
 
-    def run(self, **kwargs) -> DiagnosticResult:
-        details: List[str] = []
-        # Attempt to detect default outbound IP
+    @staticmethod
+    def _detect_primary_ip() -> Optional[str]:
+        """Detecta la IPv4 de salida principal sin transmitir trafico real."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(1.0)
                 s.connect(("8.8.8.8", 80))
-                primary_ip = s.getsockname()[0]
-                details.append(f"IPv4: {primary_ip}")
-        except Exception:
-            details.append("IPv4: 192.168.1.100")
+                ip_addr = s.getsockname()[0]
+                if ip_addr and not ip_addr.startswith("127."):
+                    return ip_addr
+        except OSError:
+            pass
+        return None
 
-        details.append(f"Host: {socket.gethostname()[:12]}")
-        details.append("wlan0: UP (192.168.1.100)")
-        details.append("usb0:  UP (172.16.0.1)")
+    @staticmethod
+    def _read_operstate(iface: str) -> str:
+        """Lee el estado operativo de una interfaz en /sys/class/net."""
+        state_path = os.path.join("/sys/class/net", iface, "operstate")
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                return fh.read().strip().upper() or "UNKNOWN"
+        except OSError:
+            return "UNKNOWN"
+
+    def _collect_interfaces(self) -> List[Dict[str, Any]]:
+        """Recolecta interfaces reales (o simuladas en DRY-RUN) ordenadas por prioridad."""
+        if os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_WIFI") == "1":
+            return [
+                {"name": "wlan0", "ip": "192.168.1.100", "state": "UP", "is_up": True},
+                {"name": "usb0", "ip": "172.16.0.1", "state": "UP", "is_up": True},
+            ]
+
+        iface_ips: Dict[str, str] = {}
+        ip_bin = shutil.which("ip")
+        if ip_bin:
+            try:
+                proc = subprocess.run(
+                    [ip_bin, "-4", "-o", "addr", "show"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if proc.returncode == 0:
+                    for raw_line in proc.stdout.splitlines():
+                        parts = raw_line.split()
+                        if len(parts) >= 4 and parts[2] == "inet":
+                            iface_name = parts[1].split("@", 1)[0]
+                            if iface_name == "lo":
+                                continue
+                            ip_only = parts[3].split("/", 1)[0]
+                            iface_ips.setdefault(iface_name, ip_only)
+            except (OSError, subprocess.SubprocessError) as ex:
+                logger.debug(f"No se pudo consultar 'ip -4 addr': {ex}")
+
+        candidates: List[str] = list(iface_ips.keys())
+        if os.path.isdir("/sys/class/net"):
+            try:
+                for name in sorted(os.listdir("/sys/class/net")):
+                    if name == "lo" or name in iface_ips:
+                        continue
+                    if name.startswith(("wlan", "eth", "usb", "en", "wl")):
+                        candidates.append(name)
+            except OSError:
+                pass
+
+        priority = {"wlan0": 0, "eth0": 1, "usb0": 2}
+        candidates.sort(key=lambda n: (0 if n in iface_ips else 1, priority.get(n, 10), n))
+
+        interfaces: List[Dict[str, Any]] = []
+        for name in candidates:
+            ip_val = iface_ips.get(name, "")
+            state = self._read_operstate(name)
+            is_up = bool(ip_val) or state == "UP"
+            if state == "UNKNOWN":
+                state = "UP" if ip_val else "DOWN"
+            interfaces.append(
+                {
+                    "name": name,
+                    "ip": ip_val,
+                    "state": state,
+                    "is_up": is_up,
+                }
+            )
+        return interfaces
+
+    def run(self, **kwargs) -> DiagnosticResult:
+        is_dry_run = os.getenv("REI_DRY_RUN") == "1" or os.getenv("REI_MOCK_WIFI") == "1"
+        interfaces = self._collect_interfaces()
+        primary_ip = "192.168.1.100" if is_dry_run else self._detect_primary_ip()
+
+        if not primary_ip:
+            for item in interfaces:
+                if item.get("ip"):
+                    primary_ip = str(item["ip"])
+                    break
+
+        hostname = sanitize_oled_text(socket.gethostname() or "rei-pi")
+        active_ifaces = [item for item in interfaces if item.get("is_up")]
+        has_ip = bool(primary_ip)
+
+        if active_ifaces:
+            link_summary = ", ".join(str(item["name"]) for item in active_ifaces[:3])
+        else:
+            link_summary = "Sin enlace"
+
+        details: List[str] = [
+            f"IPv4: {primary_ip or 'Sin IP'}",
+            f"Host: {hostname[:16]}",
+        ]
+        for item in interfaces[:4]:
+            ip_label = item["ip"] if item["ip"] else "Sin IP"
+            details.append(f"{item['name']}: {item['state']} ({ip_label})")
+
+        detail_pages: List[Dict[str, Any]] = [
+            {
+                "title": "DIRECCION IP",
+                "hero": {
+                    "tag": "IP",
+                    "value": primary_ip or "Sin conexion",
+                },
+                "rows": [
+                    {"label": "Host", "value": hostname},
+                    {"label": "Enlace", "value": link_summary},
+                ],
+            }
+        ]
+
+        for idx in range(0, len(interfaces), 2):
+            chunk = interfaces[idx : idx + 2]
+            detail_pages.append(
+                {
+                    "title": "INTERFACES",
+                    "entities": [
+                        {
+                            "title": str(item["name"]),
+                            "subtitle": str(item["ip"] or "Sin direccion IPv4"),
+                            "badge": str(item["state"]),
+                            "status_active": bool(item["is_up"]),
+                        }
+                        for item in chunk
+                    ],
+                }
+            )
 
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
-            summary="Interfaces Activas",
+            overall_status=Severity.OK if has_ip else Severity.WARNING,
+            summary="Interfaces Activas" if has_ip else "Sin IPv4 Activa",
             details=details,
-            metrics={"interfaces_active": 2}
+            metrics={
+                "primary_ip": primary_ip or "",
+                "hostname": hostname,
+                "interfaces_active": len(active_ifaces),
+                "interfaces": interfaces,
+                "detail_pages": detail_pages,
+            },
         )
 
 
@@ -394,9 +534,16 @@ class BatteryStatusPlugin(IDiagnosticPlugin):
 
     def run(self, **kwargs) -> DiagnosticResult:
         telemetry = self._client.get_telemetry()
+        low_bat = (
+            not telemetry.is_charging
+            and not telemetry.is_power_plugged
+            and telemetry.percentage <= 15
+        )
+        overall = Severity.WARNING if low_bat else Severity.OK
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
+            overall_status=overall,
             summary=f"{telemetry.percentage}% ({telemetry.voltage:.2f}V)",
             details=telemetry.details,
             metrics={
@@ -406,6 +553,8 @@ class BatteryStatusPlugin(IDiagnosticPlugin):
                 "current_ma": telemetry.current_ma,
                 "power_w": telemetry.power_w,
                 "temperature": telemetry.temperature_c,
+                "is_charging": telemetry.is_charging,
+                "is_power_plugged": telemetry.is_power_plugged,
                 "source": telemetry.source,
             }
         )
@@ -426,6 +575,48 @@ class SystemStatusPlugin(IDiagnosticPlugin):
     def category(self) -> str:
         return "SYSTEM"
 
+    @staticmethod
+    def _read_ram_usage() -> Tuple[int, int, int]:
+        """Lee RAM total y en uso desde /proc/meminfo en MB y porcentaje."""
+        try:
+            if os.path.exists("/proc/meminfo"):
+                mem_total_kb = 0
+                mem_avail_kb = 0
+                with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            mem_total_kb = int(line.split()[1])
+                        elif line.startswith("MemAvailable:"):
+                            mem_avail_kb = int(line.split()[1])
+                if mem_total_kb > 0:
+                    used_kb = max(0, mem_total_kb - mem_avail_kb)
+                    total_mb = max(1, int(round(mem_total_kb / 1024.0)))
+                    used_mb = max(0, int(round(used_kb / 1024.0)))
+                    pct = max(0, min(100, int(round((used_kb / float(mem_total_kb)) * 100.0))))
+                    return used_mb, total_mb, pct
+        except Exception:
+            pass
+        return 142, 512, 28
+
+    @staticmethod
+    def _read_uptime() -> str:
+        """Lee el tiempo encendido desde /proc/uptime en formato compacto."""
+        try:
+            if os.path.exists("/proc/uptime"):
+                with open("/proc/uptime", "r", encoding="utf-8") as f:
+                    total_sec = int(float(f.read().strip().split()[0]))
+                days, rem = divmod(total_sec, 86400)
+                hours, rem = divmod(rem, 3600)
+                mins = rem // 60
+                if days > 0:
+                    return f"{days}d {hours}h"
+                if hours > 0:
+                    return f"{hours}h {mins}m"
+                return f"{mins}m"
+        except Exception:
+            pass
+        return "--"
+
     def run(self, **kwargs) -> DiagnosticResult:
         # Thermal telemetry
         temp_c = 43.5
@@ -442,18 +633,36 @@ class SystemStatusPlugin(IDiagnosticPlugin):
         except Exception:
             load1 = 0.35
 
+        cpu_count = os.cpu_count() or 4
+        ram_used_mb, ram_total_mb, ram_pct = self._read_ram_usage()
+        uptime_str = self._read_uptime()
+        kernel = platform.release()
+        hostname = socket.gethostname()
+        overall = Severity.WARNING if (temp_c >= 75.0 or ram_pct >= 90) else Severity.OK
+
         details = [
             f"Temp CPU: {temp_c:.1f} C",
             f"Carga:    {load1:.2f}",
-            "RAM:      142MB / 512MB",
-            f"Kernel:   {platform.release()[:10]}"
+            f"RAM:      {ram_used_mb}MB / {ram_total_mb}MB",
+            f"Kernel:   {kernel[:12]}",
         ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
-            summary="Sistema Estable",
+            overall_status=overall,
+            summary="Sistema Estable" if overall == Severity.OK else "Carga / Temp Alta",
             details=details,
-            metrics={"temp": temp_c, "load": load1}
+            metrics={
+                "temp": temp_c,
+                "load": load1,
+                "cpu_count": cpu_count,
+                "ram_used_mb": ram_used_mb,
+                "ram_total_mb": ram_total_mb,
+                "ram_pct": ram_pct,
+                "kernel": kernel,
+                "uptime": uptime_str,
+                "hostname": hostname,
+            },
         )
 
 
@@ -480,11 +689,29 @@ class CiscoSerialPlugin(IDiagnosticPlugin):
             "DSR: ACTIVO | CTS: OK",
             "Prompt: Switch-2960#"
         ]
+        detail_pages = [
+            {
+                "title": "CISCO SERIAL",
+                "hero": {"tag": ">", "value": "Switch-2960#"},
+                "rows": [
+                    {"label": "Puerto", "value": "/dev/ttyUSB0"},
+                    {"label": "Baud", "value": "9600 8-N-1"},
+                ],
+            },
+            {
+                "title": "SENALES",
+                "rows": [
+                    {"label": "DSR", "value": "ACTIVO"},
+                    {"label": "CTS", "value": "OK"},
+                ],
+            },
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="Consola Serial OK",
-            details=details
+            details=details,
+            metrics={"detail_pages": detail_pages},
         )
 
 
@@ -511,11 +738,29 @@ class CiscoSSHPlugin(IDiagnosticPlugin):
             "Cipher: aes256-ctr",
             "Auth: Key / Password"
         ]
+        detail_pages = [
+            {
+                "title": "CISCO SSH",
+                "hero": {"tag": "SSH", "value": "192.168.1.1:22"},
+                "rows": [
+                    {"label": "Version", "value": "Cisco-1.25"},
+                    {"label": "Cifrado", "value": "aes256-ctr"},
+                ],
+            },
+            {
+                "title": "SEGURIDAD",
+                "rows": [
+                    {"label": "Proto", "value": "SSH-2.0"},
+                    {"label": "Auth", "value": "Key / Password"},
+                ],
+            },
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="SSHv2 Detectado",
-            details=details
+            details=details,
+            metrics={"detail_pages": detail_pages},
         )
 
 
@@ -542,11 +787,29 @@ class SNMPScanPlugin(IDiagnosticPlugin):
             "192.168.1.254 (Gateway)",
             "Comunidad: public (v2c)"
         ]
+        detail_pages = [
+            {
+                "title": "ESCANER SNMP",
+                "hero": {"tag": "SNMP", "value": "2 Nodos"},
+                "rows": [
+                    {"label": "Subred", "value": "192.168.1.0/24"},
+                    {"label": "Com.", "value": "public (v2c)"},
+                ],
+            },
+            {
+                "title": "NODOS SNMP",
+                "entities": [
+                    {"title": "192.168.1.1", "subtitle": "Cisco IOS", "badge": "IOS"},
+                    {"title": "192.168.1.254", "subtitle": "Gateway", "badge": "GW"},
+                ],
+            },
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="2 Nodos SNMP",
-            details=details
+            details=details,
+            metrics={"nodes_count": 2, "detail_pages": detail_pages},
         )
 
 
@@ -573,11 +836,22 @@ class WindowsRNDISPlugin(IDiagnosticPlugin):
             "IP Hub: 172.16.0.1",
             "IP PC:  172.16.0.2 (DHCP)"
         ]
+        detail_pages = [
+            {
+                "title": "USB RNDIS",
+                "hero": {"tag": "USB", "value": "172.16.0.1"},
+                "rows": [
+                    {"label": "Interfaz", "value": "usb0 (UP)"},
+                    {"label": "PC", "value": "172.16.0.2 DHCP"},
+                ],
+            }
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="RNDIS Enlazado",
-            details=details
+            details=details,
+            metrics={"detail_pages": detail_pages},
         )
 
 
@@ -604,11 +878,22 @@ class LinuxSSHPlugin(IDiagnosticPlugin):
             "User:  admin@endpoint",
             "Shell: /bin/bash (Ready)"
         ]
+        detail_pages = [
+            {
+                "title": "LINUX SSH",
+                "hero": {"tag": "SSH", "value": "admin@endpoint"},
+                "rows": [
+                    {"label": "Auth", "value": "ed25519 Cert"},
+                    {"label": "Interfaz", "value": "usb0 / wlan0"},
+                ],
+            }
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="Sesion SSH Lista",
-            details=details
+            details=details,
+            metrics={"detail_pages": detail_pages},
         )
 
 
@@ -635,11 +920,29 @@ class VaultPlugin(IDiagnosticPlugin):
             "Llaves: 4 SSH / 8 Pass",
             "HSM:    Chip ATECC608"
         ]
+        detail_pages = [
+            {
+                "title": "BOVEDA / VAULT",
+                "hero": {"tag": "SEC", "value": "ENCRIPTADO"},
+                "rows": [
+                    {"label": "Cifrado", "value": "AES-GCM-256"},
+                    {"label": "Llaves", "value": "4 SSH / 8 Pass"},
+                ],
+            },
+            {
+                "title": "HARDWARE",
+                "rows": [
+                    {"label": "HSM", "value": "Chip ATECC608"},
+                    {"label": "Estado", "value": "Bloqueada"},
+                ],
+            },
+        ]
         return DiagnosticResult(
             plugin_name=self.name,
             status=DiagnosticStatus.SUCCESS,
             summary="Bóveda Bloqueada",
-            details=details
+            details=details,
+            metrics={"detail_pages": detail_pages},
         )
 
 
@@ -764,15 +1067,12 @@ class PoweroffPlugin(IDiagnosticPlugin):
                 ]
             )
         else:
+            formatted = format_oled_error(msg, fallback_title="FALLO AL APAGAR")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Fallo al apagar",
-                details=[
-                    "Error al apagar:",
-                    msg[:20],
-                    "Verifique permisos"
-                ]
+                summary=formatted.title,
+                details=formatted.lines,
             )
 
 
@@ -805,15 +1105,12 @@ class RebootPlugin(IDiagnosticPlugin):
                 ]
             )
         else:
+            formatted = format_oled_error(msg, fallback_title="FALLO AL REINICIAR")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Fallo al reiniciar",
-                details=[
-                    "Error al reiniciar:",
-                    msg[:20],
-                    "Verifique permisos"
-                ]
+                summary=formatted.title,
+                details=formatted.lines,
             )
 
 
@@ -849,7 +1146,7 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
             time.sleep(0.3)
             update_progress("Saneando dpkg...", 0.25)
             time.sleep(0.3)
-            update_progress("Actualizando indices APT...", 0.45)
+            update_progress("Actualizando APT...", 0.45)
             time.sleep(0.4)
             update_progress("Instalando paquetes...", 0.75)
             time.sleep(0.4)
@@ -953,25 +1250,27 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
             )
             if res_update.returncode != 0:
                 err = (res_update.stderr or res_update.stdout or "Error en apt-get update").strip()
+                formatted = format_oled_error(err, fallback_title="FALLO APT UPDATE")
                 return DiagnosticResult(
                     plugin_name=self.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Fallo en apt update",
-                    details=["Error indices APT:", err[:20], "Verifique conexion"]
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
         except subprocess.TimeoutExpired:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Timeout en actualizacion",
-                details=["Tiempo de espera agotado", "al consultar repositorios."]
+                summary="Tiempo agotado",
+                details=["Tiempo de espera agotado al consultar repositorios."],
             )
         except Exception as ex:
+            formatted = format_oled_error(ex, fallback_title="ERROR APT")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Error ejecutando APT",
-                details=[str(ex)[:20]]
+                summary=formatted.title,
+                details=formatted.lines,
             )
 
         # 5. Step: apt-get dist-upgrade
@@ -994,25 +1293,27 @@ class SystemUpdatePlugin(IDiagnosticPlugin):
             )
             if res_upgrade.returncode != 0:
                 err = (res_upgrade.stderr or res_upgrade.stdout or "Error en dist-upgrade").strip()
+                formatted = format_oled_error(err, fallback_title="FALLO INSTALACION")
                 return DiagnosticResult(
                     plugin_name=self.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Fallo en actualizacion",
-                    details=["Error al instalar:", err[:20], "Consulte journalctl"]
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
         except subprocess.TimeoutExpired:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Timeout instalando paquetes",
-                details=["Tiempo de espera excedido."]
+                summary="Tiempo agotado",
+                details=["Tiempo de espera excedido instalando paquetes."],
             )
         except Exception as ex:
+            formatted = format_oled_error(ex, fallback_title="ERROR INSTALACION")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Error en instalacion",
-                details=[str(ex)[:20]]
+                summary=formatted.title,
+                details=formatted.lines,
             )
 
         # 6. Step: Cleanup
@@ -1161,25 +1462,27 @@ class AppUpdatePlugin(IDiagnosticPlugin):
             res_fetch = self._exec_git(git_bin, ["fetch", "--all", "--prune"], timeout=30)
             if res_fetch.returncode != 0:
                 err = (res_fetch.stderr or res_fetch.stdout or "Error en git fetch").strip()
+                formatted = format_oled_error(err, fallback_title="FALLO GIT FETCH")
                 return DiagnosticResult(
                     plugin_name=self.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Fallo al consultar Git",
-                    details=["Error fetch remoto:", err[:20]]
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
         except subprocess.TimeoutExpired:
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Timeout en GitHub",
-                details=["Tiempo de espera excedido", "conectando a GitHub."]
+                summary="Tiempo agotado",
+                details=["Tiempo de espera excedido conectando a GitHub."],
             )
         except Exception as ex:
+            formatted = format_oled_error(ex, fallback_title="ERROR GIT")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Error en Git",
-                details=[str(ex)[:20]]
+                summary=formatted.title,
+                details=formatted.lines,
             )
 
         # 4. Check status (current branch vs upstream)
@@ -1211,11 +1514,12 @@ class AppUpdatePlugin(IDiagnosticPlugin):
             res_pull = self._exec_git(git_bin, ["pull", "--ff-only", "origin", branch], timeout=30)
             if res_pull.returncode != 0:
                 err = (res_pull.stderr or res_pull.stdout or "Error en git pull").strip()
+                formatted = format_oled_error(err, fallback_title="FALLO GIT PULL")
                 return DiagnosticResult(
                     plugin_name=self.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Fallo en git pull",
-                    details=["Conflicto o cambios:", err[:20], "Pull cancelado."]
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
 
             # Get new commit hash
@@ -1236,9 +1540,10 @@ class AppUpdatePlugin(IDiagnosticPlugin):
             )
 
         except Exception as ex:
+            formatted = format_oled_error(ex, fallback_title="ERROR ACTUALIZACION")
             return DiagnosticResult(
                 plugin_name=self.name,
                 status=DiagnosticStatus.FAILED,
-                summary="Error en actualizacion",
-                details=[str(ex)[:20]]
+                summary=formatted.title,
+                details=formatted.lines,
             )

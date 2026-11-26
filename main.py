@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from core.ducky import DuckyInjector
+from core.errors import NoticeLevel, format_oled_error, severity_to_notice_level
 from core.gemini_analyzer import GeminiDiagnosticAnalyzer
 from core.interfaces import DiagnosticMetric, DiagnosticResult, DiagnosticStatus, Severity
 from core.manager import DiagnosticManager
@@ -46,12 +47,19 @@ from core.wifi import WiFiManager
 from plugins.endpoints.hid_linux import LinuxHIDPlugin
 from plugins.endpoints.hid_windows import WindowsHIDPlugin
 from ui.display import (
+    BatteryTelemetryView,
+    ConfirmDialogView,
     DetailCardView,
+    DetailHero,
+    DetailPage,
+    DetailRow,
     HeroCard,
     HeroCardDeckView,
     KeyboardInputView,
+    NoticeView,
     QRCodeView,
     ScreenManager,
+    SystemTelemetryView,
     UpdateProgressView,
     ViewAction,
     ViewActionType,
@@ -212,12 +220,24 @@ class REIApp:
         """Submits a diagnostic task to the background worker pool."""
         detail_view = self._detail_views.get(task_id)
         if detail_view:
-            detail_view.set_content(lines=["Ejecutando...", "Consultando bus/red..."], status="RUN", is_loading=True)
+            detail_view.set_content(
+                lines=["Consultando datos..."],
+                status="RUN",
+                is_loading=True,
+                level=NoticeLevel.INFO,
+            )
 
-        self.diag_manager.execute_async(
+        started = self.diag_manager.execute_async(
             plugin_id=task_id,
             on_complete=self._on_task_completed,
         )
+        if not started and detail_view:
+            detail_view.set_content(
+                lines=["La tarea ya esta en ejecucion.", "Espere unos segundos."],
+                status="AVISO",
+                is_loading=False,
+                level=NoticeLevel.WARNING,
+            )
 
     def _trigger_update_task(self, task_id: str) -> None:
         """Submits a critical update task with streaming progress to worker pool."""
@@ -225,19 +245,23 @@ class REIApp:
         if not progress_view:
             return
 
-        progress_view.stage_message = "Iniciando proceso..."
-        progress_view.progress = 0.0
-        progress_view.is_running = True
-        progress_view.is_finished = False
+        progress_view.reset("Iniciando proceso...")
+        progress_view._started = True
 
-        def on_progress(msg: str, pct: float):
+        def on_progress(msg: str, pct: float) -> None:
             progress_view.set_progress(msg, pct)
 
-        self.diag_manager.execute_async(
+        started = self.diag_manager.execute_async(
             plugin_id=task_id,
             on_complete=self._on_task_completed,
             on_progress=on_progress,
         )
+        if not started:
+            progress_view.set_completed(
+                success=False,
+                summary="Proceso ya en curso",
+                details=["Espere a que finalice la actualizacion actual."],
+            )
 
     def _on_task_completed(self, result: DiagnosticResult) -> None:
         """Callback invoked by worker thread when diagnostic completes."""
@@ -266,18 +290,20 @@ class REIApp:
         def on_progress(msg: str, pct: float):
             progress_view.set_progress(msg, pct)
 
-        def on_diagnostic_finished(result: DiagnosticResult):
-            # Task finished
-            if result.status != DiagnosticStatus.SUCCESS:
-                progress_view.set_completed(
-                    success=False,
-                    summary=result.summary or "Error de Inyección",
-                    details=result.details if result.details else ["Fallo en recolección"],
-                )
-            else:
-                # Transition to Post-Diagnostic Options Menu
-                self.screen_manager.pop_view()
-                self._display_post_diagnostic_menu(result, os_type, layout, category)
+        def on_diagnostic_finished(result: DiagnosticResult) -> None:
+            def finish_on_ui() -> None:
+                if result.status != DiagnosticStatus.SUCCESS:
+                    progress_view.set_completed(
+                        success=False,
+                        summary=result.summary or "Error de inyeccion",
+                        details=result.details if result.details else ["Fallo en recoleccion de telemetria."],
+                    )
+                else:
+                    if self.screen_manager.current_view is progress_view:
+                        self.screen_manager.pop_view()
+                    self._display_post_diagnostic_menu(result, os_type, layout, category)
+
+            self._schedule_ui(finish_on_ui)
 
         # Configure plugin context and launch asynchronously
         plugin_id = "diag_win_hid" if os_type == "windows" else "diag_linux_hid"
@@ -285,11 +311,17 @@ class REIApp:
         if isinstance(plugin, (WindowsHIDPlugin, LinuxHIDPlugin)):
             plugin.set_context(category=category, layout=layout, web_server=self.web_server)
 
-        self.diag_manager.execute_async(
+        started = self.diag_manager.execute_async(
             plugin_id=plugin_id,
             on_complete=on_diagnostic_finished,
             on_progress=on_progress,
         )
+        if not started:
+            progress_view.set_completed(
+                success=False,
+                summary="Diagnostico ocupado",
+                details=["Hay otro diagnostico HID en curso.", "Espere un momento e intente de nuevo."],
+            )
 
     def _display_post_diagnostic_menu(
         self,
@@ -327,39 +359,50 @@ class REIApp:
 
     def _execute_ai_analysis(self, result: DiagnosticResult) -> None:
         """Runs Gemini AI analysis in background and presents QR code upon completion."""
-        ai_progress = UpdateProgressView(title="CONSULTANDO IA")
-        ai_progress.stage_message = "Sintetizando telemetria..."
-        ai_progress.progress = 0.5
+        ai_progress = UpdateProgressView(title="CONSULTANDO IA", indeterminate=True)
+        ai_progress.stage_message = "Analizando datos..."
         ai_progress.is_running = True
         ai_progress.is_finished = False
         self.screen_manager.push_view(ai_progress)
 
-        def worker_ai():
-            report_id = result.metadata.get("report_id", "latest")
-            latest_report = self.web_server.get_latest_report()
-            payload = {
-                "os_type": result.metadata.get("os_type", "PC"),
-                "category": result.summary,
-                "hostname": getattr(latest_report, "hostname", "Host Remoto"),
-                "telemetry": getattr(latest_report, "telemetry", {}),
-            }
+        def worker_ai() -> None:
+            try:
+                report_id = result.metadata.get("report_id", "latest")
+                latest_report = self.web_server.get_latest_report()
+                payload = {
+                    "os_type": result.metadata.get("os_type", "PC"),
+                    "category": result.summary,
+                    "hostname": getattr(latest_report, "hostname", "Host Remoto"),
+                    "telemetry": getattr(latest_report, "telemetry", {}),
+                }
 
-            ai_res = self.gemini_analyzer.analyze_diagnostic(payload)
-            result.ai_analysis = ai_res
-            self.web_server.attach_ai_analysis(
-                report_id=report_id,
-                ai_data=ai_res,
-                overall_status=ai_res.get("overall_status", "OK"),
-            )
+                ai_res = self.gemini_analyzer.analyze_diagnostic(payload)
+                result.ai_analysis = ai_res
+                self.web_server.attach_ai_analysis(
+                    report_id=report_id,
+                    ai_data=ai_res,
+                    overall_status=ai_res.get("overall_status", "OK"),
+                )
 
-            # Return to UI loop
-            def on_done():
-                self.screen_manager.pop_view()
-                self._display_qr_report(result)
+                def on_done() -> None:
+                    if self.screen_manager.current_view is ai_progress:
+                        self.screen_manager.pop_view()
+                    self._display_qr_report(result)
 
-            # Schedule UI transition on next frame
-            time.sleep(0.3)
-            on_done()
+                time.sleep(0.25)
+                self._schedule_ui(on_done)
+            except Exception as ex:
+                logger.exception(f"Error en analisis IA: {ex}")
+                formatted = format_oled_error(ex, fallback_title="ERROR IA")
+
+                def on_fail() -> None:
+                    ai_progress.set_completed(
+                        success=False,
+                        summary=formatted.title,
+                        details=formatted.lines,
+                    )
+
+                self._schedule_ui(on_fail)
 
         # Submit AI task to diagnostic manager worker pool
         self.diag_manager._executor.submit(worker_ai)
@@ -397,27 +440,37 @@ class REIApp:
         else:
             title = "HID LINUX"
         progress_view = UpdateProgressView(title=title)
-        progress_view.stage_message = "Configurando Gadget Universal..."
+        progress_view.stage_message = "Configurando USB..."
         progress_view.progress = 0.3
         self.screen_manager.push_view(progress_view)
 
-        def worker_mode():
-            success, msg = self.usb_manager.set_mode(target_mode)
-            if success:
-                progress_view.set_progress("Reiniciando en 3s...", 0.8)
-                time.sleep(1.0)
-                progress_view.set_completed(
-                    success=True,
-                    summary="Reiniciando...",
-                    details=["Gadget Universal OK", "Reiniciando sistema..."],
-                )
-                time.sleep(2.0)
-                execute_system_reboot()
-            else:
+        def worker_mode() -> None:
+            try:
+                success, msg = self.usb_manager.set_mode(target_mode)
+                if success:
+                    progress_view.set_progress("Reiniciando en 3s...", 0.8)
+                    time.sleep(1.0)
+                    progress_view.set_completed(
+                        success=True,
+                        summary="Modo USB actualizado",
+                        details=["Gadget configurado correctamente.", "Reiniciando sistema..."],
+                    )
+                    time.sleep(2.0)
+                    execute_system_reboot()
+                else:
+                    formatted = format_oled_error(msg, fallback_title="ERROR MODO USB")
+                    progress_view.set_completed(
+                        success=False,
+                        summary=formatted.title,
+                        details=formatted.lines,
+                    )
+            except Exception as ex:
+                logger.exception(f"Error cambiando modo USB a {target_mode}: {ex}")
+                formatted = format_oled_error(ex, fallback_title="ERROR MODO USB")
                 progress_view.set_completed(
                     success=False,
-                    summary="Error de Modo",
-                    details=[msg[:19], "OK/KEY3: Salir"],
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
 
         self.diag_manager._executor.submit(worker_mode)
@@ -450,9 +503,8 @@ class REIApp:
         **plugin_kwargs: Any,
     ) -> None:
         """Runs a Wi-Fi plugin asynchronously and dispatches completion onto the UI thread."""
-        progress_view = UpdateProgressView(title=progress_title)
+        progress_view = UpdateProgressView(title=progress_title, indeterminate=True)
         progress_view.stage_message = stage_message
-        progress_view.progress = 0.5
         self.screen_manager.push_view(progress_view)
 
         started = self.diag_manager.execute_async(
@@ -466,7 +518,11 @@ class REIApp:
             if self.screen_manager.current_view is progress_view:
                 self.screen_manager.pop_view()
             self.screen_manager.push_view(
-                DetailCardView("OCUPADO", ["Operacion en curso", "Espere un momento"])
+                NoticeView(
+                    "OCUPADO",
+                    ["Hay una operacion Wi-Fi en curso.", "Espere unos segundos y reintente."],
+                    level=NoticeLevel.WARNING,
+                )
             )
 
     @staticmethod
@@ -565,17 +621,49 @@ class REIApp:
         if security:
             info_lines.append(f"Seg: {shorten_oled_label(security, 14)}")
 
+        short_band = frequency.replace("GHz", "G").replace(" ", "") if frequency else ""
+        short_sec = security.replace("-PSK", "").replace("WPA2/WPA3", "WPA3").strip() if security else ""
+        summary_parts: List[str] = []
+        if signal_pct:
+            summary_parts.append(f"{signal_pct}%")
+        if short_band:
+            summary_parts.append(short_band)
+        if short_sec:
+            summary_parts.append(short_sec)
+        info_value = " ".join(summary_parts) if summary_parts else "Activa"
+
+        wifi_pages: List[DetailPage] = [
+            DetailPage(
+                title="RED ACTIVA",
+                hero=DetailHero(
+                    tag="WIFI",
+                    value=ssid,
+                    signal_pct=signal_pct if signal_pct > 0 else None,
+                ),
+                rows=(
+                    DetailRow(label="IP", value=ip_addr),
+                    DetailRow(label="Info", value=info_value),
+                ),
+            )
+        ]
+        if security and signal_pct:
+            sec_rows: List[DetailRow] = [
+                DetailRow(label="Seg.", value=security),
+                DetailRow(label="Senal", value=f"{signal_pct}% {frequency}".strip()),
+            ]
+            wifi_pages.append(DetailPage(title="DETALLE RED", rows=tuple(sec_rows)))
+
         deck.add_card(
             HeroCard(
                 title="ESTADO RED",
                 icon_name="WIFI_OK",
-                submenu=DetailCardView("RED ACTIVA", wrap_oled_lines(info_lines, max_chars=19)),
+                submenu=DetailCardView("RED ACTIVA", info_lines, level=NoticeLevel.OK, pages=wifi_pages),
             )
         )
         deck.add_card(
             HeroCard(
                 title="DESCONECTAR",
-                icon_name="WIFI_FAIL",
+                icon_name="WIFI_OFF",
                 on_select=lambda: self._disconnect_wifi(ssid=ssid, action_menu=deck, source_deck=source_deck),
             )
         )
@@ -598,7 +686,7 @@ class REIApp:
         deck.add_card(
             HeroCard(
                 title="OLVIDAR RED",
-                icon_name="POWEROFF",
+                icon_name="TRASH",
                 on_select=lambda: self._forget_wifi(
                     ssid=ssid, profile_id=profile_id, action_menu=deck, source_deck=source_deck,
                 ),
@@ -656,7 +744,7 @@ class REIApp:
         deck.add_card(
             HeroCard(
                 title="OLVIDAR RED",
-                icon_name="POWEROFF",
+                icon_name="TRASH",
                 on_select=lambda: self._forget_wifi(
                     ssid=ssid, profile_id=profile_id, action_menu=deck, source_deck=source_deck,
                 ),
@@ -700,9 +788,10 @@ class REIApp:
                 )
             elif is_enterprise:
                 self.screen_manager.push_view(
-                    DetailCardView(
+                    NoticeView(
                         "RED 802.1X",
-                        wrap_oled_lines(["Requiere 802.1X", f"Red: {shorten_oled_label(ssid, 14)}", "No soportado aqui"]),
+                        [f"Red: {ssid}", "Requiere autenticacion 802.1X.", "No soportado desde este menu."],
+                        level=NoticeLevel.WARNING,
                     )
                 )
             elif is_secured:
@@ -729,45 +818,46 @@ class REIApp:
         deck_wifi_nets._rei_deck_kind = "scan"
 
         if result.status == DiagnosticStatus.FAILED and not networks:
-            deck_wifi_nets.add_card(
-                HeroCard(
-                    title="ERROR ESCANEO",
-                    icon_name="WIFI_FAIL",
-                    submenu=DetailCardView("ERROR WI-FI", result.details or [result.summary]),
+            self.screen_manager.push_view(
+                NoticeView(
+                    "ERROR WI-FI",
+                    result.details or [result.summary or "Error al escanear redes."],
+                    level=NoticeLevel.ERROR,
                 )
             )
-        elif not networks:
-            deck_wifi_nets.add_card(
-                HeroCard(
-                    title="SIN REDES",
-                    icon_name="WIFI_FAIL",
-                    submenu=DetailCardView("SIN REDES", ["No se encontraron", "redes Wi-Fi."]),
+            return
+        if not networks:
+            self.screen_manager.push_view(
+                NoticeView(
+                    "SIN REDES",
+                    ["No se encontraron redes Wi-Fi.", "Verifique alcance e intente de nuevo."],
+                    level=NoticeLevel.INFO,
                 )
             )
-        else:
-            for net in networks:
-                ssid = net.get("ssid", "Red Wi-Fi")
-                in_use = bool(net.get("in_use", False))
-                is_saved = bool(net.get("is_saved", False))
-                is_secured = bool(net.get("is_secured", True))
+            return
+        for net in networks:
+            ssid = net.get("ssid", "Red Wi-Fi")
+            in_use = bool(net.get("in_use", False))
+            is_saved = bool(net.get("is_saved", False))
+            is_secured = bool(net.get("is_secured", True))
 
-                if in_use:
-                    icon = "WIFI_OK"
-                elif is_saved:
-                    icon = "WIFI_SAVED"
-                elif is_secured:
-                    icon = "LOCK"
-                else:
-                    icon = "WIFI"
+            if in_use:
+                icon = "WIFI_OK"
+            elif is_saved:
+                icon = "WIFI_SAVED"
+            elif is_secured:
+                icon = "LOCK"
+            else:
+                icon = "WIFI"
 
-                deck_wifi_nets.add_card(
-                    HeroCard(
-                        title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=is_saved),
-                        icon_name=icon,
-                        on_select=self._make_scanned_card_handler(net, deck_wifi_nets),
-                        metadata={"ssid": ssid, "net": dict(net)},
-                    )
+            deck_wifi_nets.add_card(
+                HeroCard(
+                    title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=is_saved),
+                    icon_name=icon,
+                    on_select=self._make_scanned_card_handler(net, deck_wifi_nets),
+                    metadata={"ssid": ssid, "net": dict(net)},
                 )
+            )
 
         self.screen_manager.push_view(deck_wifi_nets)
 
@@ -778,39 +868,39 @@ class REIApp:
         deck_saved._rei_deck_kind = "saved"
 
         if not profiles:
-            deck_saved.add_card(
-                HeroCard(
-                    title="SIN GUARDADAS",
-                    icon_name="INFO",
-                    submenu=DetailCardView("REDES GUARDADAS", ["No hay redes", "guardadas aun."]),
+            self.screen_manager.push_view(
+                NoticeView(
+                    "REDES GUARDADAS",
+                    ["No hay redes guardadas aun.", "Conectese desde Escanear Wi-Fi."],
+                    level=NoticeLevel.INFO,
                 )
             )
-        else:
-            for prof in profiles:
-                ssid = prof.get("ssid", "Red Wi-Fi")
-                in_use = bool(prof.get("in_use", False))
-                in_range = bool(prof.get("in_range", False))
+            return
+        for prof in profiles:
+            ssid = prof.get("ssid", "Red Wi-Fi")
+            in_use = bool(prof.get("in_use", False))
+            in_range = bool(prof.get("in_range", False))
 
-                if in_use:
-                    icon = "WIFI_OK"
-                elif in_range:
-                    icon = "WIFI_SAVED"
-                else:
-                    icon = "INFO"
+            if in_use:
+                icon = "WIFI_OK"
+            elif in_range:
+                icon = "WIFI_SAVED"
+            else:
+                icon = "INFO"
 
-                def make_saved_handler(p: Dict[str, Any]):
-                    def handler():
-                        self.screen_manager.push_view(self._build_saved_profile_menu(p, source_deck=deck_saved))
-                    return handler
+            def make_saved_handler(p: Dict[str, Any]) -> Callable[[], None]:
+                def handler() -> None:
+                    self.screen_manager.push_view(self._build_saved_profile_menu(p, source_deck=deck_saved))
+                return handler
 
-                deck_saved.add_card(
-                    HeroCard(
-                        title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=False),
-                        icon_name=icon,
-                        on_select=make_saved_handler(prof),
-                        metadata={"ssid": ssid, "net": dict(prof)},
-                    )
+            deck_saved.add_card(
+                HeroCard(
+                    title=self._format_wifi_card_title(ssid, in_use=in_use, is_saved=False),
+                    icon_name=icon,
+                    on_select=make_saved_handler(prof),
+                    metadata={"ssid": ssid, "net": dict(prof)},
                 )
+            )
 
         self.screen_manager.push_view(deck_saved)
 
@@ -957,15 +1047,13 @@ class REIApp:
                 if action_menu is not None and self.screen_manager.current_view is action_menu:
                     self.screen_manager.pop_view()
 
-            deck = HeroCardDeckView("ESTADO WI-FI")
-            deck.add_card(
-                HeroCard(
-                    title=ok_title if is_ok else "ERROR",
-                    icon_name=ok_icon if is_ok else "WIFI_FAIL",
-                    submenu=DetailCardView(detail_title, result.details or [result.summary]),
+            self.screen_manager.push_view(
+                NoticeView(
+                    title=ok_title if is_ok else "ERROR WI-FI",
+                    lines=result.details or [result.summary or detail_title],
+                    level=NoticeLevel.OK if is_ok else NoticeLevel.ERROR,
                 )
             )
-            self.screen_manager.push_view(deck)
 
         self._run_wifi_async_task(
             progress_title=progress_title,
@@ -1035,14 +1123,14 @@ class REIApp:
             self._update_source_deck_state(source_deck, connected_ssid=ssid)
             already_conn = bool(metrics.get("already_connected"))
             hero_title = "YA CONECTADA" if already_conn else "CONECTADO"
-            detail_view = DetailCardView(
-                title="RESUMEN RED",
-                initial_lines=result.details if result.details else [result.summary],
-                pop_to_root_on_key1=True,
+            self.screen_manager.push_view(
+                NoticeView(
+                    title=hero_title,
+                    lines=result.details if result.details else [result.summary or f"Conectado a {ssid}"],
+                    level=NoticeLevel.OK,
+                    pop_to_root_on_ok=True,
+                )
             )
-            deck_result = HeroCardDeckView("ESTADO WI-FI")
-            deck_result.add_card(HeroCard(title=hero_title, icon_name="WIFI_OK", submenu=detail_view))
-            self.screen_manager.push_view(deck_result)
             return
 
         error_code = str(metrics.get("error_code", "UNKNOWN"))
@@ -1059,38 +1147,33 @@ class REIApp:
             "ENTERPRISE_UNSUPPORTED": "REQ. 802.1X",
         }
         hero_title = title_map.get(error_code, "ERROR CONEXION")
-
-        detail_view = DetailCardView(
-            title="DETALLE ERROR",
-            initial_lines=result.details if result.details else [result.summary],
-            pop_to_root_on_key1=False,
-        )
-        deck_result = HeroCardDeckView("ESTADO WI-FI")
+        err_lines = result.details if result.details else [result.summary or "No se pudo conectar."]
 
         if error_code in ("AUTH_FAILED", "SECRETS_REQUIRED") or needs_password:
-            retry_label = "NUEVA CLAVE" if used_saved else "REINTENTAR CLAVE"
-            retry_card = HeroCard(
-                title=retry_label,
-                icon_name="KEYBOARD",
-                on_select=lambda: self._open_wifi_password_prompt(
-                    ssid=ssid,
-                    force_update=True,
-                    security_hint=security_hint,
-                    replace_top=True,
-                    source_deck=source_deck,
-                ),
+            retry_action = lambda: self._open_wifi_password_prompt(
+                ssid=ssid,
+                force_update=True,
+                security_hint=security_hint,
+                replace_top=True,
+                source_deck=source_deck,
             )
-            error_card = HeroCard(title=hero_title, icon_name="WIFI_FAIL", submenu=detail_view)
-            if used_saved:
-                deck_result.add_card(retry_card)
-                deck_result.add_card(error_card)
-            else:
-                deck_result.add_card(error_card)
-                deck_result.add_card(retry_card)
+            self.screen_manager.push_view(
+                NoticeView(
+                    title=hero_title,
+                    lines=err_lines,
+                    level=NoticeLevel.ERROR,
+                    action_label="CLAVE",
+                    on_action=retry_action,
+                )
+            )
         else:
-            deck_result.add_card(HeroCard(title=hero_title, icon_name="WIFI_FAIL", submenu=detail_view))
-
-        self.screen_manager.push_view(deck_result)
+            self.screen_manager.push_view(
+                NoticeView(
+                    title=hero_title,
+                    lines=err_lines,
+                    level=NoticeLevel.ERROR,
+                )
+            )
 
     # =========================================================================
     # HIERARCHICAL MENU BUILDER
@@ -1190,29 +1273,72 @@ class REIApp:
         view_poweroff_detail = self._create_detail_view("sys_poweroff", "APAGAR")
         view_reboot_detail = self._create_detail_view("sys_reboot", "REINICIAR")
 
+        def confirm_poweroff() -> None:
+            def on_confirm() -> None:
+                self.screen_manager.replace_view(view_poweroff_detail)
+                self._trigger_task("sys_poweroff")
+
+            self.screen_manager.push_view(
+                ConfirmDialogView(
+                    title="APAGAR",
+                    question="APAGAR EQUIPO?",
+                    icon_name="POWEROFF",
+                    cancel_label="NO",
+                    confirm_label="APAGAR",
+                    on_confirm=on_confirm,
+                    default_confirm=False,
+                )
+            )
+
+        def confirm_reboot() -> None:
+            def on_confirm() -> None:
+                self.screen_manager.replace_view(view_reboot_detail)
+                self._trigger_task("sys_reboot")
+
+            self.screen_manager.push_view(
+                ConfirmDialogView(
+                    title="REINICIAR",
+                    question="REINICIAR EQUIPO?",
+                    icon_name="REBOOT",
+                    cancel_label="NO",
+                    confirm_label="REINICIAR",
+                    on_confirm=on_confirm,
+                    default_confirm=False,
+                )
+            )
+
         deck_alimentacion = HeroCardDeckView("ALIMENTACION")
         deck_alimentacion.add_card(
             HeroCard(
                 title="APAGAR",
                 icon_name="POWEROFF",
-                submenu=view_poweroff_detail,
-                on_select=lambda: self._trigger_task("sys_poweroff"),
+                on_select=confirm_poweroff,
             )
         )
         deck_alimentacion.add_card(
             HeroCard(
                 title="REINICIAR",
                 icon_name="REBOOT",
-                submenu=view_reboot_detail,
-                on_select=lambda: self._trigger_task("sys_reboot"),
+                on_select=confirm_reboot,
             )
         )
 
         # ----------------------------------------------------
         # LEVEL 1: Sub-menus for UTILIDADES
         # ----------------------------------------------------
-        view_battery_detail = self._create_detail_view("diag_battery", "ESTADO BATERIA")
-        view_system_detail = self._create_detail_view("diag_system", "ESTADO SISTEMA")
+        view_battery_detail = BatteryTelemetryView(
+            title="BATERIA",
+            initial_lines=["Consultando bateria..."],
+            on_refresh=lambda: self._trigger_task("diag_battery"),
+        )
+        self._detail_views["diag_battery"] = view_battery_detail
+
+        view_system_detail = SystemTelemetryView(
+            title="SISTEMA",
+            initial_lines=["Consultando sistema..."],
+            on_refresh=lambda: self._trigger_task("diag_system"),
+        )
+        self._detail_views["diag_system"] = view_system_detail
 
         deck_utilidades = HeroCardDeckView("UTILIDADES")
         deck_utilidades.add_card(HeroCard(title="CONEXION DE RED", icon_name="NETWORK", submenu=deck_net_conn))
@@ -1351,7 +1477,7 @@ class REIApp:
         # ----------------------------------------------------
         root_deck = HeroCardDeckView("MAIN")
         root_deck.add_card(HeroCard(title="UTILIDADES", icon_name="TOOLS", submenu=deck_utilidades))
-        root_deck.add_card(HeroCard(title="SWITCHES / RED", icon_name="NETWORK", submenu=deck_switches))
+        root_deck.add_card(HeroCard(title="SWITCHES / RED", icon_name="SWITCH", submenu=deck_switches))
         root_deck.add_card(HeroCard(title="ENDPOINTS PC", icon_name="ENDPOINT", submenu=deck_endpoints))
         root_deck.add_card(
             HeroCard(
@@ -1385,9 +1511,20 @@ class REIApp:
             for task_id, detail_view in self._detail_views.items():
                 plugin = self.diag_manager.get_plugin(task_id)
                 if plugin and plugin.name == result.plugin_name:
-                    status_badge = "OK" if result.status == DiagnosticStatus.SUCCESS else "FAIL"
+                    status_badge = "OK" if result.status == DiagnosticStatus.SUCCESS else "ERROR"
+                    notice_level = (
+                        severity_to_notice_level(result.overall_status)
+                        if result.status == DiagnosticStatus.SUCCESS
+                        else severity_to_notice_level(result.status)
+                    )
                     lines = result.details if result.details else [result.summary]
-                    detail_view.set_content(lines=lines, status=status_badge, is_loading=False)
+                    detail_view.set_content(
+                        lines=lines,
+                        status=status_badge,
+                        is_loading=False,
+                        level=notice_level,
+                        metrics=result.metrics if isinstance(result.metrics, dict) else None,
+                    )
 
             # Find matching update progress view
             for task_id, progress_view in self._progress_views.items():
@@ -1423,21 +1560,34 @@ class REIApp:
                 while event is not None:
                     curr_view = self.screen_manager.current_view
                     if curr_view:
-                        if isinstance(curr_view, (WiFiPasswordView, KeyboardInputView)) or getattr(
-                            curr_view, "accepts_text_input", False
-                        ):
-                            action = curr_view.handle_input(event, char=self.input_handler.get_last_char())
-                        else:
-                            action = curr_view.handle_input(event)
+                        try:
+                            if isinstance(curr_view, (WiFiPasswordView, KeyboardInputView)) or getattr(
+                                curr_view, "accepts_text_input", False
+                            ):
+                                action = curr_view.handle_input(event, char=self.input_handler.get_last_char())
+                            else:
+                                action = curr_view.handle_input(event)
 
-                        if action.action_type == ViewActionType.PUSH_VIEW and action.target_view:
-                            self.screen_manager.push_view(action.target_view)
-                        elif action.action_type == ViewActionType.POP_VIEW:
-                            self.screen_manager.pop_view()
-                        elif action.action_type == ViewActionType.POP_TO_ROOT:
-                            self.screen_manager.pop_to_root()
-                        elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
-                            self._trigger_task(action.task_id)
+                            if action.action_type == ViewActionType.PUSH_VIEW and action.target_view:
+                                self.screen_manager.push_view(action.target_view)
+                            elif action.action_type == ViewActionType.REPLACE_VIEW and action.target_view:
+                                self.screen_manager.replace_view(action.target_view)
+                            elif action.action_type == ViewActionType.POP_VIEW:
+                                self.screen_manager.pop_view()
+                            elif action.action_type == ViewActionType.POP_TO_ROOT:
+                                self.screen_manager.pop_to_root()
+                            elif action.action_type == ViewActionType.EXECUTE_TASK and action.task_id:
+                                self._trigger_task(action.task_id)
+                        except Exception as ui_ex:
+                            logger.exception(f"Error procesando entrada '{event}' en '{curr_view.title}': {ui_ex}")
+                            formatted = format_oled_error(ui_ex, fallback_title="ERROR INTERFAZ")
+                            self.screen_manager.push_view(
+                                NoticeView(
+                                    title=formatted.title,
+                                    lines=formatted.lines,
+                                    level=formatted.level,
+                                )
+                            )
 
                     event = self.input_handler.get_event()
 

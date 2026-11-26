@@ -9,7 +9,8 @@ import queue
 import time
 from typing import Callable, Dict, Optional
 
-from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus
+from .errors import format_oled_error
+from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus, Severity
 
 logger = logging.getLogger("REI.Core.Manager")
 
@@ -68,11 +69,13 @@ class DiagnosticManager:
                 result = plugin.run(**kwargs)
             except Exception as ex:
                 logger.exception(f"Unhandled error executing plugin '{plugin_id}': {ex}")
+                formatted = format_oled_error(ex, context=plugin.name)
                 result = DiagnosticResult(
                     plugin_name=plugin.name,
                     status=DiagnosticStatus.FAILED,
-                    summary="Error de ejecución",
-                    details=[str(ex)],
+                    overall_status=Severity.CRITICAL,
+                    summary=formatted.title,
+                    details=formatted.lines,
                 )
             result.elapsed_seconds = round(time.monotonic() - start_time, 2)
             self._result_queue.put(result)

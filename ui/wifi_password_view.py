@@ -1,52 +1,48 @@
 """
 REI - Vista OLED para ingreso de contraseña Wi-Fi mediante teclado físico USB.
 
-Sustituye al teclado virtual matricial en pantalla en los flujos Wi-Fi.
-El usuario conecta un teclado físico USB (o receptor inalámbrico 2.4 GHz),
-escribe la contraseña con soporte LATAM/ES/US, puede alternar entre mostrarla
-u ocultarla (KEY2 / Tab / F2) y confirmar con ENTER / KEY1 / PRESS sin bloquear
-el bucle de interfaz de 30 FPS.
+Alineada con el sistema visual unificado de REI (Opción 3 — Campo compacto):
+- Marco fino de instrumento (2, 6)-(125, 57) con SSID y distribución (LA/ES/US)
+  incrustados en el borde superior, y borde inferior completamente limpio.
+- Línea superior de estado: visibilidad (Oculta/Visible) + contador NN/63, o
+  mensaje de error/aviso sin tapar la contraseña ingresada.
+- Campo de entrada compacto (18 px de alto) con puntos redondos (oculta),
+  texto claro desplazable (visible) o guía contextual.
 """
 
 import logging
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from PIL import ImageDraw
 
-from core.parser import sanitize_oled_text, shorten_oled_label
+from core.parser import sanitize_oled_text
 from core.wifi import WiFiErrorCode, validate_wifi_password
 from .display import BaseView, ViewAction, ViewActionType
 from .input_handler import InputEvent
 from .keyboard_layouts import get_layout_badge
+from .theme import (
+    draw_instrument_frame,
+    draw_mini_glyph,
+    draw_text_vcenter,
+    fit_text_px,
+    measure_text_px,
+)
 
 logger = logging.getLogger("REI.UI.WiFiPassword")
 
 MAX_PASSWORD_LENGTH = 63
 
-# Geometría del rediseño (128x64 px, 1-bit). Caja de contraseña y ritmo de
-# los puntos enmascarados; mantener PW_BOX consistente con _fit_tail_window.
-PW_BOX = (5, 17, 122, 43)
+# Geometría alineada al marco de instrumento (2, 6)-(125, 57)
+PW_BOX: Tuple[int, int, int, int] = (6, 31, 121, 48)
 DOT_SPACING = 6
 DOT_SIZE = 4
 
 
 class WiFiPasswordView(BaseView):
     """
-    Pantalla de contraseña Wi-Fi rediseñada (128x64 px, 1-bit).
+    Pantalla unificada de ingreso de contraseña Wi-Fi por teclado USB físico.
 
-    Layout (menos cargado y más intuitivo que la versión anterior):
-    - Cabecera: título (prefijo + SSID) truncado a la izquierda; badge de
-      distribución (LA/ES/US) y punto de estado del teclado a la derecha
-      (sólido = conectado, hueco = ausente). Sin pills ni separadores.
-    - Cuadro central: la contraseña como puntos redondos (oculta) o texto
-      claro (visible) con cursor parpadeante; los errores de validación se
-      muestran invertidos dentro del propio cuadro; si está vacía, un texto
-      guía ("Ingrese su clave...") ocupa su lugar.
-    - Banda inferior: contador "NN/63" a la izquierda y hints compactos con
-      glyph a la derecha: [ojo] K2 (ver/ocultar), [check] ENT (conectar),
-      [flecha] K3 (cancelar).
-
-    Controles (sin cambios respecto a la versión previa):
+    Controles preservados:
     - Teclado físico USB (CHAR): escribe caracteres de la contraseña.
     - Backspace / Delete: elimina el último carácter.
     - KEY2 / Tab / F2: alterna entre ocultar y mostrar la contraseña.
@@ -186,10 +182,10 @@ class WiFiPasswordView(BaseView):
                 raw_layout = self.layout_provider()
                 if isinstance(raw_layout, str):
                     self._active_layout = raw_layout
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.debug(f"Fallo consultando layout de teclado: {ex}")
 
-    def handle_input(self, event: InputEvent, char: Optional[str] = None, **kwargs) -> ViewAction:
+    def handle_input(self, event: InputEvent, char: Optional[str] = None, **kwargs: Any) -> ViewAction:
         """Procesa eventos del teclado USB y botones físicos del HAT OLED."""
         if event == InputEvent.CHAR:
             self._append_char(char)
@@ -213,15 +209,7 @@ class WiFiPasswordView(BaseView):
 
     def _fit_text_to_width(self, draw: ImageDraw.ImageDraw, text: str, max_px: int) -> str:
         """Recorta texto por la derecha para ajustarse exactamente a max_px píxeles."""
-        clean = sanitize_oled_text(text)
-        if self.get_text_width(draw, clean) <= max_px:
-            return clean
-        if max_px <= 10:
-            return ""
-        trimmed = clean
-        while trimmed and self.get_text_width(draw, trimmed + "..") > max_px:
-            trimmed = trimmed[:-1]
-        return (trimmed + "..") if trimmed else ""
+        return fit_text_px(draw, text, self.font, max_px)
 
     def _fit_tail_window(
         self,
@@ -234,147 +222,165 @@ class WiFiPasswordView(BaseView):
         Ajusta la ventana visible al final de la contraseña según ancho real en píxeles.
         Retorna (texto_visible, hubo_desplazamiento).
         """
-        if self.get_text_width(draw, display_text + cursor_char) <= max_px:
+        if measure_text_px(draw, display_text + cursor_char, self.font) <= max_px:
             return display_text, False
 
-        # Reservar espacio para marcador '<' a la izquierda
         inner_px = max(12, max_px - 8)
         visible = display_text
-        while visible and self.get_text_width(draw, visible + cursor_char) > inner_px:
+        while visible and measure_text_px(draw, visible + cursor_char, self.font) > inner_px:
             visible = visible[1:]
         return visible, True
 
     # ------------------------------------------------------------------ #
-    # Render (rediseño)
+    # Render unificado (Opción 3 — Campo compacto + borde inferior limpio)
     # ------------------------------------------------------------------ #
 
     def render(self, draw: ImageDraw.ImageDraw, width: int = 128, height: int = 64) -> None:
-        """Renderiza la interfaz Wi-Fi rediseñada en el canvas 128x64 1-bit."""
-        self.draw_perimeter_border(draw)
-        self._draw_header(draw)
-        self._draw_password_field(draw, width)
-        self._draw_bottom_band(draw)
-
-    def _draw_header(self, draw: ImageDraw.ImageDraw) -> None:
-        """Cabecera ligera: título a la izquierda, badge + punto de teclado a la derecha."""
-        # Punto de estado del teclado (5x5): sólido = conectado, hueco = ausente
-        if self._keyboard_connected:
-            draw.rectangle((117, 6, 121, 10), fill="white")
-        else:
-            draw.rectangle((117, 6, 121, 10), outline="white")
-
-        # Badge de distribución del teclado (LA / ES / US)
+        """Renderiza la interfaz Wi-Fi unificada en el canvas 128x64 de 1 bit."""
+        has_alert = bool(self.error_message or self.usb_gadget_active or not self._keyboard_connected)
+        frame_title = self.ssid or self.title or "CLAVE WI-FI"
         badge = get_layout_badge(self._active_layout)
-        badge_w = self.get_text_width(draw, badge)
-        badge_x = 117 - badge_w - 3
-        draw.text((badge_x, 2), badge, font=self.font, fill="white")
 
-        # Título (prefijo + SSID) truncado al ancho disponible
-        title = sanitize_oled_text(self.title or f"RED: {self.ssid}").strip().upper()
-        title_label = self._fit_text_to_width(draw, title, max(24, badge_x - 8))
-        draw.text((5, 2), title_label, font=self.font, fill="white")
+        inner_x1, _, inner_x2, _ = draw_instrument_frame(
+            draw,
+            title=frame_title,
+            icon_glyph="warn" if has_alert else None,
+            right_text=badge,
+            font=self.small_font,
+            width=width,
+            height=height,
+        )
+        self._draw_status_line(draw, inner_x1, inner_x2)
+        self._draw_password_field(draw, inner_x1, inner_x2)
 
-    def _draw_password_field(self, draw: ImageDraw.ImageDraw, width: int) -> None:
-        """Cuadro central: puntos/texto/cursor, error invertido o texto guía."""
-        x1, y1, x2, y2 = PW_BOX
-        draw.rectangle(PW_BOX, outline="white", fill="black")
+    def _draw_status_line(self, draw: ImageDraw.ImageDraw, inner_x1: int, inner_x2: int) -> None:
+        """Fila superior despejada: error/aviso o visibilidad (Oculta/Visible) + contador."""
+        y_top, y_bottom = 15, 24
+        inner_w = max(16, inner_x2 - inner_x1 + 1)
 
-        # Errores de validación: barra invertida dentro del propio cuadro
         if self.error_message:
-            draw.rectangle((x1 + 2, y1 + 2, x2 - 2, y2 - 2), fill="white")
-            err_txt = shorten_oled_label(self.error_message, 19)
-            self.draw_centered_text(draw, err_txt, y=24, screen_width=width, fill="black")
+            err_txt = fit_text_px(draw, self.error_message, self.font, inner_w)
+            draw_text_vcenter(draw, err_txt, x=inner_x1, y_top=y_top, y_bottom=y_bottom, font=self.font, fill="white")
             return
+
+        if self.usb_gadget_active:
+            msg = fit_text_px(draw, "USB en modo HID", self.font, inner_w)
+            draw_text_vcenter(draw, msg, x=inner_x1, y_top=y_top, y_bottom=y_bottom, font=self.font, fill="white")
+            return
+
+        if not self._keyboard_connected:
+            msg = fit_text_px(draw, "Conecte teclado USB", self.font, inner_w)
+            draw_text_vcenter(draw, msg, x=inner_x1, y_top=y_top, y_bottom=y_bottom, font=self.font, fill="white")
+            return
+
+        eye_glyph = "eye_open" if self.is_visible else "eye_closed"
+        gw = draw_mini_glyph(draw, eye_glyph, x=inner_x1, y=17, fill="white")
+        mode_txt = "Visible" if self.is_visible else "Oculta"
+        counter_txt = f"{len(self.password)}/{self.max_length}"
+        counter_w = measure_text_px(draw, counter_txt, self.small_font)
+        counter_x = max(inner_x1 + gw + 28, inner_x2 - counter_w + 1)
+
+        mode_max_px = max(12, counter_x - (inner_x1 + gw + 3) - 4)
+        fitted_mode = fit_text_px(draw, mode_txt, self.small_font, mode_max_px)
+        if fitted_mode:
+            draw_text_vcenter(
+                draw,
+                fitted_mode,
+                x=inner_x1 + gw + 3,
+                y_top=y_top,
+                y_bottom=y_bottom,
+                font=self.small_font,
+                fill="white",
+            )
+        draw_text_vcenter(
+            draw,
+            counter_txt,
+            x=counter_x,
+            y_top=y_top,
+            y_bottom=y_bottom,
+            font=self.small_font,
+            fill="white",
+        )
+
+    def _draw_password_field(self, draw: ImageDraw.ImageDraw, inner_x1: int, inner_x2: int) -> None:
+        """Campo compacto de 18 px de alto: puntos, texto visible o guía contextual."""
+        box = (inner_x1, PW_BOX[1], inner_x2, PW_BOX[3])
+        draw.rectangle(box, outline="white", fill="black")
 
         display_pw = sanitize_oled_text(self.password)
         if not display_pw:
-            self._draw_empty_prompt(draw)
+            self._draw_empty_prompt(draw, box)
         elif self.is_visible:
-            self._draw_visible_password(draw, display_pw)
+            self._draw_visible_password(draw, display_pw, box)
         else:
-            self._draw_masked_password(draw, len(display_pw))
+            self._draw_masked_password(draw, len(display_pw), box)
 
-    def _draw_empty_prompt(self, draw: ImageDraw.ImageDraw) -> None:
-        """Texto guía dentro del cuadro cuando aún no hay caracteres."""
+    def _draw_empty_prompt(self, draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int]) -> None:
+        """Texto guía limpio dentro del campo cuando aún no hay caracteres."""
+        x1, y1, x2, y2 = box
         if self.usb_gadget_active:
-            prompt = "USB en modo HID..."
+            prompt = "Cambie a USB normal"
         elif not self._keyboard_connected:
-            prompt = "Conecte teclado..."
+            prompt = "Esperando teclado..."
         else:
             prompt = "Ingrese su clave..."
-        # Recorte defensivo: el prompt nunca debe invadir el borde del cuadro
-        prompt = self._fit_text_to_width(draw, prompt, 103)
-        draw.text((9, 23), prompt, font=self.font, fill="white")
-        if self.cursor_visible:
-            cursor_x = min(9 + self.get_text_width(draw, prompt) + 3, 116)
-            draw.rectangle((cursor_x, 24, cursor_x + 1, 34), fill="white")
 
-    def _draw_visible_password(self, draw: ImageDraw.ImageDraw, display_pw: str) -> None:
+        max_px = max(12, (x2 - x1) - 10)
+        fitted = fit_text_px(draw, prompt, self.small_font, max_px)
+        draw_text_vcenter(draw, fitted, x=x1 + 4, y_top=y1 + 2, y_bottom=y2 - 2, font=self.small_font, fill="white")
+        if self.cursor_visible and self._keyboard_connected and not self.usb_gadget_active:
+            cursor_x = min(x1 + 4 + measure_text_px(draw, fitted, self.small_font) + 2, x2 - 3)
+            draw.rectangle((cursor_x, y1 + 4, cursor_x + 1, y2 - 4), fill="white")
+
+    def _draw_visible_password(
+        self,
+        draw: ImageDraw.ImageDraw,
+        display_pw: str,
+        box: Tuple[int, int, int, int],
+    ) -> None:
         """Contraseña en texto claro con ventana deslizante y cursor."""
+        x1, y1, x2, y2 = box
         cursor_char = "_" if self.cursor_visible else " "
-        visible_pw, scrolled = self._fit_tail_window(draw, display_pw, cursor_char, max_px=104)
-        start_x = 9
+        max_px = max(16, (x2 - x1) - 8)
+        visible_pw, scrolled = self._fit_tail_window(draw, display_pw, cursor_char, max_px=max_px)
+        start_x = x1 + 4
         if scrolled:
-            draw.text((start_x, 23), "<", font=self.font, fill="white")
+            draw_text_vcenter(draw, "<", x=start_x, y_top=y1 + 2, y_bottom=y2 - 2, font=self.font)
             start_x += 8
-        draw.text((start_x, 23), visible_pw + cursor_char, font=self.font, fill="white")
+        draw_text_vcenter(
+            draw,
+            visible_pw + cursor_char,
+            x=start_x,
+            y_top=y1 + 2,
+            y_bottom=y2 - 2,
+            font=self.font,
+        )
 
-    def _draw_masked_password(self, draw: ImageDraw.ImageDraw, count: int) -> None:
-        """
-        Contraseña oculta como puntos redondos (estilo cajita moderna).
-        Muestra la cola de la clave; los caracteres reales nunca se dibujan.
-        """
-        dy1 = (PW_BOX[1] + PW_BOX[3]) // 2 - 2
+    def _draw_masked_password(
+        self,
+        draw: ImageDraw.ImageDraw,
+        count: int,
+        box: Tuple[int, int, int, int],
+    ) -> None:
+        """Contraseña oculta como puntos redondos; nunca dibuja caracteres en claro."""
+        x1, y1, x2, y2 = box
+        dy1 = (y1 + y2) // 2 - (DOT_SIZE // 2)
         dy2 = dy1 + DOT_SIZE - 1
-        inner_right = PW_BOX[2] - 3
+        inner_right = x2 - 4
 
-        start_x = 10
+        start_x = x1 + 5
         span = (count - 1) * DOT_SPACING + DOT_SIZE
         if start_x + span > inner_right:
-            draw.text((start_x, 23), "<", font=self.font, fill="white")
+            draw_text_vcenter(draw, "<", x=start_x, y_top=y1 + 2, y_bottom=y2 - 2, font=self.font)
             start_x += 8
 
-        max_dots = (inner_right - start_x - DOT_SIZE) // DOT_SPACING + 1
+        max_dots = max(1, (inner_right - start_x - DOT_SIZE) // DOT_SPACING + 1)
         shown = min(count, max_dots)
         last_x = start_x
         for i in range(shown):
             last_x = start_x + i * DOT_SPACING
             draw.ellipse((last_x, dy1, last_x + DOT_SIZE - 1, dy2), fill="white")
 
-        # Cursor parpadeante tras el último punto visible (el final de la clave)
         if self.cursor_visible:
-            cursor_x = last_x + DOT_SIZE + 2
-            draw.rectangle((cursor_x, dy1 - 4, cursor_x + 1, dy2 + 4), fill="white")
-
-    def _draw_bottom_band(self, draw: ImageDraw.ImageDraw) -> None:
-        """Banda inferior: contador a la izquierda, hints con glyph a la derecha."""
-        if self.password:
-            count_txt = f"{len(self.password):02d}/{self.max_length}"
-            draw.text((5, 48), count_txt, font=self.font, fill="white")
-
-        # Hints compactos: [ojo] K2 · [check] ENT · [flecha] K3
-        self._draw_eye(draw, 42, 50, hidden=not self.is_visible)
-        draw.text((53, 48), "K2", font=self.font, fill="white")
-        self._draw_check(draw, 70, 51)
-        draw.text((78, 48), "ENT", font=self.font, fill="white")
-        self._draw_back_arrow(draw, 100, 52)
-        draw.text((108, 48), "K3", font=self.font, fill="white")
-
-    @staticmethod
-    def _draw_eye(draw: ImageDraw.ImageDraw, x: int, y: int, hidden: bool) -> None:
-        """Glyph de ojo 9x6: pupila sólida = clave oculta, hueca = visible."""
-        draw.ellipse((x, y, x + 8, y + 5), outline="white")
-        if hidden:
-            draw.rectangle((x + 3, y + 2, x + 4, y + 3), fill="white")
-
-    @staticmethod
-    def _draw_check(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Glyph de confirmación (checkmark de 7x5 px)."""
-        draw.line((x, y + 2, x + 2, y + 4), fill="white")
-        draw.line((x + 2, y + 4, x + 6, y), fill="white")
-
-    @staticmethod
-    def _draw_back_arrow(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """Glyph de flecha hacia la izquierda (6x5 px)."""
-        draw.line((x + 5, y, x + 1, y + 2), fill="white")
-        draw.line((x + 1, y + 2, x + 5, y + 4), fill="white")
+            cursor_x = min(last_x + DOT_SIZE + 2, x2 - 3)
+            draw.rectangle((cursor_x, y1 + 4, cursor_x + 1, y2 - 4), fill="white")

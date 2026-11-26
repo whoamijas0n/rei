@@ -89,8 +89,11 @@ at least `Pillow`) before trusting a test run. The QR tests additionally need
 | `core/usb_modes.py` | USB gadget ConfigFS script generator |
 | `core/wifi.py` | `nmcli` / `wpa_cli` Wi-Fi scan + connect |
 | `core/pisugar.py` | PiSugar 3 UPS telemetry (I2C / sysfs / socket / simulated) |
+| `core/errors.py` | `NoticeLevel`, `FormattedNotice`, `format_oled_error` — traducción de errores a avisos OLED |
 | `plugins/endpoints/` | **Only** the HID endpoint plugins: `hid_windows.py`, `hid_linux.py` |
-| `ui/display.py` | `ScreenManager`, `HeroCardDeckView`, `DetailCardView`, `UpdateProgressView`, `QRCodeView`, `IconRenderer` |
+| `ui/display.py` | `ScreenManager`, `HeroCardDeckView`, `DetailCardView`, `NoticeView`, `UpdateProgressView`, `QRCodeView` |
+| `ui/icons.py` | `IconRenderer` — librería de iconos pixel-art 20x20 monocromáticos cacheados |
+| `ui/theme.py` | Sistema visual OLED (cabecera/pie unificados, ajuste de texto en píxeles, badges, spinner, scrollbar) |
 | `ui/input_handler.py` | GPIO joystick/buttons + `USBKeyboardListener` (evdev + stdin) |
 | `ui/keyboard_view.py` | Virtual on-screen keyboard (`VirtualKeyboardInputView`) |
 | `ui/keyboard_layouts.py` | USB keyboard layout detection + US/ES/Latam scancode maps |
@@ -251,12 +254,16 @@ without hardware: arrow keys = joystick, `Enter` = PRESS, `Tab` = KEY2, `Esc` = 
 
 ## OLED rendering conventions
 
-- `IconRenderer.draw_icon` dispatches to `_draw_<ICON_NAME>`; an unknown name silently
-  falls back to `_draw_DEFAULT`. List the valid names with
-  `grep -o 'def _draw_[A-Z_0-9]*' ui/display.py`.
-- Hero card geometry is fixed: 1px border `(1,1)-(126,62)`, 20x20 icon centred at
-  `(64, 24)`, uppercase title centred at `y=44`, carousel dots at
-  `x = 122 - total*5`, `y = 4..6`.
+- `IconRenderer.draw_icon` (defined in `ui/icons.py`, re-exported from `ui/display.py`)
+  renders cached 20x20 monochrome pixel-art bitmaps (`_ICON_SPRITES` + `_ICON_ALIASES`);
+  an unknown name silently falls back to `DEFAULT`. List valid names with
+  `IconRenderer.list_icons()`.
+- Unified chrome geometry (`ui/theme.py`): 1px border `(1,1)-(126,62)`, unified top
+  header bar `y=2..12` + divider `y=13`, dotted footer divider `y=51` + hints `y=52..61`.
+- Hero card geometry: clean top area without menu-name header bar, pagination dots
+  in top-right (or `N/M` if >10), sleek 1px-stroke 20x20 icon centred at `(64, 24)`
+  with `< >` side chevrons when >1 card, uppercase title centred at `y=46` fitted by
+  real pixel width.
 - `KeyboardInputView` is an alias of `VirtualKeyboardInputView`; both are re-exported
   from `ui/display.py` and `ui/keyboard_view.py`.
 
