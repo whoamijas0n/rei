@@ -89,8 +89,10 @@ at least `Pillow`) before trusting a test run. The QR tests additionally need
 | `core/usb_modes.py` | USB gadget ConfigFS script generator |
 | `core/wifi.py` | `nmcli` / `wpa_cli` Wi-Fi scan + connect |
 | `core/pisugar.py` | PiSugar 3 UPS telemetry (I2C / sysfs / socket / simulated) |
+| `core/serial_console.py` | Serial port discovery (`/dev/ttyUSB*`, `/dev/ttyACM*`), auto-baud & passive vendor detection |
 | `core/errors.py` | `NoticeLevel`, `FormattedNotice`, `format_oled_error` — traducción de errores a avisos OLED |
-| `plugins/endpoints/` | **Only** the HID endpoint plugins: `hid_windows.py`, `hid_linux.py` |
+| `plugins/endpoints/` | HID endpoint plugins: `hid_windows.py`, `hid_linux.py` |
+| `plugins/switches/` | Switch CLI profiles (`base.py`, `cisco_ios.py`, `tplink_jetstream.py`, `generic_serial.py`) |
 | `ui/display.py` | `ScreenManager`, `HeroCardDeckView`, `DetailCardView`, `NoticeView`, `UpdateProgressView`, `QRCodeView` |
 | `ui/icons.py` | `IconRenderer` — librería de iconos pixel-art 20x20 monocromáticos cacheados |
 | `ui/theme.py` | Sistema visual OLED (cabecera/pie unificados, ajuste de texto en píxeles, badges, spinner, scrollbar) |
@@ -98,6 +100,7 @@ at least `Pillow`) before trusting a test run. The QR tests additionally need
 | `ui/keyboard_view.py` | Virtual on-screen keyboard (`VirtualKeyboardInputView`) |
 | `ui/keyboard_layouts.py` | USB keyboard layout detection + US/ES/Latam scancode maps |
 | `ui/wifi_password_view.py` | `WiFiPasswordView` — USB-keyboard Wi-Fi password entry |
+| `ui/console_auth_view.py` | `ConsoleCredentialView` — USB-keyboard console serial credentials (user/password/optional enable) |
 | `install.sh` | APT packages, `.venv`, systemd units, USB gadget setup; `do_install` / `do_uninstall` |
 | `splash.py` | Standalone early-boot splash (runs as `rei-splash.service`) |
 
@@ -120,12 +123,13 @@ for view routing), `status` (`DiagnosticStatus`), `overall_status` (`Severity`),
 ## Stubs vs. real implementations
 
 `core/plugins.py` contains several plugins that are **stubs**: they `time.sleep()` and
-return literal strings without touching hardware — `CiscoSerialPlugin`, `CiscoSSHPlugin`,
-`SNMPScanPlugin`, `WindowsRNDISPlugin`, `LinuxSSHPlugin`, `VaultPlugin`. `netmiko`,
-`scrapli`, `pysnmp-lextudio` and `pypsrp` are in `requirements.txt` but **unused**.
+return literal strings without touching hardware — `CiscoSSHPlugin`,
+`SNMPScanPlugin`, `WindowsRNDISPlugin`, `LinuxSSHPlugin`, `VaultPlugin`. `scrapli`,
+`pysnmp-lextudio` and `pypsrp` are in `requirements.txt` but **unused**.
 
-Real I/O happens only in: `core/wifi.py`, `core/web_server.py`, `core/gemini_analyzer.py`,
-`core/ducky.py`, `core/usb_modes.py`, `core/pisugar.py`, and the update plugins
+Real I/O happens in: `core/wifi.py`, `core/web_server.py`, `core/gemini_analyzer.py`,
+`core/ducky.py`, `core/usb_modes.py`, `core/pisugar.py`, `core/serial_console.py` +
+`plugins/switches/` (`CiscoSerialPlugin` via `pyserial` + `netmiko`), and the update plugins
 (`apt-get` / `git pull`). Don't assume a plugin talks to the network because its name
 suggests it — read its `run()`.
 
@@ -218,8 +222,9 @@ typing must not be mistaken for the current run.
 ## Dry-run / simulation
 
 `REI_DRY_RUN=1` is the master switch — it stubs HID injection, USB gadget scripting,
-poweroff/reboot, apt/git updates and Wi-Fi scan/connect. Narrower overrides:
-`REI_MOCK_POWER=1`, `REI_MOCK_WIFI=1`, `REI_MOCK_UPDATES=1`.
+poweroff/reboot, apt/git updates, serial console probing/collection and Wi-Fi scan/connect.
+Narrower overrides: `REI_MOCK_POWER=1`, `REI_MOCK_WIFI=1`, `REI_MOCK_UPDATES=1`,
+`REI_MOCK_SERIAL=1` (with optional `REI_MOCK_SERIAL_SCENARIO`).
 
 **Always** use `REI_DRY_RUN=1` when running `main.py` on a non-Pi machine; otherwise the
 update plugins will really run `apt-get` and `git pull`, and the power plugins can really

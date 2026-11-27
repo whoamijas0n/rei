@@ -46,9 +46,11 @@ from core.web_server import REIWebServer
 from core.wifi import WiFiManager
 from plugins.endpoints.hid_linux import LinuxHIDPlugin
 from plugins.endpoints.hid_windows import WindowsHIDPlugin
+from plugins.switches import DEFAULT_SWITCH_REGISTRY, SWITCH_MENU_CATEGORIES
 from ui.display import (
     BatteryTelemetryView,
     ConfirmDialogView,
+    ConsoleCredentialView,
     DetailCardView,
     DetailHero,
     DetailPage,
@@ -175,7 +177,7 @@ class REIApp:
             WiFiForgetPlugin(wifi_mgr=self.wifi_manager),
             BatteryStatusPlugin(),
             SystemStatusPlugin(),
-            CiscoSerialPlugin(),
+            CiscoSerialPlugin(web_server=self.web_server),
             CiscoSSHPlugin(),
             SNMPScanPlugin(),
             WindowsRNDISPlugin(),
@@ -368,13 +370,28 @@ class REIApp:
         def worker_ai() -> None:
             try:
                 report_id = result.metadata.get("report_id", "latest")
-                latest_report = self.web_server.get_latest_report()
-                payload = {
-                    "os_type": result.metadata.get("os_type", "PC"),
-                    "category": result.summary,
-                    "hostname": getattr(latest_report, "hostname", "Host Remoto"),
-                    "telemetry": getattr(latest_report, "telemetry", {}),
+                stored_report = (
+                    self.web_server.get_report(report_id)
+                    if hasattr(self.web_server, "get_report")
+                    else self.web_server.get_latest_report()
+                )
+                if stored_report is None:
+                    stored_report = self.web_server.get_latest_report()
+
+                telemetry_obj = getattr(stored_report, "telemetry", {}) if stored_report else {}
+                switch_audit_obj = getattr(stored_report, "switch_audit", None) if stored_report else None
+                if not switch_audit_obj and isinstance(result.metrics, dict):
+                    switch_audit_obj = result.metrics.get("switch_audit")
+
+                payload: Dict[str, Any] = {
+                    "device_kind": result.metadata.get("device_kind", "ENDPOINT"),
+                    "os_type": result.metadata.get("os_type") or getattr(stored_report, "os_type", "PC"),
+                    "category": result.metadata.get("category_label") or result.summary,
+                    "hostname": result.metadata.get("hostname") or getattr(stored_report, "hostname", "Host Remoto"),
+                    "telemetry": telemetry_obj,
                 }
+                if switch_audit_obj:
+                    payload["switch_audit"] = switch_audit_obj
 
                 ai_res = self.gemini_analyzer.analyze_diagnostic(payload)
                 result.ai_analysis = ai_res
@@ -426,6 +443,206 @@ class REIApp:
             alt_label=alt_label,
         )
         self.screen_manager.push_view(qr_view)
+
+    # =========================================================================
+    # SWITCH CONSOLE SERIAL DIAGNOSTIC ORCHESTRATION (AUTO/MANUAL + AUTH + QR)
+    # =========================================================================
+
+    def _start_switch_serial_diagnostic(
+        self,
+        profile_id: Optional[str] = None,
+        category: str = "GENERAL",
+        credentials: Optional[Dict[str, str]] = None,
+        probe_hint: Optional[Dict[str, Any]] = None,
+        skip_enable: bool = False,
+    ) -> None:
+        """
+        Orquesta el diagnóstico de switches por consola serial:
+        1. Valida que el puerto OTG no esté bloqueado en modo USB HID Gadget.
+        2. Muestra UpdateProgressView bloqueante durante detección y recolección.
+        3. Si el switch exige login o clave enable, abre ConsoleCredentialView por teclado USB.
+        4. Al completar, presenta POST-DIAGNOSTICO (ANALISIS CON IA / INFORME SIN IA -> QR).
+        """
+        if self._is_usb_gadget_blocking_host():
+            logger.warning("Consola serial bloqueada: USB OTG en modo HID Gadget.")
+            self.screen_manager.push_view(
+                NoticeView(
+                    title="MODO HID ACTIVO",
+                    lines=[
+                        "USB en modo HID.",
+                        "Cambie a MODO USB",
+                        "NORMAL en Utilidades.",
+                    ],
+                    level=NoticeLevel.WARNING,
+                )
+            )
+            return
+
+        logger.info(
+            f"Iniciando diagnostico consola serial (perfil={profile_id or 'AUTO'}, "
+            f"categoria={category}, skip_enable={skip_enable})"
+        )
+        progress_view = UpdateProgressView(title="CONSOLA SERIAL")
+        progress_view.stage_message = "Buscando cable serial..."
+        progress_view.progress = 0.05
+        progress_view.is_running = True
+        progress_view.is_finished = False
+        self.screen_manager.push_view(progress_view)
+
+        def on_progress(msg: str, pct: float) -> None:
+            progress_view.set_progress(msg, pct)
+
+        def on_serial_finished(result: DiagnosticResult) -> None:
+            def finish_on_ui() -> None:
+                meta = result.metadata if isinstance(result.metadata, dict) else {}
+                if meta.get("auth_required"):
+                    if self.screen_manager.current_view is progress_view:
+                        self.screen_manager.pop_view()
+                    self._open_console_auth_flow(
+                        auth_stage=str(meta.get("auth_stage") or "password"),
+                        probe_hint=meta.get("probe") or probe_hint,
+                        profile_id=profile_id,
+                        category=category,
+                        existing_credentials=dict(credentials or {}),
+                    )
+                    return
+
+                if result.status != DiagnosticStatus.SUCCESS:
+                    progress_view.set_completed(
+                        success=False,
+                        summary=result.summary or "Error consola serial",
+                        details=result.details if result.details else ["No se pudo consultar el switch."],
+                    )
+                    return
+
+                if self.screen_manager.current_view is progress_view:
+                    self.screen_manager.pop_view()
+                self._display_post_diagnostic_menu(
+                    result=result,
+                    os_type=str(meta.get("os_type") or "SWITCH"),
+                    layout="serial",
+                    category=str(meta.get("category_label") or category),
+                )
+
+            self._schedule_ui(finish_on_ui)
+
+        started = self.diag_manager.execute_async(
+            plugin_id="diag_cisco_serial",
+            on_complete=on_serial_finished,
+            on_progress=on_progress,
+            profile_id=profile_id,
+            category=category,
+            credentials=credentials,
+            probe_hint=probe_hint,
+            skip_enable=skip_enable,
+        )
+        if not started:
+            progress_view.set_completed(
+                success=False,
+                summary="Consola ocupada",
+                details=["Hay otro diagnostico serial", "en curso. Espere un momento."],
+            )
+
+    def _open_console_auth_flow(
+        self,
+        auth_stage: str,
+        probe_hint: Optional[Dict[str, Any]],
+        profile_id: Optional[str],
+        category: str,
+        existing_credentials: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Abre vistas ConsoleCredentialView encadenadas por teclado físico USB."""
+        if hasattr(self.input_handler, "request_keyboard_rescan"):
+            self.input_handler.request_keyboard_rescan()
+
+        creds = dict(existing_credentials or {})
+        kb_status = getattr(self.input_handler, "has_typing_input", None)
+        kb_cb = kb_status if callable(kb_status) else None
+        layout_cb = lambda: getattr(self.input_handler, "keyboard_layout", "latam")
+        hid_blocking = self._is_usb_gadget_blocking_host()
+
+        def open_password_step() -> None:
+            def on_pw_submit(password: str) -> None:
+                creds["password"] = password
+                if isinstance(self.screen_manager.current_view, ConsoleCredentialView):
+                    self.screen_manager.pop_view()
+                self._start_switch_serial_diagnostic(
+                    profile_id=profile_id,
+                    category=category,
+                    credentials=creds,
+                    probe_hint=probe_hint,
+                )
+
+            pw_view = ConsoleCredentialView(
+                title="CONSOLA: CLAVE",
+                field_label="Clave",
+                masked=True,
+                allow_empty=False,
+                keyboard_status=kb_cb,
+                layout_provider=layout_cb,
+                usb_gadget_active=hid_blocking,
+                on_submit=on_pw_submit,
+            )
+            self.screen_manager.push_view(pw_view)
+
+        if auth_stage == "username":
+            def on_user_submit(username: str) -> None:
+                creds["username"] = username
+                if isinstance(self.screen_manager.current_view, ConsoleCredentialView):
+                    self.screen_manager.pop_view()
+                open_password_step()
+
+            user_view = ConsoleCredentialView(
+                title="CONSOLA: USUARIO",
+                field_label="Usuario",
+                masked=False,
+                allow_empty=False,
+                keyboard_status=kb_cb,
+                layout_provider=layout_cb,
+                usb_gadget_active=hid_blocking,
+                on_submit=on_user_submit,
+            )
+            self.screen_manager.push_view(user_view)
+            return
+
+        if auth_stage == "enable":
+            def on_enable_submit(secret: str) -> None:
+                if isinstance(self.screen_manager.current_view, ConsoleCredentialView):
+                    self.screen_manager.pop_view()
+                if secret:
+                    creds["enable_secret"] = secret
+                    self._start_switch_serial_diagnostic(
+                        profile_id=profile_id,
+                        category=category,
+                        credentials=creds,
+                        probe_hint=probe_hint,
+                        skip_enable=False,
+                    )
+                else:
+                    # ENTER vacío: continuar en modo lectura (>) sin abortar el diagnóstico
+                    self._start_switch_serial_diagnostic(
+                        profile_id=profile_id,
+                        category=category,
+                        credentials=creds,
+                        probe_hint=probe_hint,
+                        skip_enable=True,
+                    )
+
+            enable_view = ConsoleCredentialView(
+                title="CLAVE ENABLE",
+                field_label="Enable",
+                masked=True,
+                allow_empty=True,
+                placeholder="Enter=solo lectura",
+                keyboard_status=kb_cb,
+                layout_provider=layout_cb,
+                usb_gadget_active=hid_blocking,
+                on_submit=on_enable_submit,
+            )
+            self.screen_manager.push_view(enable_view)
+            return
+
+        open_password_step()
 
     # =========================================================================
     # USB MODES SWITCHING ORCHESTRATION
@@ -1363,19 +1580,58 @@ class REIApp:
         deck_utilidades.add_card(HeroCard(title="ALIMENTACION", icon_name="POWER", submenu=deck_alimentacion))
 
         # ----------------------------------------------------
-        # LEVEL 1: Sub-menus for SWITCHES / RED
+        # LEVEL 1: Sub-menus for SWITCHES
         # ----------------------------------------------------
-        view_serial_detail = self._create_detail_view("diag_cisco_serial", "CISCO SERIAL")
+        def create_switch_category_deck(profile_id: Optional[str]) -> HeroCardDeckView:
+            deck = HeroCardDeckView("TIPO PROBLEMA")
+            for cat_key, cat_label, cat_icon in SWITCH_MENU_CATEGORIES:
+                deck.add_card(
+                    HeroCard(
+                        title=cat_label,
+                        icon_name=cat_icon,
+                        on_select=lambda p=profile_id, c=cat_key: self._start_switch_serial_diagnostic(
+                            profile_id=p,
+                            category=c,
+                        ),
+                    )
+                )
+            return deck
+
+        deck_serial_manual = HeroCardDeckView("PERFIL MANUAL")
+        for prof in DEFAULT_SWITCH_REGISTRY.list_profiles():
+            deck_serial_manual.add_card(
+                HeroCard(
+                    title=prof.display_name,
+                    icon_name="SWITCH",
+                    submenu=create_switch_category_deck(profile_id=prof.vendor_id),
+                )
+            )
+
+        deck_consola_serial = HeroCardDeckView("CONSOLA SERIAL")
+        deck_consola_serial.add_card(
+            HeroCard(
+                title="AUTO-DETECTAR",
+                icon_name="SERIAL",
+                submenu=create_switch_category_deck(profile_id=None),
+            )
+        )
+        deck_consola_serial.add_card(
+            HeroCard(
+                title="PERFIL MANUAL",
+                icon_name="TOOLS",
+                submenu=deck_serial_manual,
+            )
+        )
+
         view_cisco_ssh_detail = self._create_detail_view("diag_cisco_ssh", "CISCO SSH")
         view_snmp_detail = self._create_detail_view("diag_snmp_scan", "ESCANER SNMP")
 
-        deck_switches = HeroCardDeckView("SWITCHES / RED")
+        deck_switches = HeroCardDeckView("SWITCHES")
         deck_switches.add_card(
             HeroCard(
-                title="CISCO SERIAL",
+                title="CONSOLA SERIAL",
                 icon_name="SERIAL",
-                submenu=view_serial_detail,
-                on_select=lambda: self._trigger_task("diag_cisco_serial"),
+                submenu=deck_consola_serial,
             )
         )
         deck_switches.add_card(
@@ -1477,7 +1733,7 @@ class REIApp:
         # ----------------------------------------------------
         root_deck = HeroCardDeckView("MAIN")
         root_deck.add_card(HeroCard(title="UTILIDADES", icon_name="TOOLS", submenu=deck_utilidades))
-        root_deck.add_card(HeroCard(title="SWITCHES / RED", icon_name="SWITCH", submenu=deck_switches))
+        root_deck.add_card(HeroCard(title="SWITCHES", icon_name="SWITCH", submenu=deck_switches))
         root_deck.add_card(HeroCard(title="ENDPOINTS PC", icon_name="ENDPOINT", submenu=deck_endpoints))
         root_deck.add_card(
             HeroCard(

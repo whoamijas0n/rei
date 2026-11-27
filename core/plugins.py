@@ -18,7 +18,22 @@ from .errors import format_oled_error
 from .interfaces import IDiagnosticPlugin, DiagnosticResult, DiagnosticStatus, Severity
 from .parser import sanitize_oled_text, shorten_oled_label, wrap_oled_lines
 from .pisugar import PiSugar3Client, PiSugarTelemetry
+from .serial_console import (
+    ConsolePromptState,
+    DEFAULT_BAUDRATES,
+    SerialConsoleManager,
+    SerialPortInfo,
+    SerialProbeResult,
+)
 from .wifi import WiFiErrorCode, WiFiManager, WiFiNetwork
+from plugins.switches import (
+    DEFAULT_SWITCH_REGISTRY,
+    ISwitchProfile,
+    SwitchProfileRegistry,
+    get_mock_cisco_2960s_outputs,
+    get_switch_category_label,
+    normalize_switch_category,
+)
 
 logger = logging.getLogger("REI.Core.Plugins")
 
@@ -666,8 +681,44 @@ class SystemStatusPlugin(IDiagnosticPlugin):
         )
 
 
+try:
+    from netmiko import ConnectHandler as _NetmikoConnectHandler
+    from netmiko.exceptions import (
+        NetmikoAuthenticationException as _NetmikoAuthError,
+        NetmikoTimeoutException as _NetmikoTimeoutError,
+    )
+    NETMIKO_AVAILABLE = True
+except ImportError:
+    _NetmikoConnectHandler = None  # type: ignore
+    _NetmikoAuthError = Exception  # type: ignore
+    _NetmikoTimeoutError = TimeoutError  # type: ignore
+    NETMIKO_AVAILABLE = False
+
+
 class CiscoSerialPlugin(IDiagnosticPlugin):
-    """Tests RS-232 / USB-to-UART Cisco Console interface."""
+    """
+    Plugin unificado de diagnóstico por consola serial para switches gestionables.
+
+    Ejecuta el flujo en 3 fases:
+    1. Detección pasiva de puerto (/dev/ttyUSB* o /dev/ttyACM*), auto-baudrate
+       (9600 -> 115200 -> 38400), estado de prompt y huella pasiva de fabricante.
+    2. Señalización limpia de autenticación requerida (usuario/clave/enable) para
+       captura interactiva por teclado físico USB sin bloquear el bucle de 30 FPS.
+    3. Identificación segura por sonda de solo lectura + recolección Netmiko según
+       el perfil de fabricante y la categoría de problema elegida (ej. GENERAL).
+    """
+
+    def __init__(
+        self,
+        web_server: Optional[Any] = None,
+        serial_manager: Optional[SerialConsoleManager] = None,
+        registry: Optional[SwitchProfileRegistry] = None,
+        connection_factory: Optional[Callable[..., Any]] = None,
+    ):
+        self.web_server = web_server
+        self.serial_manager = serial_manager or SerialConsoleManager()
+        self.registry = registry or DEFAULT_SWITCH_REGISTRY
+        self._connection_factory = connection_factory
 
     @property
     def id(self) -> str:
@@ -675,44 +726,497 @@ class CiscoSerialPlugin(IDiagnosticPlugin):
 
     @property
     def name(self) -> str:
-        return "CISCO SERIAL"
+        return "CONSOLA SERIAL"
 
     @property
     def category(self) -> str:
         return "SWITCHES"
 
-    def run(self, **kwargs) -> DiagnosticResult:
-        time.sleep(0.4)
-        details = [
-            "Baud: 9600 8-N-1",
-            "Puerto: /dev/ttyUSB0",
-            "DSR: ACTIVO | CTS: OK",
-            "Prompt: Switch-2960#"
-        ]
-        detail_pages = [
-            {
-                "title": "CISCO SERIAL",
-                "hero": {"tag": ">", "value": "Switch-2960#"},
-                "rows": [
-                    {"label": "Puerto", "value": "/dev/ttyUSB0"},
-                    {"label": "Baud", "value": "9600 8-N-1"},
-                ],
+    @staticmethod
+    def _severity_from_status(overall_status: str) -> Severity:
+        token = (overall_status or "OK").upper()
+        if token == "CRIT":
+            return Severity.CRITICAL
+        if token == "WARN":
+            return Severity.WARNING
+        return Severity.OK
+
+    @staticmethod
+    def _build_probe_dict(probe: SerialProbeResult) -> Dict[str, Any]:
+        return {
+            "device": probe.port.device if probe.port else "",
+            "port_kind": probe.port.kind if probe.port else "USB_RJ45",
+            "baudrate": probe.baudrate,
+            "prompt_state": probe.prompt_state.value,
+            "banner_text": probe.banner_text,
+            "prompt_line": probe.prompt_line,
+            "detected_vendor": probe.detected_vendor,
+            "hostname_hint": probe.hostname_hint,
+            "signals": dict(probe.signals),
+        }
+
+    @staticmethod
+    def _restore_probe(probe_hint: Dict[str, Any]) -> SerialProbeResult:
+        device = str(probe_hint.get("device") or "/dev/ttyUSB0")
+        port_kind = str(probe_hint.get("port_kind") or "USB_RJ45")
+        raw_state = str(probe_hint.get("prompt_state") or ConsolePromptState.USER_EXEC.value)
+        try:
+            prompt_state = ConsolePromptState(raw_state)
+        except ValueError:
+            prompt_state = ConsolePromptState.USER_EXEC
+
+        return SerialProbeResult(
+            port=SerialPortInfo(device=device, kind=port_kind),
+            baudrate=int(probe_hint.get("baudrate") or 9600),
+            prompt_state=prompt_state,
+            banner_text=str(probe_hint.get("banner_text") or ""),
+            prompt_line=str(probe_hint.get("prompt_line") or ""),
+            detected_vendor=probe_hint.get("detected_vendor"),
+            hostname_hint=str(probe_hint.get("hostname_hint") or ""),
+            signals=dict(probe_hint.get("signals") or {}),
+        )
+
+    def _open_netmiko_connection(
+        self,
+        profile: ISwitchProfile,
+        probe: SerialProbeResult,
+        credentials: Dict[str, str],
+    ) -> Any:
+        device = probe.port.device if probe.port else "/dev/ttyUSB0"
+        params: Dict[str, Any] = {
+            "device_type": profile.netmiko_device_type,
+            "username": credentials.get("username", ""),
+            "password": credentials.get("password", ""),
+            "secret": credentials.get("enable_secret", ""),
+            "fast_cli": False,
+            "conn_timeout": 15,
+            "banner_timeout": 15,
+            "read_timeout_override": 20.0,
+            "serial_settings": {
+                "port": device,
+                "baudrate": probe.baudrate,
+                "bytesize": 8,
+                "parity": "N",
+                "stopbits": 1,
+                "timeout": 2.0,
             },
-            {
-                "title": "SENALES",
-                "rows": [
-                    {"label": "DSR", "value": "ACTIVO"},
-                    {"label": "CTS", "value": "OK"},
-                ],
-            },
-        ]
+        }
+        if self._connection_factory is not None:
+            return self._connection_factory(**params)
+        if not NETMIKO_AVAILABLE or _NetmikoConnectHandler is None:
+            raise RuntimeError("La libreria netmiko no esta instalada en el entorno.")
+        return _NetmikoConnectHandler(**params)
+
+    def _resolve_profile_after_connect(
+        self,
+        conn: Any,
+        manual_profile: Optional[ISwitchProfile],
+        passive_profile: Optional[ISwitchProfile],
+        progress_cb: Optional[Callable[[str, float], None]],
+    ) -> Tuple[ISwitchProfile, Dict[str, str]]:
+        """Fase 3a: si la marca aún no se conoce, envía 1-2 sondas inofensivas y cachea su salida."""
+        if manual_profile is not None:
+            return manual_profile, {}
+        if passive_profile is not None:
+            return passive_profile, {}
+
+        if progress_cb:
+            progress_cb("Identificando marca...", 0.32)
+
+        probe_cmds = ("show version", "show system-info", "display version")
+        combined_output: List[str] = []
+        prefetched: Dict[str, str] = {}
+        for cmd in probe_cmds:
+            try:
+                out = str(conn.send_command(cmd, read_timeout=15) or "")
+            except Exception as ex:
+                logger.debug(f"Sonda segura '{cmd}' sin exito: {ex}")
+                continue
+            if not out.strip():
+                continue
+            prefetched[cmd] = out
+            combined_output.append(out)
+            detected = self.registry.detect_from_probe(out)
+            if detected.vendor_id != "generic":
+                return detected, prefetched
+
+        return self.registry.detect_from_probe("\n".join(combined_output)), prefetched
+
+    def _run_mock_audit(
+        self,
+        profile: ISwitchProfile,
+        probe: SerialProbeResult,
+        norm_cat: str,
+        is_privileged: bool,
+        progress_cb: Optional[Callable[[str, float], None]],
+    ) -> DiagnosticResult:
+        """Ejecuta los parsers reales sobre salidas simuladas en DRY-RUN / MOCK."""
+        if progress_cb:
+            progress_cb("Leyendo interfaces...", 0.55)
+        time.sleep(0.10)
+        if progress_cb:
+            progress_cb("Revisando PoE y salud...", 0.78)
+        time.sleep(0.10)
+
+        if profile.vendor_id == "cisco_ios":
+            outputs = get_mock_cisco_2960s_outputs()
+            if not is_privileged:
+                outputs = {k: v for k, v in outputs.items() if k != "logging"}
+        elif profile.vendor_id == "tplink_jetstream":
+            outputs = {
+                "version": (
+                    "System Name: SW-TPLINK-LAB\n"
+                    "Hardware Version: TL-SG3428MP 2.0\n"
+                    "Firmware Version: 2.0.5 Build 20230510\n"
+                    "Running Time: 12 days 04:15:22\n"
+                ),
+                "interfaces_status": "Gi1/0/1 LinkUp 1000M Full\n",
+                "vlans": "1 default active\n",
+                "stp": "Spanning Tree enabled (RSTP)\n",
+            }
+        else:
+            outputs = {
+                "version": "Switch Generico CLI v1.0 (Simulado)\n",
+                "interfaces_status": "Port 1 UP 1000Mbps\n",
+                "vlans": "VLAN 1 Default\n",
+            }
+
+        ctx = {
+            "category": norm_cat,
+            "is_privileged": is_privileged,
+            "hostname_hint": probe.hostname_hint,
+            "port_device": probe.port.device if probe.port else "/dev/ttyUSB0",
+            "port_kind": probe.port.kind if probe.port else "USB_RJ45",
+            "baudrate": probe.baudrate,
+            "signals": dict(probe.signals),
+            "skipped_privileged": ["show logging"] if not is_privileged else [],
+        }
+        outcome = profile.parse_outputs(outputs, context=ctx)
+        return self._finalize_outcome(outcome, progress_cb=progress_cb)
+
+    def _finalize_outcome(
+        self,
+        outcome: Any,
+        progress_cb: Optional[Callable[[str, float], None]] = None,
+    ) -> DiagnosticResult:
+        """Registra el informe en REIWebServer y arma el DiagnosticResult final."""
+        report_id = "latest"
+        if self.web_server is not None and hasattr(self.web_server, "store_local_report"):
+            try:
+                report_id = self.web_server.store_local_report(
+                    os_type=f"SWITCH_{outcome.vendor_id.upper()}",
+                    category=get_switch_category_label(outcome.category),
+                    hostname=outcome.hostname,
+                    telemetry={
+                        "device_kind": "SWITCH",
+                        "vendor_id": outcome.vendor_id,
+                        "vendor_name": outcome.vendor_name,
+                        "category": outcome.category,
+                        "switch_audit": outcome.switch_audit,
+                    },
+                    overall_status=outcome.overall_status,
+                    switch_audit=outcome.switch_audit,
+                )
+            except Exception as ex:
+                logger.warning(f"No se pudo almacenar el reporte local del switch: {ex}")
+
+        if progress_cb:
+            progress_cb("Diagnostico completado", 1.0)
+
         return DiagnosticResult(
             plugin_name=self.name,
+            target_identifier=outcome.hostname,
             status=DiagnosticStatus.SUCCESS,
-            summary="Consola Serial OK",
-            details=details,
-            metrics={"detail_pages": detail_pages},
+            overall_status=self._severity_from_status(outcome.overall_status),
+            summary=outcome.summary,
+            details=outcome.details,
+            metrics={
+                "detail_pages": outcome.detail_pages,
+                "switch_audit": outcome.switch_audit,
+            },
+            metadata={
+                "report_id": report_id,
+                "device_kind": "SWITCH",
+                "os_type": f"SWITCH_{outcome.vendor_id.upper()}",
+                "vendor_id": outcome.vendor_id,
+                "vendor_name": outcome.vendor_name,
+                "category": outcome.category,
+                "category_label": get_switch_category_label(outcome.category),
+                "hostname": outcome.hostname,
+            },
         )
+
+    def run(
+        self,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+        profile_id: Optional[str] = None,
+        category: str = "GENERAL",
+        credentials: Optional[Dict[str, str]] = None,
+        probe_hint: Optional[Dict[str, Any]] = None,
+        skip_enable: bool = False,
+        **kwargs: Any,
+    ) -> DiagnosticResult:
+        """Ejecuta el flujo completo de diagnóstico por consola serial."""
+        def report_progress(msg: str, pct: float) -> None:
+            if progress_callback:
+                try:
+                    progress_callback(msg, pct)
+                except Exception:
+                    pass
+
+        norm_cat = normalize_switch_category(category)
+        creds = dict(credentials or {})
+        manual_profile = self.registry.get(profile_id) if profile_id else None
+        baudrates = manual_profile.preferred_baudrates if manual_profile else DEFAULT_BAUDRATES
+
+        # -----------------------------------------------------------------
+        # FASE 1: Detección pasiva de puerto, baudrate, prompt y marca
+        # -----------------------------------------------------------------
+        if probe_hint:
+            probe = self._restore_probe(probe_hint)
+            report_progress(f"Reconectando {probe.baudrate} bps...", 0.22)
+        else:
+            probe = self.serial_manager.auto_probe(
+                baudrates=baudrates,
+                progress_cb=report_progress,
+            )
+
+        if not probe.is_responsive:
+            err_msg = probe.error or "Sin respuesta del switch en consola serial."
+            logger.warning(
+                f"Consola serial sin respuesta (profile={profile_id or 'auto'}, cat={norm_cat}): {err_msg}"
+            )
+            formatted = format_oled_error(err_msg, fallback_title="SIN CONSOLA")
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                overall_status=Severity.CRITICAL,
+                summary=formatted.title,
+                details=formatted.lines,
+                metadata={
+                    "device_kind": "SWITCH",
+                    "category": norm_cat,
+                    "error": err_msg,
+                },
+            )
+
+        # Identificación pasiva del perfil (si no se seleccionó perfil manual)
+        passive_profile: Optional[ISwitchProfile] = None
+        if manual_profile is None:
+            if probe.detected_vendor:
+                passive_profile = self.registry.get(probe.detected_vendor)
+            if passive_profile is None:
+                passive_profile = self.registry.detect_passive(probe.banner_text, probe.prompt_line)
+
+        # -----------------------------------------------------------------
+        # FASE 2: Verificar si el switch exige autenticación interactiva
+        # -----------------------------------------------------------------
+        if probe.prompt_state == ConsolePromptState.LOGIN_USERNAME and not creds.get("username"):
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.WARNING,
+                overall_status=Severity.INFO,
+                summary="Requiere usuario",
+                details=["El switch solicita usuario", "y clave de consola."],
+                metadata={
+                    "auth_required": True,
+                    "auth_stage": "username",
+                    "probe": self._build_probe_dict(probe),
+                    "profile_id": profile_id,
+                    "category": norm_cat,
+                },
+            )
+
+        if probe.prompt_state == ConsolePromptState.LOGIN_PASSWORD and not creds.get("password"):
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.WARNING,
+                overall_status=Severity.INFO,
+                summary="Requiere clave",
+                details=["El switch solicita clave", "de consola."],
+                metadata={
+                    "auth_required": True,
+                    "auth_stage": "password",
+                    "probe": self._build_probe_dict(probe),
+                    "profile_id": profile_id,
+                    "category": norm_cat,
+                },
+            )
+
+        # -----------------------------------------------------------------
+        # FASE 3: Recolección solo lectura (Simulación o Netmiko real)
+        # -----------------------------------------------------------------
+        if self.serial_manager.is_mock_mode() and self._connection_factory is None:
+            # En simulación con prompt USER_EXEC, respetar el flujo opcional de enable
+            if (
+                probe.prompt_state == ConsolePromptState.USER_EXEC
+                and not creds.get("enable_secret")
+                and not skip_enable
+                and os.getenv("REI_MOCK_SERIAL_SCENARIO", "").strip().lower() == "cisco_user"
+            ):
+                return DiagnosticResult(
+                    plugin_name=self.name,
+                    status=DiagnosticStatus.WARNING,
+                    overall_status=Severity.INFO,
+                    summary="Clave enable opcional",
+                    details=["Switch en modo lectura (>).", "Ingrese enable o Enter."],
+                    metadata={
+                        "auth_required": True,
+                        "auth_stage": "enable",
+                        "probe": self._build_probe_dict(probe),
+                        "profile_id": profile_id,
+                        "category": norm_cat,
+                    },
+                )
+
+            selected = manual_profile or passive_profile or self.registry.get("cisco_ios") or self.registry.get_fallback()
+            is_priv = probe.is_privileged or bool(creds.get("enable_secret"))
+            return self._run_mock_audit(
+                profile=selected,
+                probe=probe,
+                norm_cat=norm_cat,
+                is_privileged=is_priv,
+                progress_cb=report_progress,
+            )
+
+        active_profile = manual_profile or passive_profile or self.registry.get("cisco_ios") or self.registry.get_fallback()
+        conn = None
+        secrets_to_scrub = (creds.get("password"), creds.get("enable_secret"))
+
+        try:
+            report_progress("Abriendo sesion CLI...", 0.28)
+            conn = self._open_netmiko_connection(active_profile, probe, creds)
+
+            # Comprobar privilegios (# vs >) e intentar enable de forma no destructiva
+            is_privileged = probe.is_privileged
+            if hasattr(conn, "check_enable_mode"):
+                try:
+                    is_privileged = bool(conn.check_enable_mode())
+                except Exception:
+                    is_privileged = probe.is_privileged
+
+            if not is_privileged and not skip_enable and hasattr(conn, "enable"):
+                try:
+                    conn.enable()
+                    is_privileged = True
+                except (ValueError, _NetmikoAuthError, _NetmikoTimeoutError) as en_ex:
+                    logger.info(f"Switch requiere clave enable o rechazo enable ({en_ex}).")
+                    if not creds.get("enable_secret"):
+                        return DiagnosticResult(
+                            plugin_name=self.name,
+                            status=DiagnosticStatus.WARNING,
+                            overall_status=Severity.INFO,
+                            summary="Clave enable opcional",
+                            details=["Switch en modo lectura (>).", "Ingrese enable o Enter."],
+                            metadata={
+                                "auth_required": True,
+                                "auth_stage": "enable",
+                                "probe": self._build_probe_dict(probe),
+                                "profile_id": profile_id,
+                                "category": norm_cat,
+                            },
+                        )
+                    is_privileged = False
+
+            # Fase 3a: Si no se conoció marca pasivamente, sondear con comandos seguros
+            resolved_profile, prefetched_outputs = self._resolve_profile_after_connect(
+                conn=conn,
+                manual_profile=manual_profile,
+                passive_profile=passive_profile,
+                progress_cb=report_progress,
+            )
+            logger.info(
+                f"Perfil serial resuelto: {resolved_profile.vendor_id} "
+                f"(puerto={probe.port.device if probe.port else 'N/D'}, "
+                f"baud={probe.baudrate}, priv={is_privileged}, cat={norm_cat})"
+            )
+
+            ctx = {
+                "category": norm_cat,
+                "is_privileged": is_privileged,
+                "hostname_hint": probe.hostname_hint,
+                "port_device": probe.port.device if probe.port else "/dev/ttyUSB0",
+                "port_kind": probe.port.kind if probe.port else "USB_RJ45",
+                "baudrate": probe.baudrate,
+                "signals": dict(probe.signals),
+            }
+
+            outcome = resolved_profile.collect_audit(
+                connection=conn,
+                category=norm_cat,
+                is_privileged=is_privileged,
+                progress_cb=report_progress,
+                context=ctx,
+                secrets_to_scrub=secrets_to_scrub,
+                prefetched_outputs=prefetched_outputs,
+            )
+            logger.info(
+                f"Diagnostico serial completado: {outcome.hostname} ({outcome.overall_status})"
+            )
+            return self._finalize_outcome(outcome, progress_cb=report_progress)
+
+        except _NetmikoAuthError as auth_ex:
+            # Si aún no se solicitaron credenciales (ej. Fase 1 devolvió UNKNOWN_PROMPT
+            # por un banner largo), redirigir al teclado USB en lugar de fallar directo.
+            if not creds.get("username") and not creds.get("password"):
+                err_low = str(auth_ex).lower()
+                stage = "password" if ("password" in err_low and "username" not in err_low) else "username"
+                logger.info(
+                    f"Netmiko solicito autenticacion sin credenciales previas -> pidiendo {stage}"
+                )
+                return DiagnosticResult(
+                    plugin_name=self.name,
+                    status=DiagnosticStatus.WARNING,
+                    overall_status=Severity.INFO,
+                    summary="Credenciales requeridas",
+                    details=["El switch solicita acceso", "por consola serial."],
+                    metadata={
+                        "auth_required": True,
+                        "auth_stage": stage,
+                        "probe": self._build_probe_dict(probe),
+                        "profile_id": profile_id,
+                        "category": norm_cat,
+                    },
+                )
+            logger.warning(f"Autenticacion serial rechazada por el switch: {auth_ex}")
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                overall_status=Severity.CRITICAL,
+                summary="AUTH FALLIDA",
+                details=["Usuario o clave de consola", "rechazados por el switch."],
+                metadata={
+                    "device_kind": "SWITCH",
+                    "category": norm_cat,
+                    "auth_failed": True,
+                },
+            )
+        except (_NetmikoTimeoutError, TimeoutError):
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                overall_status=Severity.CRITICAL,
+                summary="TIMEOUT CONSOLA",
+                details=["El switch tardo demasiado", "en responder por serial."],
+                metadata={"device_kind": "SWITCH", "category": norm_cat},
+            )
+        except (OSError, RuntimeError) as ex:
+            logger.error(f"Error en sesion serial con switch: {ex}")
+            formatted = format_oled_error(ex, fallback_title="ERROR SERIAL")
+            return DiagnosticResult(
+                plugin_name=self.name,
+                status=DiagnosticStatus.FAILED,
+                overall_status=Severity.CRITICAL,
+                summary=formatted.title,
+                details=formatted.lines,
+                metadata={"device_kind": "SWITCH", "category": norm_cat},
+            )
+        finally:
+            if conn is not None and hasattr(conn, "disconnect"):
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
 
 
 class CiscoSSHPlugin(IDiagnosticPlugin):

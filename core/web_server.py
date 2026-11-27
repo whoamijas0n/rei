@@ -49,6 +49,7 @@ class StoredReport:
         self.hardware_audit = data.get("hardware_audit") or self.telemetry.get("hardware_audit", {})
         self.malware_audit = data.get("malware_audit") or self.telemetry.get("malware_audit", {})
         self.osi_network = data.get("osi_network") or self.telemetry.get("osi_network") or self.telemetry.get("osi", {})
+        self.switch_audit = data.get("switch_audit") or self.telemetry.get("switch_audit", {})
         self.ai_analysis: Optional[Dict[str, Any]] = None
         self.overall_status = "OK"
 
@@ -64,6 +65,7 @@ class StoredReport:
             "hardware_audit": self.hardware_audit,
             "malware_audit": self.malware_audit,
             "osi_network": self.osi_network,
+            "switch_audit": self.switch_audit,
             "telemetry": self.telemetry,
             "metrics": self.metrics,
             "ai_analysis": self.ai_analysis,
@@ -207,6 +209,7 @@ class REIWebServer:
         hardware_audit: Optional[Dict[str, Any]] = None,
         malware_audit: Optional[Dict[str, Any]] = None,
         osi_network: Optional[Dict[str, Any]] = None,
+        switch_audit: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Stores a report constructed locally by REI and returns its report_id."""
         report_id = str(uuid.uuid4())[:8]
@@ -221,6 +224,7 @@ class REIWebServer:
                 "hardware_audit": hardware_audit or (telemetry.get("hardware_audit", {}) if isinstance(telemetry, dict) else {}),
                 "malware_audit": malware_audit or (telemetry.get("malware_audit", {}) if isinstance(telemetry, dict) else {}),
                 "osi_network": osi_network or (telemetry.get("osi_network") or telemetry.get("osi", {}) if isinstance(telemetry, dict) else {}),
+                "switch_audit": switch_audit or (telemetry.get("switch_audit", {}) if isinstance(telemetry, dict) else {}),
             },
         )
         stored.overall_status = overall_status
@@ -233,6 +237,8 @@ class REIWebServer:
             stored.malware_audit = malware_audit
         if osi_network:
             stored.osi_network = osi_network
+        if switch_audit:
+            stored.switch_audit = switch_audit
 
         with self._lock:
             self._reports[report_id] = stored

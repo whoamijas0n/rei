@@ -1692,6 +1692,7 @@ class QRCodeView(BaseView):
 # Re-exportación de vistas de teclado para retrocompatibilidad
 from .keyboard_view import KeyboardLayer, VirtualKeyboardInputView
 from .wifi_password_view import WiFiPasswordView
+from .console_auth_view import ConsoleCredentialView
 
 KeyboardInputView = VirtualKeyboardInputView
 

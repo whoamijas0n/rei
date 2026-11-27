@@ -222,20 +222,27 @@ def _format_category(raw_category: str) -> str:
         "HARDWARE": "Auditoría de hardware",
         "MALWARE": "Seguridad y amenazas",
         "LOGS": "Registros del sistema",
-        "GENERAL": "Diagnóstico general",
+        "GENERAL": "Problemas generales",
+        "PROBLEMAS GENERALES": "Problemas generales",
+        "MAC_TABLE": "Tabla de direcciones MAC",
+        "POE": "PoE y energía",
+        "STP": "Spanning Tree / bucles",
     }
     key = str(raw_category or "GENERAL").strip().upper()
     return mapping.get(key, key.capitalize())
 
 
 def _format_os(raw_os: str) -> str:
-    """Normaliza la etiqueta del sistema operativo."""
+    """Normaliza la etiqueta del sistema operativo o plataforma de switch."""
     key = str(raw_os or "Desconocido").strip().upper()
-    if key == "WINDOWS":
-        return "Windows"
-    if key == "LINUX":
-        return "Linux"
-    return str(raw_os or "Desconocido")
+    mapping = {
+        "WINDOWS": "Windows",
+        "LINUX": "Linux",
+        "SWITCH_CISCO_IOS": "Cisco IOS / XE",
+        "SWITCH_TPLINK_JETSTREAM": "TP-Link JetStream",
+        "SWITCH_GENERIC": "Switch Serial",
+    }
+    return mapping.get(key, str(raw_os or "Desconocido"))
 
 
 def _pill(text: str, tone: str = "neutral", icon: Optional[str] = None) -> str:
@@ -294,13 +301,99 @@ def _extract_section_dict(report: Any, attr_name: str, *telemetry_keys: str) -> 
     return {}
 
 
+def _build_switch_vitals(switch_audit: Dict[str, Any]) -> List[str]:
+    """Construye hasta 4 indicadores vitales para informes de switches gestionables."""
+    tiles: List[str] = []
+    ifaces = switch_audit.get("interfaces", {}) if isinstance(switch_audit.get("interfaces"), dict) else {}
+    counts = ifaces.get("counts", {}) if isinstance(ifaces.get("counts"), dict) else {}
+    err_dis = ifaces.get("err_disabled", []) if isinstance(ifaces.get("err_disabled"), list) else []
+    poe = switch_audit.get("poe", {}) if isinstance(switch_audit.get("poe"), dict) else {}
+    health = switch_audit.get("health", {}) if isinstance(switch_audit.get("health"), dict) else {}
+    cpu = health.get("cpu", {}) if isinstance(health.get("cpu"), dict) else {}
+    env = health.get("environment", {}) if isinstance(health.get("environment"), dict) else {}
+
+    # 1. Puertos activos / err-disabled
+    total_ports = counts.get("total")
+    conn_ports = counts.get("connected")
+    if total_ports is not None and conn_ports is not None:
+        tone = "crit" if err_dis else "ok"
+        badge = _pill(f"{len(err_dis)} err-disabled", "crit") if err_dis else _pill("Sin bloqueos", "ok")
+        tiles.append(
+            '<div class="vital-tile">'
+            f'<div class="vital-head"><span class="vital-label">{svg_icon("layers", 15)} Puertos</span>{badge}</div>'
+            f'<div class="vital-primary"><span class="vital-score tone-{tone}">{_esc(conn_ports)}/{_esc(total_ports)}</span> <span class="vital-unit">activos</span></div>'
+            f'<div class="vital-sub">{_esc(f"{counts.get("notconnect", 0)} libres — {counts.get("disabled", 0)} apagados")}</div>'
+            "</div>"
+        )
+
+    # 2. Presupuesto PoE
+    if poe.get("supported") and poe.get("budget_watts"):
+        poe_pct = _safe_float(poe.get("usage_pct")) or 0.0
+        faulty = poe.get("faulty_ports", [])
+        tone = "crit" if faulty else ("warn" if poe_pct >= 85 else "ok")
+        used_w = poe.get("used_watts", 0.0)
+        bud_w = poe.get("budget_watts", 0.0)
+        sub = (
+            f"{len(faulty)} puerto(s) PoE en falla"
+            if faulty
+            else f"{used_w} W / {bud_w} W ({poe.get('active_ports', 0)} equipos)"
+        )
+        tiles.append(
+            '<div class="vital-tile">'
+            f'<div class="vital-head"><span class="vital-label">{svg_icon("battery", 15)} Energía PoE</span>'
+            f'<span class="vital-num tone-{tone}">{poe_pct:g}%</span></div>'
+            f"{_meter(poe_pct, tone)}"
+            f'<div class="vital-sub">{_esc(sub)}</div>'
+            "</div>"
+        )
+
+    # 3. CPU del Switch
+    cpu_5m = _safe_float(cpu.get("cpu_5m"))
+    if cpu_5m is not None:
+        tone = "crit" if cpu_5m >= 85 else ("warn" if cpu_5m >= 70 else "ok")
+        sub = f"5s: {cpu.get('cpu_5s', '-')}% | 1m: {cpu.get('cpu_1m', '-')}% | 5m: {cpu.get('cpu_5m', '-')}%"
+        tiles.append(
+            '<div class="vital-tile">'
+            f'<div class="vital-head"><span class="vital-label">{svg_icon("cpu", 15)} CPU Switch</span>'
+            f'<span class="vital-num tone-{tone}">{cpu_5m:g}%</span></div>'
+            f"{_meter(cpu_5m, tone)}"
+            f'<div class="vital-sub">{_esc(sub)}</div>'
+            "</div>"
+        )
+
+    # 4. Salud física / Temperatura
+    temp_c = env.get("temperature_c")
+    env_issues = env.get("issues", []) if isinstance(env.get("issues"), list) else []
+    if temp_c is not None or env.get("fan_status"):
+        tone = "crit" if env_issues else "ok"
+        label = "Revisar chasis" if env_issues else "Nominal"
+        primary_val = f"{temp_c} °C" if temp_c is not None else str(env.get("temperature_status") or "OK")
+        sub = f"FAN: {env.get('fan_status', 'N/D')} — PSU: {env.get('psu_status', 'N/D')}"
+        tiles.append(
+            '<div class="vital-tile">'
+            f'<div class="vital-head"><span class="vital-label">{svg_icon("thermometer", 15)} Chasis</span>'
+            f'{_pill(label, tone)}</div>'
+            f'<div class="vital-primary"><span class="vital-score tone-{tone}">{_esc(primary_val)}</span></div>'
+            f'<div class="vital-sub">{_esc(sub)}</div>'
+            "</div>"
+        )
+
+    return tiles[:4]
+
+
 def _build_vitals(
     hw_audit: Dict[str, Any],
     osi: Dict[str, Any],
     malware_audit: Dict[str, Any],
     telemetry: Dict[str, Any],
+    switch_audit: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Construye hasta 4 indicadores vitales clave según los datos reales del informe."""
+    if isinstance(switch_audit, dict) and switch_audit:
+        sw_tiles = _build_switch_vitals(switch_audit)
+        if sw_tiles:
+            return sw_tiles
+
     tiles: List[str] = []
 
     # 1. CPU
@@ -1245,12 +1338,248 @@ def _render_security_section(malware_audit: Dict[str, Any]) -> str:
     """
 
 
+def _render_switch_section(switch_audit: Dict[str, Any]) -> str:
+    """Renderiza el panel técnico dedicado para switches gestionables por consola serial."""
+    if not isinstance(switch_audit, dict) or not switch_audit:
+        return ""
+
+    ident = switch_audit.get("identity", {}) if isinstance(switch_audit.get("identity"), dict) else {}
+    conn = switch_audit.get("connection", {}) if isinstance(switch_audit.get("connection"), dict) else {}
+    health = switch_audit.get("health", {}) if isinstance(switch_audit.get("health"), dict) else {}
+    env = health.get("environment", {}) if isinstance(health.get("environment"), dict) else {}
+    cpu = health.get("cpu", {}) if isinstance(health.get("cpu"), dict) else {}
+    mem = health.get("memory", {}) if isinstance(health.get("memory"), dict) else {}
+    poe = switch_audit.get("poe", {}) if isinstance(switch_audit.get("poe"), dict) else {}
+    ifaces = switch_audit.get("interfaces", {}) if isinstance(switch_audit.get("interfaces"), dict) else {}
+    switching = switch_audit.get("switching", {}) if isinstance(switch_audit.get("switching"), dict) else {}
+    logs = switch_audit.get("logging", {}) if isinstance(switch_audit.get("logging"), dict) else {}
+    raw_cmds = switch_audit.get("raw_commands", {}) if isinstance(switch_audit.get("raw_commands"), dict) else {}
+
+    priv_pill = (
+        _pill("Privilegiado (#)", "ok", "check")
+        if conn.get("privileged")
+        else _pill("Solo lectura (>)", "warn", "warn")
+    )
+    conn_desc = f"{conn.get('port', '/dev/ttyUSB0')} @ {conn.get('baudrate', 9600)} bps"
+
+    identity_rows = [
+        _kv_row("Fabricante / Perfil", f"<strong>{_esc(switch_audit.get('vendor_name') or 'Switch')}</strong>"),
+        _kv_row("Modelo", f"<strong>{_esc(ident.get('model') or 'No reportado')}</strong>"),
+        _kv_row("Número de serie", _copy_code(ident.get("serial_number"))),
+        _kv_row("Versión SO", _copy_code(ident.get("os_version"))),
+        _kv_row("IP de gestión", _copy_code(ident.get("management_ip"))),
+        _kv_row("Tiempo activo (Uptime)", _esc(ident.get("uptime") or "No disponible")),
+        _kv_row("Conexión consola", f"<code>{_esc(conn_desc)}</code> {priv_pill}"),
+    ]
+    if ident.get("reload_reason"):
+        identity_rows.append(_kv_row("Último reinicio", _esc(ident["reload_reason"])))
+
+    # Panel 1: Puertos err-disabled, errores CRC/FCS y uplinks 10G
+    err_dis = ifaces.get("err_disabled", []) if isinstance(ifaces.get("err_disabled"), list) else []
+    err_counters = ifaces.get("error_counters", []) if isinstance(ifaces.get("error_counters"), list) else []
+    uplinks = ifaces.get("uplinks_10g", []) if isinstance(ifaces.get("uplinks_10g"), list) else []
+    hd_ports = ifaces.get("half_duplex_ports", []) if isinstance(ifaces.get("half_duplex_ports"), list) else []
+
+    iface_blocks: List[str] = []
+    if err_dis:
+        items = [
+            '<li class="alert-item">'
+            f'<div class="alert-item-head">{_pill("ERR-DISABLED", "crit", "crit")} '
+            f'<strong>{_esc(e.get("port"))}</strong></div>'
+            f'<div class="alert-item-reason">Motivo: <code>{_esc(e.get("reason"))}</code></div>'
+            "</li>"
+            for e in err_dis
+            if isinstance(e, dict)
+        ]
+        iface_blocks.append(f'<ul class="alert-list">{"".join(items)}</ul>')
+    else:
+        iface_blocks.append(
+            f'<div class="clean-state">{svg_icon("check", 16)} <span>Sin puertos bloqueados en estado err-disabled.</span></div>'
+        )
+
+    if err_counters:
+        err_items = [
+            '<li class="entry-item">'
+            f'<div>{_pill(f"{ec.get("total", 0)} err", "warn")} <strong>{_esc(ec.get("port"))}</strong> '
+            f'<span class="muted">FCS/CRC: {_esc(ec.get("fcs", 0))} · Rcv: {_esc(ec.get("rcv", 0))} · Align: {_esc(ec.get("align", 0))}</span></div>'
+            "</li>"
+            for ec in err_counters[:8]
+            if isinstance(ec, dict)
+        ]
+        iface_blocks.append(f'<div class="sub-block"><h4>Errores de trama L1/L2</h4><ul class="entry-list">{"".join(err_items)}</ul></div>')
+
+    if uplinks:
+        up_chips = [
+            f'<span class="port-chip"><code>{_esc(u.get("port"))}</code> {_esc(u.get("status"))} ({_esc(u.get("speed"))})</span>'
+            for u in uplinks
+            if isinstance(u, dict)
+        ]
+        iface_blocks.append(f'<div class="sub-block"><h4>Uplinks 10G / SFP+</h4><div class="chip-wrap">{"".join(up_chips)}</div></div>')
+
+    if hd_ports:
+        hd_txt = ", ".join(str(p.get("port", "")) for p in hd_ports if isinstance(p, dict))
+        iface_blocks.append(f'<div class="sub-block">{_pill("Half-Duplex", "warn")} <code>{_esc(hd_txt)}</code></div>')
+
+    # Panel 2: PoE
+    if poe.get("supported"):
+        poe_rows = [
+            _kv_row("Presupuesto total", f"<strong>{_esc(poe.get('budget_watts', 'N/D'))} W</strong>"),
+            _kv_row("Consumo actual", f"<strong>{_esc(poe.get('used_watts', 'N/D'))} W</strong> ({_esc(poe.get('usage_pct', 0))}%)"),
+            _kv_row("Disponible", f"{_esc(poe.get('remaining_watts', 'N/D'))} W"),
+            _kv_row("Puertos alimentados", str(poe.get("active_ports", 0))),
+        ]
+        poe_inner = f'<dl class="kv-grid">{"".join(poe_rows)}</dl>'
+        faulty_poe = poe.get("faulty_ports", [])
+        if faulty_poe:
+            f_items = [
+                f'<li class="alert-item"><div class="alert-item-head">{_pill(str(fp.get("oper", "FAULT")), "crit")} <strong>{_esc(fp.get("port"))}</strong></div></li>'
+                for fp in faulty_poe
+                if isinstance(fp, dict)
+            ]
+            poe_inner += f'<ul class="alert-list">{"".join(f_items)}</ul>'
+        powered = poe.get("powered_ports", [])
+        if powered:
+            p_items = [
+                f'<li class="entry-item"><div><strong>{_esc(pp.get("port"))}</strong> — {_esc(pp.get("watts"))} W <span class="muted">{_esc(pp.get("device"))}</span></div></li>'
+                for pp in powered[:8]
+                if isinstance(pp, dict)
+            ]
+            poe_inner += f'<div class="sub-block"><h4>Equipos PoE activos</h4><ul class="entry-list">{"".join(p_items)}</ul></div>'
+    else:
+        poe_inner = f'<div class="clean-state">{svg_icon("info", 16)} <span>Sin telemetría PoE o equipo sin soporte PoE.</span></div>'
+
+    # Panel 3: Salud física y recursos
+    health_rows = [
+        _kv_row("Ventiladores", _esc(env.get("fan_status") or "N/D")),
+        _kv_row(
+            "Temperatura",
+            f"{_esc(env.get('temperature_c'))} °C ({_esc(env.get('temperature_status') or 'OK')})"
+            if env.get("temperature_c") is not None
+            else _esc(env.get("temperature_status") or "N/D"),
+        ),
+        _kv_row("Fuente (PSU)", _esc(env.get("psu_status") or "N/D")),
+        _kv_row(
+            "CPU (5s / 1m / 5m)",
+            f"{_esc(cpu.get('cpu_5s', '-'))}% / {_esc(cpu.get('cpu_1m', '-'))}% / {_esc(cpu.get('cpu_5m', '-'))}%",
+        ),
+        _kv_row(
+            "Memoria RAM",
+            f"{_esc(mem.get('usage_pct'))}%" if mem.get("usage_pct") is not None else "N/D",
+        ),
+    ]
+
+    # Panel 4: VLANs, Spanning Tree y Vecinos CDP/LLDP
+    vlans = switching.get("vlans", {}) if isinstance(switching.get("vlans"), dict) else {}
+    stp = switching.get("stp", {}) if isinstance(switching.get("stp"), dict) else {}
+    neighbors = switching.get("neighbors", []) if isinstance(switching.get("neighbors"), list) else []
+
+    sw_rows = [
+        _kv_row("VLANs activas", str(vlans.get("count", 0))),
+        _kv_row("Modo STP", _esc(stp.get("mode") or "N/D")),
+        _kv_row(
+            "Puertos STP",
+            f"Fwd: {_esc(stp.get('forwarding', 0))} · Blk: {_esc(stp.get('blocking', 0))} · Activos: {_esc(stp.get('active', 0))}",
+        ),
+    ]
+    sw_inner = f'<dl class="kv-grid">{"".join(sw_rows)}</dl>'
+    if neighbors:
+        n_items = [
+            '<li class="entry-item">'
+            f'<div><strong>{_esc(nb.get("device_id"))}</strong> <span class="muted">({_esc(nb.get("platform"))})</span></div>'
+            f'<div class="muted">Local: <code>{_esc(nb.get("local_intf"))}</code> → Remoto: <code>{_esc(nb.get("port_id"))}</code></div>'
+            "</li>"
+            for nb in neighbors[:8]
+            if isinstance(nb, dict)
+        ]
+        sw_inner += f'<div class="sub-block"><h4>Vecinos CDP / LLDP</h4><ul class="entry-list">{"".join(n_items)}</ul></div>'
+
+    # Anexo colapsable de logs críticos y salida cruda
+    recent_logs = logs.get("recent_lines", []) if isinstance(logs.get("recent_lines"), list) else []
+    logs_html = ""
+    if recent_logs:
+        logs_blob = "\n".join(str(line) for line in recent_logs)
+        logs_html = (
+            '<details class="collapsible" style="margin-top:1rem">'
+            f'<summary class="collapsible-summary">{svg_icon("terminal", 15)} '
+            f'<span>Eventos recientes de Syslog ({len(recent_logs)} líneas)</span></summary>'
+            f'<div class="collapsible-body"><pre>{_esc(logs_blob)}</pre></div>'
+            "</details>"
+        )
+
+    raw_html = ""
+    if raw_cmds:
+        raw_parts = [
+            f'<div class="sub-block"><h4>{_copy_code(k)}</h4><pre>{_esc(v)}</pre></div>'
+            for k, v in raw_cmds.items()
+            if v
+        ]
+        if raw_parts:
+            raw_html = (
+                '<details class="collapsible" style="margin-top:0.75rem">'
+                f'<summary class="collapsible-summary">{svg_icon("file-code", 15)} '
+                f'<span>Salida CLI capturada ({len(raw_parts)} comandos)</span></summary>'
+                f'<div class="collapsible-body">{"".join(raw_parts)}</div>'
+                "</details>"
+            )
+
+    return f"""
+    <section id="sec-switch" class="section">
+        <div class="section-head">
+            <div class="section-title-group">
+                <span class="section-icon">{svg_icon("layers", 18)}</span>
+                <div>
+                    <h2>Auditoría de Switch (Consola Serial)</h2>
+                    <p class="section-desc">Identidad, puertos L1/L2, energía PoE, salud de chasis y conmutación</p>
+                </div>
+            </div>
+        </div>
+        <div class="identity-box">
+            <dl class="kv-grid kv-two-col">
+                {"".join(identity_rows)}
+            </dl>
+        </div>
+        <div class="subsystem-grid">
+            <div class="subpanel">
+                <div class="subpanel-head">
+                    <span class="subpanel-icon">{svg_icon("globe", 16)}</span>
+                    <h3>Interfaces y Capa 1/2</h3>
+                </div>
+                {"".join(iface_blocks)}
+            </div>
+            <div class="subpanel">
+                <div class="subpanel-head">
+                    <span class="subpanel-icon">{svg_icon("battery", 16)}</span>
+                    <h3>Energía PoE</h3>
+                </div>
+                {poe_inner}
+            </div>
+            <div class="subpanel">
+                <div class="subpanel-head">
+                    <span class="subpanel-icon">{svg_icon("thermometer", 16)}</span>
+                    <h3>Salud física y recursos</h3>
+                </div>
+                <dl class="kv-grid">{"".join(health_rows)}</dl>
+            </div>
+            <div class="subpanel">
+                <div class="subpanel-head">
+                    <span class="subpanel-icon">{svg_icon("layers", 16)}</span>
+                    <h3>VLANs, STP y Vecinos</h3>
+                </div>
+                {sw_inner}
+            </div>
+        </div>
+        {logs_html}
+        {raw_html}
+    </section>
+    """
+
+
 def _render_telemetry_section(telemetry: Dict[str, Any], default_open: bool = False) -> str:
     """Renderiza métricas adicionales de telemetría en un anexo colapsable limpio."""
     if not isinstance(telemetry, dict):
         return ""
 
-    ignored = {"hardware", "hardware_audit", "malware_audit", "osi_network", "osi"}
+    ignored = {"hardware", "hardware_audit", "malware_audit", "osi_network", "osi", "switch_audit"}
     extra_items = [(k, v) for k, v in telemetry.items() if k not in ignored]
     if not extra_items:
         return ""
@@ -2627,21 +2956,25 @@ def render_report_html(report: Any) -> str:
     hw_audit = _extract_section_dict(report, "hardware_audit", "hardware_audit")
     malware_audit = _extract_section_dict(report, "malware_audit", "malware_audit")
     osi = _extract_section_dict(report, "osi_network", "osi_network", "osi")
+    switch_audit = _extract_section_dict(report, "switch_audit", "switch_audit")
     telemetry = getattr(report, "telemetry", {}) if isinstance(getattr(report, "telemetry", {}), dict) else {}
     ai_analysis = getattr(report, "ai_analysis", None)
 
     ai_html = _render_ai_section(ai_analysis, getattr(report, "overall_status", "OK"))
+    switch_html = _render_switch_section(switch_audit)
     osi_html = _render_osi_section(osi)
     hw_html = _render_hardware_section(hw, hw_audit, getattr(report, "os_type", "Desconocido"))
     sec_html = _render_security_section(malware_audit)
 
-    has_structured = any((ai_html, osi_html, hw_html, sec_html))
+    has_structured = any((ai_html, switch_html, osi_html, hw_html, sec_html))
     telemetry_html = _render_telemetry_section(telemetry, default_open=not has_structured)
 
     # Navegación rápida solo para las secciones presentes
     nav_items: List[Tuple[str, str, str]] = []
     if ai_html:
         nav_items.append(("sec-diagnostico", "Diagnóstico", "diagnosis"))
+    if switch_html:
+        nav_items.append(("sec-switch", "Switch", "layers"))
     if osi_html:
         nav_items.append(("sec-red", "Red OSI", "layers"))
     if hw_html:
@@ -2661,12 +2994,18 @@ def render_report_html(report: Any) -> str:
         nav_html = f'<nav class="section-nav" aria-label="Secciones del informe"><div class="section-nav-inner">{pills}</div></nav>'
 
     # Signos vitales
-    vital_tiles = _build_vitals(hw_audit, osi, malware_audit, telemetry)
+    vital_tiles = _build_vitals(hw_audit, osi, malware_audit, telemetry, switch_audit=switch_audit)
     vitals_html = f'<div class="vitals-grid">{"".join(vital_tiles)}</div>' if vital_tiles else ""
 
     # Metadatos del encabezado
     sys_info = hw_audit.get("system", {}) if isinstance(hw_audit.get("system"), dict) else {}
-    os_display = sys_info.get("os_name") or hw.get("os_name") or _format_os(getattr(report, "os_type", ""))
+    sw_ident = switch_audit.get("identity", {}) if isinstance(switch_audit.get("identity"), dict) else {}
+    os_display = (
+        sys_info.get("os_name")
+        or hw.get("os_name")
+        or (f"{switch_audit.get('vendor_name')} ({sw_ident.get('model')})" if switch_audit and sw_ident.get("model") else None)
+        or _format_os(getattr(report, "os_type", ""))
+    )
     cat_display = _format_category(getattr(report, "category", "GENERAL"))
     hostname = str(getattr(report, "hostname", "Host remoto"))
     report_id = str(getattr(report, "report_id", "latest"))
@@ -2702,6 +3041,7 @@ def render_report_html(report: Any) -> str:
 
         {nav_html}
         {ai_html}
+        {switch_html}
         {osi_html}
         {hw_html}
         {sec_html}

@@ -225,8 +225,78 @@ class GeminiDiagnosticAnalyzer:
             logger.exception(f"Unexpected error calling Gemini API: {ex}")
             return self._generate_local_fallback_analysis(diagnostic_data, reason=f"Error inesperado al conectar con Gemini: {type(ex).__name__}.")
 
+    @staticmethod
+    def _extract_switch_audit(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Devuelve el bloque switch_audit si el payload corresponde a un switch."""
+        if not isinstance(data, dict):
+            return None
+        direct = data.get("switch_audit")
+        if isinstance(direct, dict) and direct:
+            return direct
+        telemetry = data.get("telemetry")
+        if isinstance(telemetry, dict):
+            nested = telemetry.get("switch_audit")
+            if isinstance(nested, dict) and nested:
+                return nested
+        if str(data.get("device_kind", "")).upper() == "SWITCH":
+            return {}
+        if str(data.get("os_type", "")).upper().startswith("SWITCH_"):
+            return {}
+        return None
+
+    def _build_switch_analysis_prompt(self, data: Dict[str, Any], switch_audit: Dict[str, Any]) -> str:
+        """Construye un prompt especializado en switches de red (L1/L2/L3, PoE, STP, salud)."""
+        # Excluir raw_commands extensos para no saturar el contexto del LLM
+        compact_audit = {
+            k: v for k, v in switch_audit.items() if k != "raw_commands"
+        }
+        category_label = str(
+            compact_audit.get("category_label")
+            or data.get("category")
+            or "PROBLEMAS GENERALES"
+        )
+        vendor_name = str(compact_audit.get("vendor_name") or data.get("os_type") or "SWITCH")
+        data_str = json.dumps(compact_audit, indent=2, ensure_ascii=False)
+
+        return f"""Eres un Ingeniero Principal de Redes y Switching Empresarial (CCIE / infraestructura L1-L3). Analiza la siguiente telemetría recolectada por consola serial por el dispositivo de campo REI para el switch ({vendor_name}), enfocándote en la categoría de diagnóstico: {category_label}.
+
+TELEMETRÍA DEL SWITCH:
+{data_str}
+
+DIRECTIVAS CRÍTICAS DE ANÁLISIS:
+1. Salud Física y Chasis:
+   - Evalúa ventiladores, temperatura, fuentes de poder (PSU), carga de CPU y uso de memoria. Cualquier falla de ventilador/PSU o temperatura crítica es CRIT.
+2. Puertos, Capa 1/2 y Errores:
+   - Detecta puertos en estado err-disabled e indica el motivo exacto (bpduguard, psecure-violation, link-flap, etc.).
+   - Analiza errores CRC/FCS/Align/Rcv en interfaces activas y enlaces en half-duplex (posible cable defectuoso, transceptor SFP o duplex mismatch).
+   - Evalúa estado de uplinks (especialmente SFP+ 10G) y vecinos CDP/LLDP.
+3. Energía PoE:
+   - Si el switch soporta PoE, evalúa el consumo frente al presupuesto total (>85% es WARN) y reporta de inmediato cualquier puerto PoE en falla (faulty / power-deny) como CRIT.
+4. Conmutación y Estabilidad:
+   - Revisa modo Spanning Tree, VLANs activas y eventos críticos en el buffer de logging.
+5. Plan de Acción:
+   - Proporciona comandos CLI exactos de verificación y remediación acordes al fabricante detectado ({vendor_name}).
+
+Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
+{{
+  "summary": "Resumen ejecutivo de 2 a 3 líneas del estado del switch, fallas críticas y severidad.",
+  "overall_status": "OK" | "WARN" | "CRIT",
+  "root_causes": [
+    "Causa raíz 1 identificada (indicando subsistema: Chasis, PoE, Capa 1/2, STP o Seguridad)",
+    "Causa raíz 2 identificada"
+  ],
+  "action_plan": [
+    "Comando CLI o acción técnica 1 de verificación/remediación",
+    "Comando CLI o acción técnica 2 recomendada"
+  ]
+}}"""
+
     def _build_analysis_prompt(self, data: Dict[str, Any]) -> str:
         """Constructs an expert IT, Network, and Hardware diagnostician prompt following the OSI Top-Down model and hardware subsystem analysis."""
+        switch_audit = self._extract_switch_audit(data)
+        if switch_audit is not None:
+            return self._build_switch_analysis_prompt(data, switch_audit)
+
         data_str = json.dumps(data, indent=2, ensure_ascii=False)
         return f"""Eres un Ingeniero Principal de Redes, Infraestructura TI, Diagnóstico de Hardware y Ciberseguridad. Analiza la siguiente telemetría de un host (identidad de hardware, subsistemas físicos de Placa/CPU/RAM/Almacenamiento/GPU, y pila de red organizada según el Modelo OSI: Capa 7 a Capa 1) recolectada por el dispositivo de campo REI.
 
@@ -285,11 +355,139 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
             logger.warning(f"Failed to parse LLM JSON: {ex} (Raw text: {text[:100]}...)")
         return None
 
+    def _generate_switch_local_fallback_analysis(
+        self,
+        data: Dict[str, Any],
+        switch_audit: Dict[str, Any],
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Análisis heurístico local para switches cuando Gemini no está disponible."""
+        identity = switch_audit.get("identity", {}) if isinstance(switch_audit.get("identity"), dict) else {}
+        health = switch_audit.get("health", {}) if isinstance(switch_audit.get("health"), dict) else {}
+        env = health.get("environment", {}) if isinstance(health.get("environment"), dict) else {}
+        cpu = health.get("cpu", {}) if isinstance(health.get("cpu"), dict) else {}
+        mem = health.get("memory", {}) if isinstance(health.get("memory"), dict) else {}
+        poe = switch_audit.get("poe", {}) if isinstance(switch_audit.get("poe"), dict) else {}
+        ifaces = switch_audit.get("interfaces", {}) if isinstance(switch_audit.get("interfaces"), dict) else {}
+        logs = switch_audit.get("logging", {}) if isinstance(switch_audit.get("logging"), dict) else {}
+
+        hostname = str(identity.get("hostname") or data.get("hostname") or "Switch")
+        vendor = str(switch_audit.get("vendor_name") or data.get("os_type") or "SWITCH")
+        category = str(switch_audit.get("category_label") or data.get("category") or "PROBLEMAS GENERALES")
+
+        root_causes: List[str] = []
+        action_plan: List[str] = []
+        status = "OK"
+
+        # 1. Salud ambiental (ventiladores, temperatura, PSU)
+        for issue in env.get("issues", []) if isinstance(env.get("issues"), list) else []:
+            issue_str = str(issue)
+            root_causes.append(f"[Chasis] {issue_str}")
+            action_plan.append("Verificar ventilacion del rack, fuentes de poder y ejecutar: show env all")
+            if any(k in issue_str.upper() for k in ("FAIL", "FAULT", "CRIT", "RED")):
+                status = "CRIT"
+            elif status != "CRIT":
+                status = "WARN"
+
+        # 2. Puertos err-disabled
+        err_dis = ifaces.get("err_disabled", []) if isinstance(ifaces.get("err_disabled"), list) else []
+        for entry in err_dis[:5]:
+            if isinstance(entry, dict):
+                p = entry.get("port", "puerto")
+                rsn = entry.get("reason", "err-disabled")
+                root_causes.append(f"[Interfaces] Puerto {p} bloqueado en err-disabled (motivo: {rsn})")
+                action_plan.append(
+                    f"Corregir causa ({rsn}) en {p} y reactivar: interface {p} -> shutdown / no shutdown"
+                )
+                status = "CRIT"
+
+        # 3. PoE (fallas o saturación de presupuesto)
+        faulty_poe = poe.get("faulty_ports", []) if isinstance(poe.get("faulty_ports"), list) else []
+        for fp in faulty_poe[:4]:
+            if isinstance(fp, dict):
+                p = fp.get("port", "puerto")
+                op = fp.get("oper", "faulty")
+                root_causes.append(f"[PoE] Falla de alimentacion PoE en {p} (estado: {op})")
+                action_plan.append(f"Revisar cableado/equipo conectado en {p} y verificar: show power inline {p} detail")
+                status = "CRIT"
+
+        poe_pct = poe.get("usage_pct")
+        if isinstance(poe_pct, (int, float)) and poe_pct >= 85.0:
+            root_causes.append(f"[PoE] Consumo cercano al limite del presupuesto ({poe_pct}%)")
+            action_plan.append("Revisar consumo por puerto con 'show power inline' y redistribuir cargas PoE")
+            if status != "CRIT":
+                status = "WARN"
+
+        # 4. CPU y Memoria
+        cpu_5m = cpu.get("cpu_5m")
+        if isinstance(cpu_5m, (int, float)) and cpu_5m >= 85:
+            root_causes.append(f"[CPU] Carga critica de CPU ({cpu_5m}% en 5 min)")
+            action_plan.append("Identificar procesos activos con: show processes cpu sorted")
+            status = "CRIT"
+        elif isinstance(cpu_5m, (int, float)) and cpu_5m >= 70:
+            root_causes.append(f"[CPU] Carga elevada de CPU ({cpu_5m}% en 5 min)")
+            action_plan.append("Monitorear carga de control plane con: show processes cpu history")
+            if status != "CRIT":
+                status = "WARN"
+
+        mem_pct = mem.get("usage_pct")
+        if isinstance(mem_pct, (int, float)) and mem_pct >= 90.0:
+            root_causes.append(f"[Memoria] Uso elevado de memoria del switch ({mem_pct}%)")
+            action_plan.append("Revisar asignacion de memoria con: show processes memory sorted")
+            if status != "CRIT":
+                status = "WARN"
+
+        # 5. Errores CRC/FCS y Half-Duplex
+        err_counters = ifaces.get("error_counters", []) if isinstance(ifaces.get("error_counters"), list) else []
+        for ec in err_counters[:3]:
+            if isinstance(ec, dict) and int(ec.get("total", 0)) >= 10:
+                p = ec.get("port", "puerto")
+                tot = ec.get("total", 0)
+                fcs = ec.get("fcs", 0)
+                root_causes.append(f"[Capa 1/2] Puerto {p} acumula {tot} errores de trama (FCS/CRC: {fcs})")
+                action_plan.append(f"Revisar patch cord/transceptor en {p} y validar: show interface {p}")
+                if status != "CRIT":
+                    status = "WARN"
+
+        hd_ports = ifaces.get("half_duplex_ports", []) if isinstance(ifaces.get("half_duplex_ports"), list) else []
+        if hd_ports:
+            p_list = ", ".join(str(p.get("port", "")) for p in hd_ports[:4] if isinstance(p, dict))
+            root_causes.append(f"[Duplex] Puertos negociados en half-duplex: {p_list}")
+            action_plan.append("Alinear autonegociacion speed/duplex en ambos extremos del enlace")
+            if status != "CRIT":
+                status = "WARN"
+
+        # 6. Eventos críticos en syslog si aún no hay hallazgos
+        crit_logs = logs.get("critical_events", []) if isinstance(logs.get("critical_events"), list) else []
+        if crit_logs and not root_causes:
+            root_causes.append(f"[Logs] Se registraron {len(crit_logs)} evento(s) relevante(s) en syslog reciente")
+            action_plan.append("Inspeccionar eventos recientes en detalle con: show logging")
+            if status != "CRIT":
+                status = "WARN"
+
+        if not root_causes:
+            root_causes.append(
+                f"Switch {hostname} en estado nominal. Sin puertos err-disabled, fallas PoE ni alertas de hardware."
+            )
+            action_plan.append("Mantener respaldo de configuracion y monitoreo preventivo de interfaces.")
+
+        summary_suffix = f" [{reason}]" if reason else ""
+        summary = f"Diagnóstico Switch {hostname} ({vendor} - {category}): Estado {status}.{summary_suffix}"
+        return {
+            "summary": summary,
+            "overall_status": status,
+            "root_causes": root_causes,
+            "action_plan": action_plan,
+        }
+
     def _generate_local_fallback_analysis(self, data: Dict[str, Any], reason: str = "") -> Dict[str, Any]:
         """
         Rule-based heuristic fallback analysis when Gemini API is unreachable.
         Evaluates the network stack layer by layer (OSI Top-Down) and all hardware subsystems.
         """
+        switch_audit = self._extract_switch_audit(data)
+        if switch_audit is not None:
+            return self._generate_switch_local_fallback_analysis(data, switch_audit, reason=reason)
         telemetry = data.get("telemetry", {}) if isinstance(data.get("telemetry"), dict) else {}
         osi = data.get("osi_network") or telemetry.get("osi_network") or telemetry.get("osi", {})
         osi = osi if isinstance(osi, dict) else {}
